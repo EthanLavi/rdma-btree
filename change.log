@@ -1,0 +1,4 @@
++109 rdma/include/rome/rdma/rdma_ptr.h
+const rdma_ptr& operator[](int index) const {
+    return this + sizeof(T) * index;
+}
