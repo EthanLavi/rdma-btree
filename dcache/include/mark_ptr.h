@@ -1,7 +1,7 @@
 #include <cstdint>
-#include <rome/rdma/rdma_ptr.h>
+#include <remus/rdma/rdma_ptr.h>
 
-using namespace rome::rdma;
+using namespace remus::rdma;
 
 constexpr uint64_t mask = (uint64_t) 1 << 63;
 

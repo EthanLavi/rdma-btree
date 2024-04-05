@@ -1,6 +1,7 @@
 #pragma once
 
-#include "../logging/logging.h"
+#include <remus/logging/logging.h>
+
 #include <atomic>
 #include <functional>
 #include <optional>

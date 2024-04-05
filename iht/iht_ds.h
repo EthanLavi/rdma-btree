@@ -78,8 +78,8 @@ private:
   // "Super class" for the elist and plist structs
   struct Base {};
   typedef uint64_t lock_type;
-  typedef remote_ptr<Base> remote_baseptr;
-  typedef remote_ptr<lock_type> remote_lock;
+  typedef rdma_ptr<Base> remote_baseptr;
+  typedef rdma_ptr<lock_type> remote_lock;
   
   struct pair_t {
     K key;
@@ -146,10 +146,10 @@ private:
   }
 
   // Get the address of the baseptr at bucket (index)
-  remote_ptr<remote_baseptr> get_baseptr(remote_plist arr_start, int index){
+  rdma_ptr<remote_baseptr> get_baseptr(remote_plist arr_start, int index){
       uint64_t new_addy = arr_start.address();
       new_addy += sizeof(plist_pair_t) * index;
-      return remote_ptr<remote_baseptr>(arr_start.id(), new_addy);
+      return rdma_ptr<remote_baseptr>(arr_start.id(), new_addy);
   }
 
   /// @brief Initialize the plist with values.
@@ -186,7 +186,7 @@ private:
   /// @param lock the lock to unlock
   /// @param unlock_status what should the end lock status be.
   inline void unlock(std::shared_ptr<rdma_capability> pool, remote_lock lock, uint64_t unlock_status) {
-    pool->Write<lock_type>(lock, unlock_status, temp_lock, rome::rdma::rdma_capability::RDMAWriteNoAck);
+    pool->Write<lock_type>(lock, unlock_status, temp_lock, internal::RDMAWriteWithAck);
   }
 
   /// @brief Change the baseptr for a given bucket to point to a different EList or a different PList

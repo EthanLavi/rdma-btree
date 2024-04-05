@@ -3,56 +3,52 @@
 #include <protos/workloaddriver.pb.h>
 #include <vector>
 
-#include "../logging/logging.h"
-#include "../vendor/sss/cli.h"
-
-#include "../rdma/rdma.h"
+#include <remus/logging/logging.h>
+#include <remus/util/cli.h>
+#include <remus/rdma/rdma.h>
 
 #include "common.h"
 #include "role_client.h"
 #include "role_server.h"
 #include "iht_ds.h"
 
+using namespace remus::util;
+using namespace remus::rdma;
+
 auto ARGS = {
-    sss::BOOL_ARG_OPT("--send_bulk",
-                      "If to run test operations multithreaded"),
-    sss::BOOL_ARG_OPT("--send_test",
-                      "If to test the functionality of the methods"),
-    sss::BOOL_ARG_OPT("-v", "If to be verbose in testing output"),
+    BOOL_ARG_OPT("--send_bulk", "If to run test operations multithreaded"),
+    BOOL_ARG_OPT("--send_test", "If to test the functionality of the methods"),
+    BOOL_ARG_OPT("-v", "If to be verbose in testing output"),
 };
 
 #define PATH_MAX 4096
 #define PORT_NUM 18000
 
-using namespace rome::rdma;
-
 // The optimial number of memory pools is mp=min(t, MAX_QP/n) where n is the number of nodes and t is the number of threads
 // To distribute mp (memory pools) across t threads, it is best for t/mp to be a whole number
 
 int main(int argc, char** argv){
-    ROME_INIT_LOG();
+    REMUS_INIT_LOG();
 
-    sss::ArgMap args;
+    ArgMap args;
     // import_args will validate that the newly added args don't conflict with
     // those already added.
     auto res = args.import_args(ARGS);
     if (res) {
-      ROME_ERROR(res.value());
-      exit(1);
+      REMUS_FATAL(res.value());
     }
     // NB: Only call parse_args once.  If it fails, a mandatory arg was skipped
     res = args.parse_args(argc, argv);
     if (res) {
       args.usage();
-      ROME_ERROR(res.value());
-      exit(1);
+      REMUS_FATAL(res.value());
     }
 
     // Extract the args to variables
     bool bulk_operations = args.bget("--send_bulk");
     bool test_operations = args.bget("--send_test");
     bool verbose = args.bget("-v");
-    ROME_ASSERT((bulk_operations ^ test_operations) == 1, "Assert one flag (bulk or test) is used"); // assert one or the other
+    REMUS_ASSERT((bulk_operations ^ test_operations) == 1, "Assert one flag (bulk or test) is used"); // assert one or the other
 
     // Create a single peer
     volatile bool done = false; // (Should be atomic?)
@@ -70,7 +66,7 @@ int main(int argc, char** argv){
     iht_->InitAsFirst(pool);
     if (test_operations){
       pool->RegisterThread();
-      ROME_INFO("Starting basic test cases.");
+      REMUS_INFO("Starting basic test cases.");
       test_output(true, iht_->contains(pool, 5), std::nullopt, "Contains 5");
       test_output(true, iht_->contains(pool, 4), std::nullopt, "Contains 4");
       test_output(true, iht_->insert(pool, 5, 10), std::nullopt, "Insert 5");
@@ -82,26 +78,26 @@ int main(int argc, char** argv){
       test_output(true, iht_->contains(pool, 5), std::nullopt, "Contains 5");
       test_output(true, iht_->contains(pool, 4), std::nullopt, "Contains 4");
       int scale_size = (CNF_PLIST_SIZE * CNF_ELIST_SIZE) * 4;
-      ROME_INFO("All basic test cases finished, starting bulk tests. Scale is {}", scale_size);
+      REMUS_INFO("All basic test cases finished, starting bulk tests. Scale is {}", scale_size);
       for(int i = 0; i < scale_size; i++){
         test_output(verbose, iht_->contains(pool, i), std::nullopt, std::string("Contains ") + std::to_string(i) + std::string(" false"));
         test_output(verbose, iht_->insert(pool, i, i), std::nullopt, std::string("Insert ") + std::to_string(i));
         test_output(verbose, iht_->contains(pool, i), std::make_optional(i), std::string("Contains ") + std::to_string(i) + std::string(" true"));
       }
-      ROME_INFO(" = 25% Finished = ");
+      REMUS_INFO(" = 25% Finished = ");
       for(int i = 0; i < scale_size; i++){
         test_output(verbose, iht_->contains(pool, i), std::make_optional(i), std::string("Contains ") + std::to_string(i) + std::string(" maintains true"));
       }
-      ROME_INFO(" = 50% Finished = ");
+      REMUS_INFO(" = 50% Finished = ");
       for(int i = 0; i < scale_size; i++){
         test_output(verbose, iht_->remove(pool, i), std::make_optional(i), std::string("Removes ") + std::to_string(i));
         test_output(verbose, iht_->contains(pool, i), std::nullopt, std::string("Contains ") + std::to_string(i) + std::string(" false"));
       }
-      ROME_INFO(" = 75% Finished = ");
+      REMUS_INFO(" = 75% Finished = ");
       for(int i = 0; i < scale_size; i++){
         test_output(verbose, iht_->contains(pool, i), std::nullopt, std::string("Contains ") + std::to_string(i) + std::string(" maintains false"));
       }
-      ROME_INFO("All test cases finished");
+      REMUS_INFO("All test cases finished");
     } else if (bulk_operations) {
       int THREAD_COUNT = 10;
       std::vector<std::thread> threads(0);
@@ -111,21 +107,21 @@ int main(int argc, char** argv){
               pool->RegisterThread();
               barr.arrive_and_wait();
               auto start = chrono::high_resolution_clock::now();
-              if (id == 0) ROME_INFO("Starting populating");
+              if (id == 0) REMUS_INFO("Starting populating");
               for (int ops = 0; ops < 50000; ops++){
                   if (verbose && ops % 5000 == 0){
-                    ROME_INFO("Progress Update: (Thread {}) {} ops", id, ops);
+                    REMUS_INFO("Progress Update: (Thread {}) {} ops", id, ops);
                   }
                   // Everybody is trying to insert the same data.
                   iht_->insert(pool, ops, ops * 2);
               }
               barr.arrive_and_wait();
-              if (id == 0) ROME_INFO("Done populating, start workload");
+              if (id == 0) REMUS_INFO("Done populating, start workload");
               auto populate_checkpoint = chrono::high_resolution_clock::now();
               for (int ops = 0; ops < 100000; ops++){
                   auto res = iht_->contains(pool, ops);
                   if (verbose && ops % 5000 == 0){
-                    ROME_INFO("Progress Update: (Thread {}) {} ops", id, ops);
+                    REMUS_INFO("Progress Update: (Thread {}) {} ops", id, ops);
                   }
                   // assert bottom half is present and top half is absent
                   if (ops < 50000){
@@ -140,8 +136,8 @@ int main(int argc, char** argv){
                 auto start_to_checkpoint = chrono::duration_cast<chrono::milliseconds>(populate_checkpoint - start);
                 auto checkpoint_to_end = chrono::duration_cast<chrono::milliseconds>(end - populate_checkpoint);
                 auto total_dur = chrono::duration_cast<chrono::milliseconds>(end - start);
-                ROME_WARN("This test used for correctness, not to be used for benchmarking, use --send_exp");
-                ROME_INFO("Inserts:{}ms Contains:{}ms Total:{}ms", start_to_checkpoint.count(), checkpoint_to_end.count(), total_dur.count());
+                REMUS_WARN("This test used for correctness, not to be used for benchmarking, use --send_exp");
+                REMUS_INFO("Inserts:{}ms Contains:{}ms Total:{}ms", start_to_checkpoint.count(), checkpoint_to_end.count(), total_dur.count());
               }
           }, t));
       }
@@ -150,9 +146,9 @@ int main(int argc, char** argv){
           threads.at(t).join();
       }
     } else {
-      ROME_INFO("Use main executable not test");
+      REMUS_INFO("Use main executable not test");
     }
 
-    ROME_INFO("[EXPERIMENT] -- End of execution; -- ");
+    REMUS_INFO("[EXPERIMENT] -- End of execution; -- ");
     return 0;
 }

@@ -1,0 +1,27 @@
+[
+  {
+    "directory": "/workspaces/DOC/build/iht",
+    "command": "/usr/bin/c++ -DREMUS_LOG_LEVEL=DEBUG  -std=gnu++20 -o CMakeFiles/iht_rome.dir/main.cc.o -c /workspaces/DOC/iht/main.cc",
+    "file": "/workspaces/DOC/iht/main.cc"
+  },
+  {
+    "directory": "/workspaces/DOC/build/iht",
+    "command": "/usr/bin/c++ -DREMUS_LOG_LEVEL=DEBUG  -std=gnu++20 -o CMakeFiles/iht_rome_test.dir/test.cc.o -c /workspaces/DOC/iht/test.cc",
+    "file": "/workspaces/DOC/iht/test.cc"
+  },
+  {
+    "directory": "/workspaces/DOC/build/iht",
+    "command": "/usr/bin/c++ -DREMUS_LOG_LEVEL=DEBUG  -std=gnu++20 -o CMakeFiles/iht_twosided.dir/compete.cc.o -c /workspaces/DOC/iht/compete.cc",
+    "file": "/workspaces/DOC/iht/compete.cc"
+  },
+  {
+    "directory": "/workspaces/DOC/build/dcache",
+    "command": "/usr/bin/c++   -std=gnu++20 -o CMakeFiles/main.dir/main.cc.o -c /workspaces/DOC/dcache/main.cc",
+    "file": "/workspaces/DOC/dcache/main.cc"
+  },
+  {
+    "directory": "/workspaces/DOC/build/dcache",
+    "command": "/usr/bin/c++   -std=gnu++20 -o CMakeFiles/ptr_test.dir/test/mark_ptr.cc.o -c /workspaces/DOC/dcache/test/mark_ptr.cc",
+    "file": "/workspaces/DOC/dcache/test/mark_ptr.cc"
+  }
+  ]

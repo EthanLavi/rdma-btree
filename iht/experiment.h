@@ -1,9 +1,13 @@
 #pragma once
 
-#include "../vendor/sss/cli.h"
+#include <remus/util/cli.h>
+#include <remus/workload/workload_driver.h>
+#include <remus/logging/logging.h>
+
 #include "common.h"
-#include "../protos/workloaddriver.h"
-#include "../logging/logging.h"
+
+using namespace remus::util;
+using namespace remus::metrics;
 
 /// An object to hold the experimental params
 /// @param node_id The node's id. (nodeX in cloudlab should have X in this option)
@@ -52,7 +56,7 @@ public:
 
     BenchmarkParams() = default;
 
-    BenchmarkParams(sss::ArgMap args){
+    BenchmarkParams(ArgMap args){
         node_id = args.iget("--node_id");
         runtime = args.iget("--runtime");
         unlimited_stream = args.bget("--unlimited_stream");
@@ -81,7 +85,7 @@ public:
                 cache_depth = CacheDepth::UpToLayer2;
                 break;
             default:
-                ROME_WARN("Unknown cache depth. Defaulting to 0");
+                REMUS_WARN("Unknown cache depth. Defaulting to 0");
                 cache_depth = CacheDepth::None;
                 break;
         }

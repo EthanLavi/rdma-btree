@@ -1,11 +1,11 @@
 #include <cassert>
 #include <iostream>
 
-#include <rome/rdma/rdma.h>
-#include <rome/rdma/rdma_ptr.h>
+#include <remus/rdma/rdma.h>
+#include <remus/rdma/rdma_ptr.h>
 #include "../include/mark_ptr.h"
 
-using namespace rome::rdma; 
+using namespace remus::rdma; 
 using namespace std;
 
 /// tmp object

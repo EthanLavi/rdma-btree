@@ -1,7 +1,7 @@
 #include "iht_local.h"
 
-#include "../rdma/connection_manager.h"
-#include "../vendor/sss/status.h"
+#include <remus/rdma/connection_map.h>
+#include <remus/util/status.h>
 
 #include <atomic>
 #include <mutex>
@@ -9,7 +9,9 @@
 #include <thread>
 #include <unordered_map>
 
-using namespace rome::rdma::internal;
+using namespace std;
+using namespace remus::rdma::internal;
+using namespace remus::util;
 
 #define MAX_THREAD_POOL 8
 
@@ -46,7 +48,7 @@ private:
 
     /// convert a key to it's id. Will return -1 if it cannot be found
     int to_id(int key){
-        ROME_ASSERT(key >= keyspace_lb && key - keyspace_lb <= keyspace_len, "Keyspace access error");
+        REMUS_ASSERT(key >= keyspace_lb && key - keyspace_lb <= keyspace_len, "Keyspace access error");
         int id = (count * (key - keyspace_lb)) / keyspace_len;
         if (id == count) return id - 1; // map any overflow numbers to the last id
         return id;
@@ -59,7 +61,7 @@ public:
     ~TwoSidedIHT(){
         stop_listening = true;
         delete internal_data_;
-        for(int i = 0; i < min(MAX_THREAD_POOL, count); i++){
+        for(int i = 0; i < fmin(MAX_THREAD_POOL, count); i++){
             t[i].join();
         }
         // for(int i = 0; i < count; i++){
@@ -76,7 +78,7 @@ public:
         : self_id(self_id), count(count), keyspace_lb(keyspace_lb), keyspace_len(keyspace_ub - keyspace_lb){
         // create a map to represent the internal data of the node
         internal_data_ = new iht_carumap<int, int, 8, 64>();
-        ROME_ASSERT(self_id >= 0 && self_id < count, "Invalid id given node count"); // assert id
+        REMUS_ASSERT(self_id >= 0 && self_id < count, "Invalid id given node count"); // assert id
         for(int i = 0; i < count; i++){
             lock_table_client.push_back(new std::mutex());
         }
@@ -88,7 +90,7 @@ public:
         this->receiver_map = receiver_map;
 
         // todo: tune thread-pool size
-        for(int i = 0; i < min(MAX_THREAD_POOL, count); i++){
+        for(int i = 0; i < fmin(MAX_THREAD_POOL, count); i++){
             t.push_back(std::thread([&](int myid, int node_count){
                 // Loop until stop_listening flag is set
                 while (!stop_listening) {
@@ -125,13 +127,13 @@ public:
                             response.set_op_type(has_key ? RMV_RES : ERR);
                             response.set_value(answer);
                         } else {
-                            ROME_ERROR("Request has unexpected opcode");
+                            REMUS_ERROR("Request has unexpected opcode");
                         }
 
                         // Send the response
-                        sss::Status stat = sender_map[id]->channel()->Send(response);
+                        Status stat = sender_map[id]->channel()->Send(response);
                         lock_table_server[id]->unlock();
-                        ROME_ASSERT(stat.t == sss::Ok, "Operation failed");
+                        REMUS_ASSERT(stat.t == Ok, "Operation failed");
                     }
                 }
             }, self_id, count));
@@ -157,16 +159,16 @@ public:
         request.set_key(key);
         request.set_value(0); // unneeded so 0
         lock_table_client[target_id]->lock();
-        sss::Status stat = receiver_map[target_id]->channel()->Send(request);
-        ROME_ASSERT(stat.t == sss::Ok, "Operation failed");
+        Status stat = receiver_map[target_id]->channel()->Send(request);
+        REMUS_ASSERT(stat.t == Ok, "Operation failed");
 
         /// Receive the result
-        sss::StatusVal<IHTOPProto> maybe_result = sender_map[target_id]->channel()->Deliver<IHTOPProto>();
+        StatusVal<IHTOPProto> maybe_result = sender_map[target_id]->channel()->Deliver<IHTOPProto>();
         lock_table_client[target_id]->unlock();
-        ROME_ASSERT(maybe_result.status.t == sss::Ok, "Cannot get result");
+        REMUS_ASSERT(maybe_result.status.t == Ok, "Cannot get result");
         IHTOPProto result = maybe_result.val.value();
         if (result.op_type() == ERR) return nullopt;
-        ROME_ASSERT(result.op_type() == GET_RES, "Response to get has unexpected opcode, {}", result.op_type());
+        REMUS_ASSERT(result.op_type() == GET_RES, "Response to get has unexpected opcode, {}", result.op_type());
         return result.value();
     }
 
@@ -187,16 +189,16 @@ public:
         request.set_key(key);
         request.set_value(val);
         lock_table_client[target_id]->lock();
-        sss::Status stat = receiver_map[target_id]->channel()->Send(request);
-        ROME_ASSERT(stat.t == sss::Ok, "Operation failed");
+        Status stat = receiver_map[target_id]->channel()->Send(request);
+        REMUS_ASSERT(stat.t == Ok, "Operation failed");
 
         /// Receive the result
-        sss::StatusVal<IHTOPProto> maybe_result = sender_map[target_id]->channel()->Deliver<IHTOPProto>();
+        StatusVal<IHTOPProto> maybe_result = sender_map[target_id]->channel()->Deliver<IHTOPProto>();
         lock_table_client[target_id]->unlock();
-        ROME_ASSERT(maybe_result.status.t == sss::Ok, "Cannot get result");
+        REMUS_ASSERT(maybe_result.status.t == Ok, "Cannot get result");
         IHTOPProto result = maybe_result.val.value();
         if (result.op_type() == ERR) return result.value();
-        ROME_ASSERT(result.op_type() == INS_RES, "Response to insert has unexpected opcode, {}", result.op_type());
+        REMUS_ASSERT(result.op_type() == INS_RES, "Response to insert has unexpected opcode, {}", result.op_type());
         return nullopt;
     }
 
@@ -220,16 +222,16 @@ public:
         request.set_key(key);
         request.set_value(0); // unneed so zero
         lock_table_client[target_id]->lock();
-        sss::Status stat = receiver_map[target_id]->channel()->Send(request);
-        ROME_ASSERT(stat.t == sss::Ok, "Operation failed");
+        Status stat = receiver_map[target_id]->channel()->Send(request);
+        REMUS_ASSERT(stat.t == Ok, "Operation failed");
 
         /// Receive the result
-        sss::StatusVal<IHTOPProto> maybe_result = sender_map[target_id]->channel()->Deliver<IHTOPProto>();
+        StatusVal<IHTOPProto> maybe_result = sender_map[target_id]->channel()->Deliver<IHTOPProto>();
         lock_table_client[target_id]->unlock();
-        ROME_ASSERT(maybe_result.status.t == sss::Ok, "Cannot get result");
+        REMUS_ASSERT(maybe_result.status.t == Ok, "Cannot get result");
         IHTOPProto result = maybe_result.val.value();
         if (result.op_type() == ERR) return nullopt;
-        ROME_ASSERT(result.op_type() == RMV_RES, "Response to remove has unexpected opcode, {}", result.op_type());
+        REMUS_ASSERT(result.op_type() == RMV_RES, "Response to remove has unexpected opcode, {}", result.op_type());
         return result.value();    
     }
 

@@ -3,3 +3,4 @@ iht/scripts/graphs
 iht/scripts/dev
 iht/scripts/results
 *.png
+.cache/

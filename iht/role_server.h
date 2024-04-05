@@ -1,9 +1,10 @@
 #include <algorithm>
 #include <atomic>
 
-#include "../logging/logging.h"
-#include "../util/tcp/tcp.h"
-#include "protos/experiment.pb.h"
+#include <remus/logging/logging.h>
+#include <remus/util/tcp/tcp.h>
+
+using namespace remus::util;
 
 namespace ExperimentManager {
 /// @brief Sleep (to avoid taking up resources) and then try to sync a exit with the clients
@@ -18,7 +19,7 @@ namespace ExperimentManager {
 inline void ClientStopBarrier(tcp::SocketManager& socket_handle, int runtime_s) {
   // Sleep while clients are running if there is a set runtime.
   if (runtime_s > 0) {
-    ROME_INFO("SERVER :: Sleeping for {}", runtime_s);
+    REMUS_INFO("SERVER :: Sleeping for {}", runtime_s);
 
     // Sleep for runtime seconds while the clients are running
     std::this_thread::sleep_for(std::chrono::seconds(runtime_s));
@@ -31,12 +32,12 @@ inline void ClientStopBarrier(tcp::SocketManager& socket_handle, int runtime_s) 
   // Receive a message from all clients to sync
   tcp::message recv_buffer[socket_handle.num_clients()];
   socket_handle.recv_from_all(recv_buffer);
-  ROME_DEBUG("SERVER :: received ack");
+  REMUS_DEBUG("SERVER :: received ack");
   
   // Once we receive a message from everyone, everyone is done
   // So we now send an OK to exit message
   tcp::message send_buffer;
   socket_handle.send_to_all(&send_buffer);
-  ROME_DEBUG("SERVER :: sent ack");
+  REMUS_DEBUG("SERVER :: sent ack");
 }
 };

@@ -1,75 +1,71 @@
-#include <protos/workloaddriver.pb.h>
 #include <vector>
 
-#include "../logging/logging.h"
-#include "../vendor/sss/cli.h"
-
-#include "../rdma/rdma.h"
+#include <protos/workloaddriver.pb.h>
+#include <remus/logging/logging.h>
+#include <remus/util/cli.h>
+#include <remus/util/tcp/tcp.h>
+#include <remus/rdma/memory_pool.h>
+#include <remus/rdma/rdma.h>
 
 #include "common.h"
 #include "experiment.h"
-#include "../util/tcp/tcp.h"
 #include "role_client.h"
 #include "role_server.h"
-#include "iht_ds.h"
 
 auto ARGS = {
-    sss::I64_ARG("--node_id", "The node's id. (nodeX in cloudlab should have X in this option)"),
-    sss::I64_ARG("--runtime", "How long to run the experiment for. Only valid if unlimited_stream"),
-    sss::BOOL_ARG_OPT("--unlimited_stream", "If the stream should be endless, stopping after runtime"),
-    sss::I64_ARG("--op_count", "How many operations to run. Only valid if not unlimited_stream"),
-    sss::I64_ARG("--region_size", "How big the region should be in 2^x bytes"),
-    sss::I64_ARG("--thread_count", "How many threads to spawn with the operations"),
-    sss::I64_ARG("--node_count", "How many nodes are in the experiment"),
-    sss::I64_ARG("--qp_max", "The max number of queue pairs to allocate for the experiment."),
-    sss::I64_ARG("--contains", "Percentage of operations are contains, (contains + insert + remove = 100)"),
-    sss::I64_ARG("--insert", "Percentage of operations are inserts, (contains + insert + remove = 100)"),
-    sss::I64_ARG("--remove", "Percentage of operations are removes, (contains + insert + remove = 100)"),
-    sss::I64_ARG("--key_lb", "The lower limit of the key range for operations"),
-    sss::I64_ARG("--key_ub", "The upper limit of the key range for operations"),
-    sss::I64_ARG_OPT("--cache_depth", "The depth of the cache for the IHT", 0),
+    remus::util::I64_ARG("--node_id", "The node's id. (nodeX in cloudlab should have X in this option)"),
+    remus::util::I64_ARG("--runtime", "How long to run the experiment for. Only valid if unlimited_stream"),
+    remus::util::BOOL_ARG_OPT("--unlimited_stream", "If the stream should be endless, stopping after runtime"),
+    remus::util::I64_ARG("--op_count", "How many operations to run. Only valid if not unlimited_stream"),
+    remus::util::I64_ARG("--region_size", "How big the region should be in 2^x bytes"),
+    remus::util::I64_ARG("--thread_count", "How many threads to spawn with the operations"),
+    remus::util::I64_ARG("--node_count", "How many nodes are in the experiment"),
+    remus::util::I64_ARG("--qp_max", "The max number of queue pairs to allocate for the experiment."),
+    remus::util::I64_ARG("--contains", "Percentage of operations are contains, (contains + insert + remove = 100)"),
+    remus::util::I64_ARG("--insert", "Percentage of operations are inserts, (contains + insert + remove = 100)"),
+    remus::util::I64_ARG("--remove", "Percentage of operations are removes, (contains + insert + remove = 100)"),
+    remus::util::I64_ARG("--key_lb", "The lower limit of the key range for operations"),
+    remus::util::I64_ARG("--key_ub", "The upper limit of the key range for operations"),
+    remus::util::I64_ARG_OPT("--cache_depth", "The depth of the cache for the IHT", 0),
 };
 
 #define PATH_MAX 4096
 #define PORT_NUM 18000
 
-using namespace rome::rdma;
+using namespace remus::rdma;
 
 // The optimial number of memory pools is mp=min(t, MAX_QP/n) where n is the number of nodes and t is the number of threads
 // To distribute mp (memory pools) across t threads, it is best for t/mp to be a whole number
 // IHT RDMA MINIMAL
 
 int main(int argc, char **argv) {
-    ROME_INIT_LOG();
+    REMUS_INIT_LOG();
 
-    sss::ArgMap args;
+    remus::util::ArgMap args;
     // import_args will validate that the newly added args don't conflict with
     // those already added.
     auto res = args.import_args(ARGS);
     if (res) {
-        ROME_ERROR(res.value());
-        exit(1);
+        REMUS_FATAL(res.value());
     }
     // NB: Only call parse_args once.  If it fails, a mandatory arg was skipped
     res = args.parse_args(argc, argv);
     if (res) {
         args.usage();
-        ROME_ERROR(res.value());
-        exit(1);
+        REMUS_FATAL(res.value());
     }
 
     // Extract the args to variables
     BenchmarkParams params = BenchmarkParams(args);
-    ROME_INFO("Running IHT with cache depth {}", params.cache_depth);
+    REMUS_INFO("Running IHT with cache depth {}", params.cache_depth);
 
     // Check node count
     if (params.node_count <= 0 || params.thread_count <= 0){
-        ROME_INFO("Cannot start experiment. Node/thread count was found to be 0");
-        exit(1);
+        REMUS_FATAL("Cannot start experiment. Node/thread count was found to be 0");
     }
     // Check we are in this experiment
     if (params.node_id >= params.node_count){
-        ROME_INFO("Not in this experiment. Exiting");
+        REMUS_INFO("Not in this experiment. Exiting");
         exit(0);
     }
 
@@ -78,7 +74,7 @@ int main(int argc, char **argv) {
     int mp = std::min(params.thread_count, (int) std::floor(params.qp_max / params.node_count));
     if (mp == 0) mp = 1; // Make sure if node_count > qp_max, we don't end up with 0 memory pools
     
-    ROME_INFO("Distributing {} MemoryPools across {} threads", mp, params.thread_count);
+    REMUS_INFO("Distributing {} MemoryPools across {} threads", mp, params.thread_count);
 
     // Start initializing a vector of peers
     std::vector<Peer> peers;
@@ -94,7 +90,7 @@ int main(int argc, char **argv) {
     // Print the peers included in this experiment
     // This is just for debugging to ensure they are what you expect
     for(int i = 0; i < peers.size(); i++){
-        ROME_DEBUG("Peer list {}:{}@{}", i, peers.at(i).id, peers.at(i).address);
+        REMUS_DEBUG("Peer list {}:{}@{}", i, peers.at(i).id, peers.at(i).address);
     }
     Peer host = peers.at(0);
     // Initialize memory pools into an array
@@ -105,7 +101,7 @@ int main(int argc, char **argv) {
     for(int i = 0; i < mp; i++){
         mempool_threads.emplace_back(std::thread([&](int mp_index, int self_index){
             Peer self = peers.at(self_index);
-            ROME_DEBUG(mp != params.thread_count ? "Is shared" : "Is not shared");
+            REMUS_DEBUG(mp != params.thread_count ? "Is shared" : "Is not shared");
             std::shared_ptr<rdma_capability> pool = std::make_shared<rdma_capability>(self);
             pool->init_pool(block_size, peers);
             pools[mp_index] = pool;
@@ -122,7 +118,7 @@ int main(int argc, char **argv) {
         // If dedicated server-node, we must send IHT pointer and wait for clients to finish
         threads.emplace_back(std::thread([&](){
             // Initialize X connections
-            tcp::SocketManager socket_handle = tcp::SocketManager(PORT_NUM);
+            remus::util::tcp::SocketManager socket_handle = remus::util::tcp::SocketManager(PORT_NUM);
             for(int i = 0; i < params.thread_count * params.node_count; i++){
                 // TODO: Can we have a per-node connection?
                 // I haven't gotten around to coming up with a clean way to reduce the number of sockets connected to the server
@@ -130,20 +126,20 @@ int main(int argc, char **argv) {
             }
             // Create a root ptr to the IHT
             IHT iht = IHT(host, params.cache_depth, pools[0]);
-            remote_ptr<anon_ptr> root_ptr = iht.InitAsFirst(pools[0]);
+            rdma_ptr<anon_ptr> root_ptr = iht.InitAsFirst(pools[0]);
             // Send the root pointer over
-            tcp::message ptr_message = tcp::message(root_ptr.raw());
+            remus::util::tcp::message ptr_message = remus::util::tcp::message(root_ptr.raw());
             socket_handle.send_to_all(&ptr_message);
             // We are the server
             ExperimentManager::ClientStopBarrier(socket_handle, params.runtime);
-            ROME_INFO("[SERVER THREAD] -- End of execution; -- ");
+            REMUS_INFO("[SERVER THREAD] -- End of execution; -- ");
         }));
     }
 
     // Initialize T endpoints, one for each thread
-    tcp::EndpointManager endpoint_managers[params.thread_count];
+    remus::util::tcp::EndpointManager endpoint_managers[params.thread_count];
     for(uint16_t i = 0; i < params.thread_count; i++){
-        endpoint_managers[i] = tcp::EndpointManager(PORT_NUM, host.address.c_str());
+        endpoint_managers[i] = remus::util::tcp::EndpointManager(PORT_NUM, host.address.c_str());
     }
 
     // Barrier to start all the clients at the same time
@@ -169,11 +165,11 @@ int main(int argc, char **argv) {
             // If the endpoint cant connect, it will just wait and retry later
             std::this_thread::sleep_for(std::chrono::milliseconds(10)); 
             // Get the data from the server to init the IHT
-            tcp::message ptr_message;
+            remus::util::tcp::message ptr_message;
             endpoint_managers[thread_index].recv_server(&ptr_message);
-            iht->InitFromPointer(remote_ptr<anon_ptr>(ptr_message.get_first()));
+            iht->InitFromPointer(rdma_ptr<anon_ptr>(ptr_message.get_first()));
             
-            ROME_DEBUG("Creating client");
+            REMUS_DEBUG("Creating client");
             // Create and run a client in a thread
             MapAPI* iht_as_map = new MapAPI(
                 [&](int key, int value){ return iht->insert(pool, key, value); },
@@ -185,18 +181,18 @@ int main(int argc, char **argv) {
             );
             std::unique_ptr<Client<IHT_Op<int, int>>> client = Client<IHT_Op<int, int>>::Create(host, endpoint_managers[thread_index], params, &client_sync, iht_as_map);
             double populate_frac = 0.5 / (double) (params.node_count * params.thread_count);
-            sss::StatusVal<WorkloadDriverResult> output = Client<IHT_Op<int, int>>::Run(std::move(client), thread_index, populate_frac);
+            remus::util::StatusVal<WorkloadDriverResult> output = Client<IHT_Op<int, int>>::Run(std::move(client), thread_index, populate_frac);
             // [mfs]  It would be good to document how a client can fail, because
             // it seems like if even one client fails, on any machine, the
             //  whole experiment should be invalidated.
             // [esl] I agree. A strange thing though: I think the output of Client::Run is always OK.
             //       Any errors just crash the script, which lead to no results being generated?
-            if (output.status.t == sss::StatusType::Ok && output.val.has_value()){
+            if (output.status.t == remus::util::StatusType::Ok && output.val.has_value()){
                 workload_results[thread_index] = output.val.value();
             } else {
-                ROME_ERROR("Client run failed");
+                REMUS_ERROR("Client run failed");
             }
-            ROME_INFO("[CLIENT THREAD] -- End of execution; -- ");
+            REMUS_INFO("[CLIENT THREAD] -- End of execution; -- ");
         }, i));
     }
 
@@ -204,7 +200,7 @@ int main(int argc, char **argv) {
     int i = 0;
     for (auto it = threads.begin(); it != threads.end(); it++){
         // For debug purposes, sometimes it helps to see which threads haven't deadlocked
-        ROME_DEBUG("Syncing {}", ++i);
+        REMUS_DEBUG("Syncing {}", ++i);
         auto t = it;
         t->join();
     }
@@ -215,7 +211,7 @@ int main(int argc, char **argv) {
     Result result[params.thread_count];
     for (int i = 0; i < params.thread_count; i++) {
         result[i] = Result(params, workload_results[i]);
-        ROME_INFO("Protobuf Result {}\n{}", i, result[i].result_as_debug_string());
+        REMUS_INFO("Protobuf Result {}\n{}", i, result[i].result_as_debug_string());
     }
 
     // [mfs] Does this produce one file per node?
@@ -227,6 +223,6 @@ int main(int argc, char **argv) {
         filestream << result[i].result_as_string();
     }
     filestream.close();
-    ROME_INFO("[EXPERIMENT] -- End of execution; -- ");
+    REMUS_INFO("[EXPERIMENT] -- End of execution; -- ");
     return 0;
 }
