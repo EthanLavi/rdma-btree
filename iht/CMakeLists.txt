@@ -2,7 +2,8 @@
 set(E1 "iht_rome")
 set(E2 "iht_rome_test")
 # set(E3 "iht_twosided")
-add_executable(${E1} main.cc)
+# add_executable(${E1} main.cc)
+add_executable(${E1} cached/main_cached.cc)
 add_executable(${E2} test.cc)
 # add_executable(${E3} compete.cc), todo: add back 
 foreach(X IN LISTS E1 E2) # E3
