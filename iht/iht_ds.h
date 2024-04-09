@@ -642,7 +642,7 @@ public:
     // Create a random operation generator that is
     // - evenly distributed among the key range
     std::uniform_real_distribution<double> dist = std::uniform_real_distribution<double>(0.0, 1.0);
-    std::default_random_engine gen((unsigned) std::time(nullptr));
+    std::default_random_engine gen(std::chrono::system_clock::now().time_since_epoch().count());
     for (int c = 0; c < op_count; c++) {
       int k = (dist(gen) * key_range) + key_lb;
       insert(pool, k, value(k));

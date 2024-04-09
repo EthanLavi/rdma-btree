@@ -110,7 +110,7 @@ def main_func():
             sync_processes.append(Process(target=__run__, args=(cmd, f"log/node{i}_sync.log", i)))
             sync_processes[-1].start()
             if install:
-                cmd = f"ssh {username}@{hostname} 'cd {proj_dir}; sh cloudlab_depend.sh'"
+                cmd = f"ssh {username}@{hostname} 'cd {proj_dir}/remus/remus-internal; sh cloudlab_depend.sh; cmake .; sudo make install'"
                 install_processes.append(Process(target=__run__, args=(cmd, f"log/node{i}_sync.log", i)))
         # Wait for all processes to finish
         for process in sync_processes:
