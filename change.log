@@ -1,6 +1,8 @@
 +109 rdma/include/rome/rdma/rdma_ptr.h
-const rdma_ptr& operator[](int index) const {
-    return this + sizeof(T) * index;
+const rdma_ptr operator[](int index) const {
+  rdma_ptr new_ptr = *this;
+  new_ptr += index;
+  return new_ptr;
 }
 
 +115 workload/include/remus/workload/workload_driver.h
