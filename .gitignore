@@ -4,3 +4,6 @@ iht/scripts/dev
 iht/scripts/results
 *.png
 .cache/
+scripts/log/
+
+scripts/cloudlab.csv

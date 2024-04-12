@@ -30,7 +30,7 @@ parser.add_argument('-v', '--verbose', action='store_true', help="If to be verbo
 parser.add_argument('--devmode', action='store_true', help="If to save the results to a separate dev folder instead of results")
 
 # Program run-types
-parser.add_argument('--runtype', required=True, choices=['test', 'concurrent_test', 'bench', 'twosided'], help="Define the type of experiment to run. Test will run correctness tests single-threaded. Concurrent test will run a correctness test with multiple threads. And bench will run a benchmark")
+parser.add_argument('--runtype', required=True, choices=['test', 'concurrent_test', 'bench', 'twosided', 'cached'], help="Define the type of experiment to run. Test will run correctness tests single-threaded. Concurrent test will run a correctness test with multiple threads. And bench will run a benchmark")
 parser.add_argument('--level', default='debug', choices=['info', 'debug', 'trace'], help='The level of print-out in the program')
 
 # Experiment parameters
@@ -150,7 +150,7 @@ def main():
             # Construct ssh command and payload
             ssh_login = f"ssh {ARGS.ssh_user}@{nodealias}.{domain_name(nodetype)}"
             if not ARGS.rerun:
-                del_cmd = "rm -f iht_rome && rm -f iht_rome_test && rm -f iht_twosided && "
+                del_cmd = "rm -f iht_rome && rm -f iht_rome_test && rm -f iht_twosided && rm -f iht_rome_cached && "
             else:
                 del_cmd = ""
             if ARGS.level == "info":
@@ -159,7 +159,7 @@ def main():
                 cmake_flags = "-DCMAKE_BUILD_TYPE=Debug -DLOG_LEVEL=DEBUG"
             else:
                 cmake_flags = "-DCMAKE_BUILD_TYPE=Debug -DLOG_LEVEL=TRACE"
-            payload = f"cd {bin_dir} && cmake {cmake_flags} . && {del_cmd}make && LD_LIBRARY_PATH=.:./protos ./"
+            payload = f"cd {bin_dir} && cmake {cmake_flags} . && {del_cmd}make && LD_LIBRARY_PATH=.:./protos ./iht/"
             if ARGS.runtype == "test":
                 payload += "iht_rome_test --send_test"
             elif ARGS.runtype == "concurrent_test":
@@ -172,6 +172,10 @@ def main():
                 payload += "iht_twosided"
                 # Adding experiment flags
                 payload += process_exp_flags(node_id)
+            elif ARGS.runtype == "cached":
+                payload += "iht_rome_cached"
+                # Adding experiment flags
+                payload += process_exp_flags(node_id)
             else:
                 print("Found unknown runtype")
                 exit(1)
@@ -179,7 +183,7 @@ def main():
                 payload += f" -v "
             # Tuple: (Creating Command | Output File Name)
             commands.append((' '.join([ssh_login, quote(payload)]), nodename))
-            if ARGS.runtype == "bench" or ARGS.runtype == "twosided":
+            if ARGS.runtype == "bench" or ARGS.runtype == "twosided" or ARGS.runtype == "cached":
                 filepath = os.path.join(f"/users/{ARGS.ssh_user}", bin_dir, ARGS.exp_result)
                 folder = "results"
                 if ARGS.devmode:
