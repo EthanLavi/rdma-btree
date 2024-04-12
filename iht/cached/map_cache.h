@@ -143,7 +143,6 @@ public:
   /// @param key the key to search on
   /// @return an optional containing the value, if the key exists
   std::optional<V> contains(std::shared_ptr<rdma_capability> pool, K key) {
-    // REMUS_INFO("Contains({})", key);
     auto global_lock = get_lock_ptr(root);
     acquire(pool, global_lock);
     bucket_ptr b = get_bucket_ptr(root);
@@ -171,7 +170,6 @@ public:
   /// @param value the value to associate with the key
   /// @return an empty optional if the insert was successful. Otherwise it's the value at the key.
   std::optional<V> insert(std::shared_ptr<rdma_capability> pool, K key, V value) {
-    // REMUS_INFO("Insert({}, {})", key, value);
     auto global_lock = get_lock_ptr(root);
     acquire(pool, global_lock);
     bucket_ptr b = get_bucket_ptr(root);
@@ -208,7 +206,6 @@ public:
   /// @param key the key to remove at
   /// @return an optional containing the old value if the remove was successful. Otherwise an empty optional.
   std::optional<V> remove(std::shared_ptr<rdma_capability> pool, K key) {
-    // REMUS_INFO("Remove({})", key);
     auto global_lock = get_lock_ptr(root);
     acquire(pool, global_lock);
     bucket_ptr b = get_bucket_ptr(root);
@@ -246,7 +243,7 @@ public:
         bucket_ptr bucket_remote = mark_ptr(b[bucket]);
         CachedObject<pair_t> blocal = cache->Read<pair_t>(bucket_remote);
         const pair_t* kv = to_address(blocal);
-        if (kv->key == EMPTY)
+        if (kv->key != EMPTY && kv->key != TOMBSTONE)
             total++;
     }
     unlock(pool, global_lock);
@@ -260,20 +257,23 @@ public:
   /// @param key_ub the upper bound for the key range
   /// @param value the value to associate with each key. Currently, we have
   /// asserts for result to be equal to the key. Best to set value equal to key!
-  void populate(std::shared_ptr<rdma_capability> pool, int op_count, K key_lb, K key_ub, std::function<K(V)> value) {
+  int populate(std::shared_ptr<rdma_capability> pool, int op_count, K key_lb, K key_ub, std::function<K(V)> value) {
     // Populate only works when we have numerical keys
     K key_range = key_ub - key_lb;
     // todo: Under-populating because of insert collisions?
     // Create a random operation generator that is
     // - evenly distributed among the key range
+    int inserts = 0;
     std::uniform_real_distribution<double> dist = std::uniform_real_distribution<double>(0.0, 1.0);
     std::default_random_engine gen(std::chrono::system_clock::now().time_since_epoch().count());
     for (int c = 0; c < op_count; c++) {
       int k = (dist(gen) * key_range) + key_lb;
-      insert(pool, k * 13, value(k) * 13);
-      // todo! remove^^
+      auto res = insert(pool, k * 13, value(k) * 13);
+      // todo! remove^^ *13
+      if (res == std::nullopt) inserts++;
       // Wait some time before doing next insert...
       std::this_thread::sleep_for(std::chrono::nanoseconds(10));
     }
+    return inserts;
   }
 };

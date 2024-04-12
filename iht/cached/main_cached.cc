@@ -126,18 +126,18 @@ int main(int argc, char **argv) {
         // If dedicated server-node, we must send IHT pointer and wait for clients to finish
         threads.emplace_back(std::thread([&](){
             // Initialize X connections
-            tcp::SocketManager socket_handle = tcp::SocketManager(PORT_NUM);
+            tcp::SocketManager* socket_handle = new tcp::SocketManager(PORT_NUM);
             for(int i = 0; i < params.thread_count * params.node_count; i++){
                 // TODO: Can we have a per-node connection?
                 // I haven't gotten around to coming up with a clean way to reduce the number of sockets connected to the server
-                socket_handle.accept_conn();
+                socket_handle->accept_conn();
             }
             
             // Collect and redistribute the CacheStore pointers
             tcp::message root_ptrs[params.node_count * params.thread_count];
-            socket_handle.recv_from_all(root_ptrs);
+            socket_handle->recv_from_all(root_ptrs);
             for(int i = 0; i < params.node_count * params.thread_count; i++){
-                socket_handle.send_to_all(&root_ptrs[i]);
+                socket_handle->send_to_all(&root_ptrs[i]);
             }
 
             // Create a root ptr to the IHT
@@ -145,18 +145,26 @@ int main(int argc, char **argv) {
             rdma_ptr<anon_ptr> root_ptr = iht.InitAsFirst(pools[0]);
             // Send the root pointer over
             tcp::message ptr_message = tcp::message(root_ptr.raw());
-            socket_handle.send_to_all(&ptr_message);
+            socket_handle->send_to_all(&ptr_message);
 
             // We are the server
             ExperimentManager::ClientStopBarrier(socket_handle, params.runtime);
+
+            // Collect and redistribute the size deltas
+            tcp::message deltas[params.node_count * params.thread_count];
+            socket_handle->recv_from_all(deltas);
+            for(int i = 0; i < params.node_count * params.thread_count; i++){
+                socket_handle->send_to_all(&deltas[i]);
+            }
+            delete socket_handle;
             REMUS_INFO("[SERVER THREAD] -- End of execution; -- ");
         }));
     }
 
     // Initialize T endpoints, one for each thread
-    tcp::EndpointManager endpoint_managers[params.thread_count];
+    tcp::EndpointManager* endpoint_managers[params.thread_count];
     for(uint16_t i = 0; i < params.thread_count; i++){
-        endpoint_managers[i] = tcp::EndpointManager(PORT_NUM, host.address.c_str());
+        endpoint_managers[i] = new tcp::EndpointManager(PORT_NUM, host.address.c_str());
     }
     // sleep for a short while to ensure the receiving end (SocketManager) is up and running
     // If the endpoint cant connect, it will just wait and retry later
@@ -185,9 +193,9 @@ int main(int argc, char **argv) {
             std::shared_ptr<RemoteCache> cache = make_shared<RemoteCache>(pool);
             tcp::message data(cache->root());
             vector<uint64_t> peer_roots;
-            endpoint_managers[thread_index].send_server(&data);
+            endpoint_managers[thread_index]->send_server(&data);
             for(int i = 0; i < params.node_count * params.thread_count; i++){
-                endpoint_managers[thread_index].recv_server(&data);
+                endpoint_managers[thread_index]->recv_server(&data);
                 peer_roots.push_back(data.get_first());
             }
             cache->init(peer_roots);
@@ -196,34 +204,57 @@ int main(int argc, char **argv) {
             std::shared_ptr<KVStore> iht = std::make_shared<KVStore>(pool, cache);
             // Get the data from the server to init the IHT
             tcp::message ptr_message;
-            endpoint_managers[thread_index].recv_server(&ptr_message);
+            endpoint_managers[thread_index]->recv_server(&ptr_message);
             iht->InitFromPointer(rdma_ptr<anon_ptr>(ptr_message.get_first()));
             
             REMUS_DEBUG("Creating client");
             // Create and run a client in a thread
+            int delta = 0;
             MapAPI* iht_as_map = new MapAPI(
-                [&](int key, int value){ return iht->insert(pool, key, value); },
+                [&](int key, int value){ 
+                    auto res = iht->insert(pool, key, value);
+                    if (res == std::nullopt) delta++;
+                    return res;
+                },
                 [&](int key){ return iht->contains(pool, key); },
-                [&](int key){ return iht->remove(pool, key); },
-                [&](int op_count, int key_lb, int key_ub){ 
+                [&](int key){
+                    auto res = iht->remove(pool, key);
+                    if (res != std::nullopt) delta--;
+                    return res;
+                },
+                [&](int op_count, int key_lb, int key_ub){
                     pool->RegisterThread();
-                    iht->populate(pool, op_count, key_lb, key_ub, [=](int key){ return key; }); }
+                    delta += iht->populate(pool, op_count, key_lb, key_ub, [=](int key){ return key; });
+                    iht->count(pool); // ? IMPORTANT - Count hits every element which in effect warms up the cache
+                                      // ? BENCHMARK EXECUTION STARTS WITH NO INVALID CACHE LINES
+                    REMUS_INFO("Cache Metrics After Populating");
+                    cache->print_metrics();
+                    cache->reset_metrics();
+                }
             );
-            assert(params.key_lb >= 2 && params.key_ub - params.key_lb <= 1000);
+            REMUS_ASSERT(params.key_lb >= 2 && params.key_ub - params.key_lb <= 1000, "Keyspace is valid?");
             std::unique_ptr<Client<IHT_Op<int, int>>> client = Client<IHT_Op<int, int>>::Create(host, endpoint_managers[thread_index], params, &client_sync, iht_as_map);
             double populate_frac = 0.5 / (double) (params.node_count * params.thread_count);
+
             StatusVal<WorkloadDriverResult> output = Client<IHT_Op<int, int>>::Run(std::move(client), thread_index, populate_frac);
-            // [mfs]  It would be good to document how a client can fail, because
-            // it seems like if even one client fails, on any machine, the
-            //  whole experiment should be invalidated.
-            // [esl] I agree. A strange thing though: I think the output of Client::Run is always OK.
-            //       Any errors just crash the script, which lead to no results being generated?
             if (output.status.t == StatusType::Ok && output.val.has_value()){
                 workload_results[thread_index] = output.val.value();
             } else {
                 REMUS_ERROR("Client run failed");
             }
+
+            // Check expected size
+            int expected_size = iht->count(pool);
+            tcp::message d(delta);
+            endpoint_managers[thread_index]->send_server(&d);
+            for(int i = 0; i < params.node_count * params.thread_count; i++){
+                endpoint_managers[thread_index]->recv_server(&d);
+                expected_size -= d.get_first();
+            }
+            REMUS_ASSERT(expected_size == 0, "Initial size + delta ==? Final size");
+
             REMUS_INFO("[CLIENT THREAD] -- End of execution; -- ");
+            REMUS_INFO("Printing Metrics from Benchmark Execution");
             cache->print_metrics();
         }, i));
     }
@@ -235,6 +266,9 @@ int main(int argc, char **argv) {
         REMUS_DEBUG("Syncing {}", ++i);
         auto t = it;
         t->join();
+    }
+    for(uint16_t i = 0; i < params.thread_count; i++){
+        delete endpoint_managers[i];
     }
     // [mfs]  Again, odd use of protobufs for relatively straightforward combining
     //        of results.  Or am I missing something, and each node is sending its
