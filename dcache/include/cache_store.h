@@ -92,6 +92,10 @@ public:
         std::cout << metrics << std::endl;
     }
 
+    void reset_metrics(){
+        metrics = CacheMetrics();
+    }
+
     template <typename T>
     CachedObject<T> Read(rdma_ptr<T> ptr, rdma_ptr<T> prealloc = nullptr){
         // todo: do i need to mark the cache line as volatile?
@@ -187,4 +191,4 @@ public:
     }
 };
 
-thread_local CacheMetrics RemoteCache::metrics = CacheMetrics();
+inline thread_local CacheMetrics RemoteCache::metrics = CacheMetrics();
