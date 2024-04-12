@@ -16,7 +16,7 @@ namespace ExperimentManager {
 ///            to revisit implementing a cleanup function to allow for things such as remote deallocation.
 /// [esl]      TODO: the code in this file is small, it could be moved to main?
 /// @return ok status
-inline void ClientStopBarrier(tcp::SocketManager& socket_handle, int runtime_s) {
+inline void ClientStopBarrier(tcp::SocketManager* socket_handle, int runtime_s) {
   // Sleep while clients are running if there is a set runtime.
   if (runtime_s > 0) {
     REMUS_INFO("SERVER :: Sleeping for {}", runtime_s);
@@ -30,14 +30,14 @@ inline void ClientStopBarrier(tcp::SocketManager& socket_handle, int runtime_s) 
   // It also serves the function of sending the remote_ptr, which is why the API is not a barrier but more of a server-client (one->many relationship)
 
   // Receive a message from all clients to sync
-  tcp::message recv_buffer[socket_handle.num_clients()];
-  socket_handle.recv_from_all(recv_buffer);
+  tcp::message recv_buffer[socket_handle->num_clients()];
+  socket_handle->recv_from_all(recv_buffer);
   REMUS_DEBUG("SERVER :: received ack");
   
   // Once we receive a message from everyone, everyone is done
   // So we now send an OK to exit message
   tcp::message send_buffer;
-  socket_handle.send_to_all(&send_buffer);
+  socket_handle->send_to_all(&send_buffer);
   REMUS_DEBUG("SERVER :: sent ack");
 }
 };

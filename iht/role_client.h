@@ -76,7 +76,7 @@ public:
   /// @param map a map interface
   /// @return a unique ptr
   static unique_ptr<Client>
-  Create(const Peer &server, tcp::EndpointManager &ep, BenchmarkParams& params, barrier<> *barr, MapAPI* map) {
+  Create(const Peer &server, tcp::EndpointManager* ep, BenchmarkParams& params, barrier<> *barr, MapAPI* map) {
     return unique_ptr<Client>(new Client(server, ep, params, barr, map));
   }
 
@@ -123,7 +123,10 @@ public:
     function<Operation(void)> generator = [&]() {
       int rng = op_dist(gen);
       int k = k_dist(gen);
-      if (rng <= contains) { 
+      // todo: remove!
+      k *= 13;
+      // ! remove this^^^ changes the distribution!
+      if (rng <= contains) {
         // between 0 and CONTAINS
         return Operation(CONTAINS, k, 0);
       } else if (rng <= contains + insert) { 
@@ -237,12 +240,12 @@ public:
 
     // send the ack to let the server know that we are done
     tcp::message send_buffer;
-    endpoint_.send_server(&send_buffer);
+    endpoint_->send_server(&send_buffer);
     REMUS_DEBUG("CLIENT :: Sent Ack");
 
     // Wait to receive an ack back. Letting us know that the other clients are done.
     tcp::message recv_buffer;
-    endpoint_.recv_server(&recv_buffer);
+    endpoint_->recv_server(&recv_buffer);
     REMUS_DEBUG("CLIENT :: Received Ack");
     return Status::Ok();
   }
@@ -255,7 +258,7 @@ private:
   /// @param barrier a barrier to synchonize local clients
   /// @param iht a pointer to an IHT
   /// @return a unique ptr
-  Client(const Peer &host, tcp::EndpointManager &ep, BenchmarkParams &params, barrier<> *barr, MapAPI* map)
+  Client(const Peer &host, tcp::EndpointManager* ep, BenchmarkParams &params, barrier<> *barr, MapAPI* map)
     : host_(host), endpoint_(ep), params_(params), barrier_(barr), map_(map){
       if (params.unlimited_stream) progression = 100000;
       else progression = max(20.0, params_.op_count * params_.thread_count * 0.01);
@@ -266,7 +269,7 @@ private:
   /// @brief Represents the host peer
   const Peer host_;
   /// @brief Represents an endpoint to be used for communication with the host peer
-  tcp::EndpointManager endpoint_;
+  tcp::EndpointManager* endpoint_;
   /// @brief Experimental parameters
   const BenchmarkParams params_;
   /// @brief a barrier for syncing amount clients locally

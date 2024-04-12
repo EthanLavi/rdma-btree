@@ -118,18 +118,18 @@ int main(int argc, char **argv) {
         // If dedicated server-node, we must send IHT pointer and wait for clients to finish
         threads.emplace_back(std::thread([&](){
             // Initialize X connections
-            remus::util::tcp::SocketManager socket_handle = remus::util::tcp::SocketManager(PORT_NUM);
+            remus::util::tcp::SocketManager* socket_handle = new remus::util::tcp::SocketManager(PORT_NUM);
             for(int i = 0; i < params.thread_count * params.node_count; i++){
                 // TODO: Can we have a per-node connection?
                 // I haven't gotten around to coming up with a clean way to reduce the number of sockets connected to the server
-                socket_handle.accept_conn();
+                socket_handle->accept_conn();
             }
             // Create a root ptr to the IHT
             IHT iht = IHT(host, params.cache_depth, pools[0]);
             rdma_ptr<anon_ptr> root_ptr = iht.InitAsFirst(pools[0]);
             // Send the root pointer over
             remus::util::tcp::message ptr_message = remus::util::tcp::message(root_ptr.raw());
-            socket_handle.send_to_all(&ptr_message);
+            socket_handle->send_to_all(&ptr_message);
             // We are the server
             ExperimentManager::ClientStopBarrier(socket_handle, params.runtime);
             REMUS_INFO("[SERVER THREAD] -- End of execution; -- ");
@@ -137,9 +137,9 @@ int main(int argc, char **argv) {
     }
 
     // Initialize T endpoints, one for each thread
-    remus::util::tcp::EndpointManager endpoint_managers[params.thread_count];
+    remus::util::tcp::EndpointManager* endpoint_managers[params.thread_count];
     for(uint16_t i = 0; i < params.thread_count; i++){
-        endpoint_managers[i] = remus::util::tcp::EndpointManager(PORT_NUM, host.address.c_str());
+        endpoint_managers[i] = new remus::util::tcp::EndpointManager(PORT_NUM, host.address.c_str());
     }
 
     // Barrier to start all the clients at the same time
@@ -166,7 +166,7 @@ int main(int argc, char **argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10)); 
             // Get the data from the server to init the IHT
             remus::util::tcp::message ptr_message;
-            endpoint_managers[thread_index].recv_server(&ptr_message);
+            endpoint_managers[thread_index]->recv_server(&ptr_message);
             iht->InitFromPointer(rdma_ptr<anon_ptr>(ptr_message.get_first()));
             
             REMUS_DEBUG("Creating client");
@@ -203,6 +203,9 @@ int main(int argc, char **argv) {
         REMUS_DEBUG("Syncing {}", ++i);
         auto t = it;
         t->join();
+    }
+    for(int i = 0; i < params.thread_count; i++){
+        delete endpoint_managers[i];
     }
     // [mfs]  Again, odd use of protobufs for relatively straightforward combining
     //        of results.  Or am I missing something, and each node is sending its
