@@ -1,6 +1,7 @@
+#pragma once
+
 #include <barrier>
 #include <chrono>
-#include <cstdlib>
 #include <optional>
 #include <random>
 #include <utility>
@@ -8,22 +9,19 @@
 #include <remus/workload/workload_driver.h>
 #include <remus/logging/logging.h>
 #include <remus/util/tcp/tcp.h>
+#include <remus/rdma/rdma.h>
 
 #include "common.h"
 #include "experiment.h"
-#include "protos/experiment.pb.h"
-// #include "structures/hashtable.h"
-#include "iht_ds.h"
+#include "tcp_barrier.h"
 #include "common.h"
+// #include "structures/hashtable.h"
 // #include "structures/test_map.h"
 
 using remus::WorkloadDriver;
 using namespace remus::rdma;
 using namespace remus::util;
 using namespace std;
-
-// todo: define elsewhere
-typedef RdmaIHT<int, int, CNF_ELIST_SIZE, CNF_PLIST_SIZE> IHT;
 
 // Function to run a test case (will return a success code)
 inline bool test_output(bool show_passing, optional<int> actual, optional<int> expected, string message) {
@@ -237,16 +235,7 @@ public:
   //        a barrier, then why not just make a barrier?
   remus::util::Status Stop() {
     REMUS_DEBUG("CLIENT :: Stopping client...");
-
-    // send the ack to let the server know that we are done
-    tcp::message send_buffer;
-    endpoint_->send_server(&send_buffer);
-    REMUS_DEBUG("CLIENT :: Sent Ack");
-
-    // Wait to receive an ack back. Letting us know that the other clients are done.
-    tcp::message recv_buffer;
-    endpoint_->recv_server(&recv_buffer);
-    REMUS_DEBUG("CLIENT :: Received Ack");
+    ExperimentManager::ClientArriveBarrier(endpoint_);
     return Status::Ok();
   }
 

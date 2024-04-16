@@ -1,5 +1,4 @@
-#include <algorithm>
-#include <atomic>
+#pragma once
 
 #include <remus/logging/logging.h>
 #include <remus/util/tcp/tcp.h>
@@ -7,6 +6,16 @@
 using namespace remus::util;
 
 namespace ExperimentManager {
+/// A barrier to arrive at. Joined with ServerStopBarrier
+inline void ClientArriveBarrier(tcp::EndpointManager* socket_handle){
+  // Receive a message from all clients to sync
+  tcp::message msg;
+  socket_handle->send_server(&msg);
+  REMUS_DEBUG("CLIENT :: Sent ack");
+  socket_handle->recv_server(&msg);
+  REMUS_DEBUG("CLIENT :: Recevied ack");
+}
+
 /// @brief Sleep (to avoid taking up resources) and then try to sync a exit with the clients
 /// @param socket_handle the socket manager resource for communicating with remote clients
 /// @param runtime_s how long to wait before listening for finishing messages
@@ -14,9 +23,8 @@ namespace ExperimentManager {
 /// [esl] IMP: cleanup was removed because it is used in the other hashmap but not the IHT
 ///            Thus it is not necessary for a minimal IHT. I left it in the documentation because I'd like 
 ///            to revisit implementing a cleanup function to allow for things such as remote deallocation.
-/// [esl]      TODO: the code in this file is small, it could be moved to main?
 /// @return ok status
-inline void ClientStopBarrier(tcp::SocketManager* socket_handle, int runtime_s) {
+inline void ServerStopBarrier(tcp::SocketManager* socket_handle, int runtime_s) {
   // Sleep while clients are running if there is a set runtime.
   if (runtime_s > 0) {
     REMUS_INFO("SERVER :: Sleeping for {}", runtime_s);
