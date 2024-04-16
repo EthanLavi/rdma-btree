@@ -2,10 +2,12 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <remus/rdma/memory_pool.h>
 #include <remus/rdma/rdma.h>
 #include <remus/rdma/rdma_ptr.h>
 #include <shared_mutex>
+#include <vector>
 
 #include "mark_ptr.h"
 #include "cached_ptr.h"
@@ -15,7 +17,7 @@ using namespace remus::rdma;
 
 class Object {};
 
-// todo: fix memory issue (all of it is in rdma accessible memory when only the addresses need to be)
+// todo: fix memory issue (all of it is in rdma accessible memory when only the addresses need to be)? Better for cache?
 struct CacheLine {
     uint64_t address;
     int priority;
@@ -23,14 +25,8 @@ struct CacheLine {
     rdma_ptr<Object> local_ptr;
 };
 
-struct CacheDescriptor {
-    int peer;
-    uint64_t ptr;
-};
-
 class RemoteCache {
 private:
-    shared_ptr<rdma_capability> pool; // todo: static?
     rdma_ptr<CacheLine> origin_address;
     vector<rdma_ptr<CacheLine>> remote_caches;
     CacheLine* lines;
@@ -39,7 +35,8 @@ private:
     template <typename T>
     uint64_t hash(rdma_ptr<T> ptr){
         // auto hashed = ptr.id() ^ ptr.address();
-        auto hashed = ptr.address() / 8;
+        // auto hashed = ptr.address() / 8;
+        auto hashed = ptr.address() / 64;
         
         // mix13
         // hashed ^= (hashed >> 33);
@@ -55,10 +52,11 @@ private:
 public:
     /// Metrics for the thread across all caches
     thread_local static CacheMetrics metrics;
+    thread_local static shared_ptr<rdma_capability> pool;
 
-    RemoteCache(shared_ptr<rdma_capability> pool) : pool(pool) {
-        size = 2000;
-        origin_address = pool->Allocate<CacheLine>(size);
+    RemoteCache(shared_ptr<rdma_capability> intializer, int size = 2000) {
+        this->size = size;
+        origin_address = intializer->Allocate<CacheLine>(size);
         REMUS_INFO("CacheLine start: {}, CacheLine end: {}", origin_address, origin_address + size);
         lines = (CacheLine*) origin_address.address();
         for(int i = 0; i < size; i++){
@@ -75,7 +73,13 @@ public:
             rdma_ptr<CacheLine> p = rdma_ptr<CacheLine>(peer_roots[i]);
             // don't mess with local cache
             if (pool->is_local(p)) continue;
-            remote_caches.push_back(p);
+            // avoid duplicates
+            bool is_dupl = false;
+            for(int i = 0; i < remote_caches.size(); i++){
+                if (remote_caches[i] == p) is_dupl = true;
+            }
+            if (!is_dupl)
+                remote_caches.push_back(p);
         }
     }
 
@@ -88,26 +92,45 @@ public:
         return origin_address.raw();
     }
 
+    /// Not thread safe. Use aside from operations
+    int count_empty_lines(){
+        int count = 0;
+        for(int i = 0; i < size; i++){
+            if (lines[i].address == 0) count++;
+        }
+        metrics.empty_lines = count;
+        return count;
+    }
+
+    /// Technically not thread safe
     void print_metrics(){
+        count_empty_lines();
         std::cout << metrics << std::endl;
     }
 
+    /// Technically not thread safe
     void reset_metrics(){
         metrics = CacheMetrics();
     }
 
     template <typename T>
-    CachedObject<T> Read(rdma_ptr<T> ptr, rdma_ptr<T> prealloc = nullptr){
+    inline CachedObject<T> Read(rdma_ptr<T> ptr, rdma_ptr<T> prealloc = nullptr){
+        return ExtendedRead(ptr, 1, prealloc);
+    }
+
+    template <typename T>
+    CachedObject<T> ExtendedRead(rdma_ptr<T> ptr, int count, rdma_ptr<T> prealloc = nullptr){
         // todo: do i need to mark the cache line as volatile?
         // todo: implement priorities
         // todo: resetting the address is not coherent with remote CAS?
+        // todo: what happens if I extendedRead the same pointer with different size
         rdma_ptr<T> result;
         bool temp;
         if (is_marked(ptr)){
             ptr = unmark_ptr(ptr);
             temp = false;
             CacheLine* l = &lines[hash(ptr) % size];
-            l->rwlock->lock_shared();
+            l->rwlock->lock(); // todo: upgrade lock on conditional write?
             if ((l->address & ~mask) == ptr.address()){
                 if (l->address & mask){
                     // Cache miss (coherence)
@@ -117,7 +140,7 @@ public:
                     //      ensure any writes that happen after this are recorded in the bit
                     l->address = l->address & ~mask; 
                     atomic_thread_fence(std::memory_order_seq_cst);
-                    l->local_ptr = static_cast<rdma_ptr<Object>>(pool->Read(ptr));
+                    l->local_ptr = static_cast<rdma_ptr<Object>>(pool->ExtendedRead(ptr, count));
                     result = static_cast<rdma_ptr<T>>(l->local_ptr);
                     metrics.remote_reads++;
                     metrics.coherence_misses++;
@@ -131,20 +154,20 @@ public:
                 // Cache miss (compulsory or conflict)
                 l->address = ptr.raw();
                 rdma_ptr<T> old_ptr = static_cast<rdma_ptr<T>>(l->local_ptr);
-                l->local_ptr = static_cast<rdma_ptr<Object>>(pool->Read(ptr));
+                l->local_ptr = static_cast<rdma_ptr<Object>>(pool->ExtendedRead(ptr, count));
                 result = static_cast<rdma_ptr<T>>(l->local_ptr);
                 metrics.remote_reads++;
                 metrics.conflict_misses++;
                 // capability->Deallocate(old_ptr); // todo: EBR
             }
-            l->rwlock->unlock_shared();
+            l->rwlock->unlock();
         } else {
             temp = true;
-            result = pool->Read(ptr, prealloc);
+            result = pool->ExtendedRead(ptr, count, prealloc);
             metrics.remote_reads++;
             metrics.allocation++;
         }
-        return CachedObject(pool, result, temp);
+        return CachedObject(pool, result, count, temp);
     }
 
     template <typename T>
@@ -192,3 +215,4 @@ public:
 };
 
 inline thread_local CacheMetrics RemoteCache::metrics = CacheMetrics();
+inline thread_local shared_ptr<rdma_capability> RemoteCache::pool = nullptr;
