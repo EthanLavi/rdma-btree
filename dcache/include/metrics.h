@@ -19,6 +19,8 @@ struct CacheMetrics {
     int conflict_misses;
     /// hit in the cache
     int hits;
+    /// Number of cold lines in the cache
+    int empty_lines;
 
     CacheMetrics(){
         remote_reads = 0;
@@ -29,6 +31,7 @@ struct CacheMetrics {
         coherence_misses = 0;
         conflict_misses = 0;
         hits = 0;
+        empty_lines = 0;
     }
 
     friend std::ostream& operator<<(std::ostream &os, const CacheMetrics &p) {
@@ -41,6 +44,7 @@ struct CacheMetrics {
                 << "  <RemoteWrite = " << p.remote_writes << "/>" << std::endl
                 << "  <RemoteCAS = " << p.remote_cas << "/>" << std::endl
                 << "  <CacheHits = " << p.hits << "/>" << std::endl
+                << "  <EmptyLines = " << p.empty_lines << "/>" << std::endl
                 << "</Metrics>" << std::endl;
     }
 };

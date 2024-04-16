@@ -26,7 +26,7 @@ private:
   typedef uint64_t lock_type;
   typedef rdma_ptr<lock_type> remote_lock;
   
-  struct pair_t {
+  struct alignas(64) pair_t {
     K key;
     V val;
 
@@ -113,7 +113,7 @@ private:
   std::shared_ptr<RemoteCache> cache;
 
 public:
-  RDMALinearProbingMap(std::shared_ptr<rdma_capability> pool, std::shared_ptr<RemoteCache> cache) : cache(cache) {
+  RDMALinearProbingMap(Peer& self, CacheDepth::CacheDepth, std::shared_ptr<RemoteCache> cache,  std::shared_ptr<rdma_capability> pool) : cache(cache) {
     temp_lock = pool->Allocate<lock_type>();
   };
 
