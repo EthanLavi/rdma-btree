@@ -22,6 +22,9 @@ public:
     CachedObject(CachedObject& o) = delete;
     CachedObject &operator=(CachedObject&) = delete;
     CachedObject(CachedObject&& o) {
+        if (this->temporary){
+            pool->Deallocate(obj, count);
+        }
         this->count = o.count;
         this->obj = o.obj;
         this->temporary = o.temporary;
@@ -29,6 +32,9 @@ public:
         o.temporary = false;
     }
     CachedObject &operator=(CachedObject&& o){
+        if (this->temporary){
+            pool->Deallocate(obj, count);
+        }
         this->count = o.count;
         this->obj = o.obj;
         this->temporary = o.temporary;
