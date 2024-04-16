@@ -105,7 +105,7 @@ public:
     /// Technically not thread safe
     void print_metrics(){
         count_empty_lines();
-        std::cout << metrics << std::endl;
+        REMUS_INFO("{}", metrics.as_string());
     }
 
     /// Technically not thread safe

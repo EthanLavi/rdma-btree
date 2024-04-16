@@ -1,6 +1,6 @@
 #pragma once
 
-#include <ostream>
+#include <string>
 
 /// A structure to capture the behavior of a cache
 struct CacheMetrics {
@@ -34,17 +34,19 @@ struct CacheMetrics {
         empty_lines = 0;
     }
 
-    friend std::ostream& operator<<(std::ostream &os, const CacheMetrics &p) {
-        return os << "<Metrics>" << std::endl
-                << "  <Allocations = " << p.allocation << "/>" << std::endl
-                << "  <Deallocations = " << p.deallocation << "/>" << std::endl
-                << "  <CoherenceMiss = " << p.coherence_misses << "/>" << std::endl
-                << "  <ConflictMiss = " << p.conflict_misses << "/>" << std::endl
-                << "  <RemoteRead = " << p.remote_reads << "/>" << std::endl
-                << "  <RemoteWrite = " << p.remote_writes << "/>" << std::endl
-                << "  <RemoteCAS = " << p.remote_cas << "/>" << std::endl
-                << "  <CacheHits = " << p.hits << "/>" << std::endl
-                << "  <EmptyLines = " << p.empty_lines << "/>" << std::endl
-                << "</Metrics>" << std::endl;
+    std::string as_string() {
+        std::string ss = "";
+        ss += "<Metrics>\n";
+        ss += "  <Allocations = " + std::to_string(allocation) + "/>\n";
+        ss += "  <Deallocations = " + std::to_string(deallocation) + "/>\n";
+        ss += "  <CoherenceMiss = " + std::to_string(coherence_misses) + "/>\n";
+        ss += "  <ConflictMiss = " + std::to_string(conflict_misses) + "/>\n";
+        ss += "  <RemoteRead = " + std::to_string(remote_reads) + "/>\n";
+        ss += "  <RemoteWrite = " + std::to_string(remote_writes) + "/>\n";
+        ss += "  <RemoteCAS = " + std::to_string(remote_cas) + "/>\n";
+        ss += "  <CacheHits = " + std::to_string(hits) + "/>\n";
+        ss += "  <EmptyLines = " + std::to_string(empty_lines) + "/>\n";
+        ss += "</Metrics>\n";
+        return ss;
     }
 };
