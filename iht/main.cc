@@ -10,7 +10,8 @@
 #include "common.h"
 #include "experiment.h"
 #include "role_client.h"
-#include "role_server.h"
+#include "tcp_barrier.h"
+#include "iht_ds.h"
 
 auto ARGS = {
     remus::util::I64_ARG("--node_id", "The node's id. (nodeX in cloudlab should have X in this option)"),
@@ -37,6 +38,8 @@ using namespace remus::rdma;
 // The optimial number of memory pools is mp=min(t, MAX_QP/n) where n is the number of nodes and t is the number of threads
 // To distribute mp (memory pools) across t threads, it is best for t/mp to be a whole number
 // IHT RDMA MINIMAL
+
+typedef RdmaIHT<int, int, CNF_ELIST_SIZE, CNF_PLIST_SIZE> IHT;
 
 int main(int argc, char **argv) {
     REMUS_INIT_LOG();
@@ -131,7 +134,7 @@ int main(int argc, char **argv) {
             remus::util::tcp::message ptr_message = remus::util::tcp::message(root_ptr.raw());
             socket_handle->send_to_all(&ptr_message);
             // We are the server
-            ExperimentManager::ClientStopBarrier(socket_handle, params.runtime);
+            ExperimentManager::ServerStopBarrier(socket_handle, params.runtime);
             REMUS_INFO("[SERVER THREAD] -- End of execution; -- ");
         }));
     }

@@ -9,7 +9,6 @@
 
 #include "common.h"
 #include "role_client.h"
-#include "role_server.h"
 #include "iht_ds.h"
 
 using namespace remus::util;
@@ -26,6 +25,8 @@ auto ARGS = {
 
 // The optimial number of memory pools is mp=min(t, MAX_QP/n) where n is the number of nodes and t is the number of threads
 // To distribute mp (memory pools) across t threads, it is best for t/mp to be a whole number
+
+typedef RdmaIHT<int, int, CNF_ELIST_SIZE, CNF_PLIST_SIZE> IHT;
 
 int main(int argc, char** argv){
     REMUS_INIT_LOG();
