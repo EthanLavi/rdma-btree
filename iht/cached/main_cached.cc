@@ -1,4 +1,3 @@
-#include <cassert>
 #include <vector>
 
 #include <protos/workloaddriver.pb.h>
@@ -8,12 +7,13 @@
 #include <remus/rdma/memory_pool.h>
 #include <remus/rdma/rdma.h>
 
-#include "map_cache.h"
+// #include "map_cache.h"
+#include "iht_ds_cached.h"
 
 #include "../common.h"
 #include "../experiment.h"
 #include "../role_client.h"
-#include "../role_server.h"
+#include "../tcp_barrier.h"
 
 #include "../../dcache/include/cache_store.h"
 
@@ -44,7 +44,8 @@ auto ARGS = {
 // IHT RDMA MINIMAL
 
 #define MAXKEY 1000
-typedef RDMALinearProbingMap<int, int, MAXKEY> KVStore;
+// typedef RDMALinearProbingMap<int, int, MAXKEY> KVStore;
+typedef RdmaIHT<int, int, CNF_ELIST_SIZE, CNF_PLIST_SIZE> KVStore;
 
 int main(int argc, char **argv) {
     REMUS_INIT_LOG();
@@ -141,14 +142,17 @@ int main(int argc, char **argv) {
             }
 
             // Create a root ptr to the IHT
-            KVStore iht = KVStore(pools[0], nullptr);
+            Peer p = Peer();
+            KVStore iht = KVStore(p, CacheDepth::None, nullptr, pools[0]);
             rdma_ptr<anon_ptr> root_ptr = iht.InitAsFirst(pools[0]);
             // Send the root pointer over
             tcp::message ptr_message = tcp::message(root_ptr.raw());
             socket_handle->send_to_all(&ptr_message);
 
-            // We are the server
-            ExperimentManager::ClientStopBarrier(socket_handle, params.runtime);
+            // Block until client is done, helping synchronize clients when they need
+            ExperimentManager::ServerStopBarrier(socket_handle, 0);
+            ExperimentManager::ServerStopBarrier(socket_handle, 0);
+            ExperimentManager::ServerStopBarrier(socket_handle, params.runtime);
 
             // Collect and redistribute the size deltas
             tcp::message deltas[params.node_count * params.thread_count];
@@ -156,6 +160,9 @@ int main(int argc, char **argv) {
             for(int i = 0; i < params.node_count * params.thread_count; i++){
                 socket_handle->send_to_all(&deltas[i]);
             }
+
+            // Wait until clients are done with correctness exchange (they all run count afterwards)
+            ExperimentManager::ServerStopBarrier(socket_handle, 0);
             delete socket_handle;
             REMUS_INFO("[SERVER THREAD] -- End of execution; -- ");
         }));
@@ -170,18 +177,17 @@ int main(int argc, char **argv) {
     // If the endpoint cant connect, it will just wait and retry later
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
+    // Create our remote cache (can initialize the cache space with any pool)
+    std::shared_ptr<RemoteCache> cache = make_shared<RemoteCache>(pools[0], 1000);
+
     // Barrier to start all the clients at the same time
     //
-    // [mfs]  This starts all the clients *on this thread*, but that's not really
+    // [mfs]  This starts all the clients *on this machine*, but that's not really
     //        a sufficient barrier.  A tree barrier is needed, to coordinate
     //        across nodes.
     // [esl]  Is this something that would need to be implemented using rome?
     //        I'm not exactly sure what the implementation of an RDMA barrier would look like. If you have one in mind, lmk and I can start working on it.
     std::barrier client_sync = std::barrier(params.thread_count);
-    // [mfs]  This seems like a misuse of protobufs: why would the local threads
-    //        communicate via protobufs?
-    // [esl]  Protobufs were a pain to code with. I think the ClientAdaptor returns a protobuf and I never understood why it didn't just return an object. 
-    // TODO:  In the refactoring of the client adaptor, remove dependency on protobufs for a workload object
     WorkloadDriverResult workload_results[params.thread_count];
     for(int i = 0; i < params.thread_count; i++){
         threads.emplace_back(std::thread([&](int thread_index){
@@ -189,8 +195,9 @@ int main(int argc, char **argv) {
             int mempool_index = thread_index % mp;
             std::shared_ptr<rdma_capability> pool = pools[mempool_index];
 
-            // Get the data for the cache stores
-            std::shared_ptr<RemoteCache> cache = make_shared<RemoteCache>(pool);
+            // initialize thread's thread_local pool
+            RemoteCache::pool = pool; 
+            // Exchange the root pointer of the other cache stores via TCP module
             tcp::message data(cache->root());
             vector<uint64_t> peer_roots;
             endpoint_managers[thread_index]->send_server(&data);
@@ -201,7 +208,7 @@ int main(int argc, char **argv) {
             cache->init(peer_roots);
 
             Peer self = peers.at((params.node_id * mp) + mempool_index);
-            std::shared_ptr<KVStore> iht = std::make_shared<KVStore>(pool, cache);
+            std::shared_ptr<KVStore> iht = std::make_shared<KVStore>(self, params.cache_depth, cache, pool);
             // Get the data from the server to init the IHT
             tcp::message ptr_message;
             endpoint_managers[thread_index]->recv_server(&ptr_message);
@@ -210,6 +217,7 @@ int main(int argc, char **argv) {
             REMUS_DEBUG("Creating client");
             // Create and run a client in a thread
             int delta = 0;
+            int populate_amount = 0;
             MapAPI* iht_as_map = new MapAPI(
                 [&](int key, int value){ 
                     auto res = iht->insert(pool, key, value);
@@ -225,14 +233,16 @@ int main(int argc, char **argv) {
                 [&](int op_count, int key_lb, int key_ub){
                     pool->RegisterThread();
                     delta += iht->populate(pool, op_count, key_lb, key_ub, [=](int key){ return key; });
-                    iht->count(pool); // ? IMPORTANT - Count hits every element which in effect warms up the cache
+                    ExperimentManager::ClientArriveBarrier(endpoint_managers[thread_index]);
+                    populate_amount = iht->count(pool); // ? IMPORTANT - Count hits every element which in effect warms up the cache
                                       // ? BENCHMARK EXECUTION STARTS WITH NO INVALID CACHE LINES
+                    ExperimentManager::ClientArriveBarrier(endpoint_managers[thread_index]);
                     REMUS_INFO("Cache Metrics After Populating");
                     cache->print_metrics();
                     cache->reset_metrics();
                 }
             );
-            REMUS_ASSERT(params.key_lb >= 2 && params.key_ub - params.key_lb <= 1000, "Keyspace is valid?");
+            // todo: for LinearProbingMap only REMUS_ASSERT(params.key_lb >= 2 && params.key_ub - params.key_lb <= 1000, "Keyspace is valid?");
             std::unique_ptr<Client<IHT_Op<int, int>>> client = Client<IHT_Op<int, int>>::Create(host, endpoint_managers[thread_index], params, &client_sync, iht_as_map);
             double populate_frac = 0.5 / (double) (params.node_count * params.thread_count);
 
@@ -244,15 +254,22 @@ int main(int argc, char **argv) {
             }
 
             // Check expected size
-            int expected_size = iht->count(pool);
+            int all_delta = 0;
             tcp::message d(delta);
             endpoint_managers[thread_index]->send_server(&d);
             for(int i = 0; i < params.node_count * params.thread_count; i++){
                 endpoint_managers[thread_index]->recv_server(&d);
-                expected_size -= d.get_first();
+                all_delta += d.get_first();
             }
-            REMUS_ASSERT(expected_size == 0, "Initial size + delta ==? Final size");
+            // add count after syncing via endpoint exchange
+            int final_size = iht->count(pool);
+            REMUS_INFO("Size (after populate) [{}]", populate_amount);
+            REMUS_INFO("Size (final) [{}]", final_size);
+            REMUS_INFO("Delta = {}", all_delta);
+            REMUS_ASSERT(final_size - all_delta == 0, "Initial size + delta ==? Final size");
+            
 
+            ExperimentManager::ClientArriveBarrier(endpoint_managers[thread_index]);
             REMUS_INFO("[CLIENT THREAD] -- End of execution; -- ");
             REMUS_INFO("Printing Metrics from Benchmark Execution");
             cache->print_metrics();

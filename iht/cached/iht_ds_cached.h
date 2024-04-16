@@ -1,6 +1,7 @@
 #pragma once
 
 #include <random>
+#include <remus/logging/logging.h>
 #include <remus/rdma/rdma.h>
 
 #include "../../dcache/include/cache_store.h"
@@ -83,10 +84,6 @@ private:
     return ptr.id() == self_.id;
   }
 
-  template <typename T> inline bool is_null(rdma_ptr<T> ptr) {
-    return ptr == nullptr;
-  }
-
   // Get the address of the lock at bucket (index)
   remote_lock get_lock(remote_plist arr_start, int index){
       uint64_t new_addy = arr_start.address();
@@ -105,13 +102,13 @@ private:
   /// @param p the plist pointer to init
   /// @param depth the depth of p, needed for PLIST_SIZE == base_size * (2 **
   /// (depth - 1)) pow(2, depth)
-  inline void InitPList(remote_plist p, int mult_modder) {
+  inline void InitPList(std::shared_ptr<rdma_capability> pool, remote_plist p, int mult_modder) {
     assert(sizeof(plist_pair_t) == 16); // Assert I did my math right...
     // memset(std::to_address(p), 0, 2 * sizeof(PList));
     for (size_t i = 0; i < PLIST_SIZE * mult_modder; i++){
-      p->buckets[i] = {
-        nullptr, E_UNLOCKED
-      };
+      remote_elist e_new = pool->Allocate<EList>();
+      e_new->count = 0;
+      p->buckets[i] = { static_cast<remote_baseptr>(e_new), E_UNLOCKED };
     }
   }
 
@@ -142,18 +139,11 @@ private:
   /// @param list_start the start of the plist (bucket list)
   /// @param bucket the bucket to manipulate
   /// @param baseptr the new pointer that bucket should have
-  //
-  // [mfs] I don't really understand this
-  // [esl] Is supposed to be a short-hand for manipulating the EList/PList pointer within a bucket.
-  //       I tried to update my documentation to make that more clear
   inline void change_bucket_pointer(std::shared_ptr<rdma_capability> pool, remote_plist list_start,
                                     uint64_t bucket, remote_baseptr baseptr) {
     rdma_ptr<remote_baseptr> bucket_ptr = get_baseptr(list_start, bucket);
-    // [mfs] Can this address manipulation be hidden?
-    // [esl] todo: I think Rome needs to support for the [] operator in the remote ptr...
-    //             Otherwise I am forced to manually calculate the pointer of a bucket
     if (!is_local(bucket_ptr)) {
-      pool->Write<remote_baseptr>(bucket_ptr, baseptr, temp_ptr);
+      cache->Write<remote_baseptr>(bucket_ptr, baseptr, temp_ptr);
     } else {
       *bucket_ptr = baseptr;
     }
@@ -187,7 +177,7 @@ private:
   /// @param pcount The number of elements in `parent`
   /// @param pdepth The depth of `parent`
   /// @param pidx   The index in `parent` of the bucket to rehash
-  remote_plist rehash(std::shared_ptr<rdma_capability> pool, CachedObject<PList> parent, size_t pcount, size_t pdepth,
+  remote_plist rehash(std::shared_ptr<rdma_capability> pool, rdma_ptr<PList> parent, size_t pcount, size_t pdepth,
                       size_t pidx) {
     // pow(2, pdepth);
     pcount = pcount * 2;
@@ -197,7 +187,7 @@ private:
     // 2 ^ (depth) ==> in other words (depth:factor). 0:1, 1:2, 2:4, 3:8, 4:16,
     // 5:32.
     remote_plist new_p = pool->Allocate<PList>(plist_size_factor);
-    InitPList(new_p, plist_size_factor);
+    InitPList(pool, new_p, plist_size_factor);
 
     // hash everything from the full elist into it
     remote_elist parent_bucket = static_cast<remote_elist>(parent->buckets[pidx].base);
@@ -208,11 +198,6 @@ private:
     // insert everything from the elist we rehashed into the plist
     for (size_t i = 0; i < source->count; i++) {
       uint64_t b = level_hash(source->pairs[i].key, pdepth + 1, pcount);
-      if (is_null(new_p->buckets[b].base)) {
-        remote_elist e = pool->Allocate<EList>();
-        new_p->buckets[b].base = static_cast<remote_baseptr>(e);
-        new_p->buckets[b].lock = E_UNLOCKED;
-      }
       remote_elist dest = static_cast<remote_elist>(new_p->buckets[b].base);
       dest->elist_insert(source->pairs[i]);
     }
@@ -229,88 +214,9 @@ private:
   rdma_ptr<remote_baseptr> temp_ptr;
   remote_elist temp_elist;
   // N.B. I don't bother creating preallocated PLists since we're hoping to cache them anyways :)
-
-  /// @brief Try to fetch the cached value for a remote pointer
-  /// If it is cached, then it returns a non null
-  PList* fetch_cache(int* bucket_path) {
-    return nullptr;
-  }
-
-  /// @brief Check if a PList is fully calcified, if so cache it
-  /// @return if it was cached
-  bool try_cache(remote_plist root_ptr, int* bucket_path) {
-    return false;
-  }
-
-  struct descent_context {
-    /// the elist (accessible elist, may be equal to bucket_base)
-    remote_elist e; 
-    /// the ptr to the original elist
-    remote_elist bucket_base;
-    /// The depth in the tree
-    size_t depth;
-    /// the number of buckets in the level
-    size_t count;
-    /// The bucket we are hased at
-    uint64_t bucket;
-    /// The ptr to the original current plist
-    remote_plist parent_ptr;
-    /// An accessible version of the current plist
-    CachedObject<PList> curr;
-  };
-
-  /// Descend to a elist and do an action on descent_context. Used to implement all functions
-  void do_with(std::shared_ptr<rdma_capability> pool, K key, std::function<bool(descent_context*)> apply){
-    // a context object with important variables
-    descent_context ctx;
-    // Define some constants
-    ctx.depth = 1;
-    ctx.count = PLIST_SIZE;
-    ctx.parent_ptr = root;
-
-    // start at root
-    ctx.curr = cache->Read<PList>(root);
-    
-    while (true) {
-      ctx.bucket = level_hash(key, ctx.depth, ctx.count);
-      // Normal descent
-      if (ctx.curr->buckets[ctx.bucket].lock == P_UNLOCKED){
-        auto bucket_base = static_cast<remote_plist>(ctx.curr->buckets[ctx.bucket].base);
-        // todo: ctx.curr.deallocate(pool);
-        // ctx.curr = cache->ExtendedRead<PList>(bucket_base, 1 << ctx.depth);
-        ctx.parent_ptr = bucket_base;
-        ctx.depth++;
-        ctx.count *= 2;
-        continue;
-      }
-
-      // Erroneous descent into EList (Think we are at an EList, but it turns out its a PList)
-      if (!acquire(pool, get_lock(ctx.parent_ptr, ctx.bucket))){
-          // We must re-fetch the PList to ensure freshness of our pointers (1 << depth-1 to adjust size of read with customized ExtendedRead)
-          // todo: ctx.curr.deallocate(pool);
-          // ctx.curr = cache->ExtendedRead<PList>(ctx.parent_ptr, 1 << (ctx.depth - 1));
-          continue;
-      }
-
-      // We locked an elist, we can read the baseptr and progress
-      ctx.bucket_base = static_cast<remote_elist>(ctx.curr->buckets[ctx.bucket].base);
-      // Past this point we have recursed to an elist
-      ctx.e = is_local(ctx.bucket_base) || is_null(ctx.bucket_base) ? ctx.bucket_base : pool->Read<EList>(ctx.bucket_base, temp_elist);
-      // apply function to the elist
-      if (apply(&ctx)){
-        unlock(pool, get_lock(ctx.parent_ptr, ctx.bucket), E_UNLOCKED);
-        // deallocate plist that brought us to the elist & exit
-        // todo: ctx.curr.deallocate(pool);
-        break;
-      } else {
-        unlock(pool, get_lock(ctx.parent_ptr, ctx.bucket), P_UNLOCKED);
-        continue;
-      }
-    }
-  }
-
 public:
-  RdmaIHT(Peer& self, std::shared_ptr<RemoteCache> cache, std::shared_ptr<rdma_capability> pool) : self_(std::move(self)), cache(cache) {
+  RdmaIHT(Peer& self, CacheDepth::CacheDepth depth, std::shared_ptr<RemoteCache> cache, std::shared_ptr<rdma_capability> pool) 
+  : self_(std::move(self)), cache_depth_(depth), cache(cache) {
     // I want to make sure we are choosing PLIST_SIZE and ELIST_SIZE to best use the space (b/c of alignment)
     if ((PLIST_SIZE * sizeof(plist_pair_t)) % 64 != 0) {
       // PList must use all its space to obey the space requirements
@@ -344,7 +250,7 @@ public:
   /// @return the iht root pointer
   rdma_ptr<anon_ptr> InitAsFirst(std::shared_ptr<rdma_capability> pool){
       remote_plist iht_root = pool->Allocate<PList>();
-      InitPList(iht_root, 1);
+      InitPList(pool, iht_root, 1);
       this->root = iht_root;
       return static_cast<rdma_ptr<anon_ptr>>(iht_root);
   }
@@ -360,22 +266,50 @@ public:
   /// @param key the key to search on
   /// @return an optional containing the value, if the key exists
   std::optional<V> contains(std::shared_ptr<rdma_capability> pool, K key) {
-    std::optional<V> result = std::nullopt;
-    do_with(pool, key, [&](descent_context* ctx){
-      if (is_null(ctx->e)) return true;
+    // Define some constants
+    size_t depth = 1;
+    size_t count = PLIST_SIZE;
+    remote_plist parent_ptr = root;
+
+    // start at root
+    CachedObject<PList> curr = cache->Read<PList>(root);
+
+    while (true) {
+      uint64_t bucket = level_hash(key, depth, count);
+      // Normal descent
+      if (curr->buckets[bucket].lock == P_UNLOCKED){
+        auto bucket_base = static_cast<remote_plist>(curr->buckets[bucket].base);
+        curr = cache->ExtendedRead<PList>(bucket_base, 1 << depth);
+        parent_ptr = bucket_base;
+        depth++;
+        count *= 2;
+        continue;
+      }
+
+      // Erroneous descent into EList (Think we are at an EList, but it turns out its a PList)
+      if (!acquire(pool, get_lock(parent_ptr, bucket))){
+          // We must re-fetch the PList to ensure freshness of our pointers (1 << depth-1 to adjust size of read with customized ExtendedRead)
+          curr = cache->ExtendedRead<PList>(parent_ptr, 1 << (depth - 1));
+          continue;
+      }
+
+      // We locked an elist, we can read the baseptr and progress
+      remote_elist bucket_base = static_cast<remote_elist>(curr->buckets[bucket].base);
+      // Past this point we have recursed to an elist
+      remote_elist e = is_local(bucket_base) ? bucket_base : pool->Read<EList>(bucket_base, temp_elist);
 
       // Get elist and linear search
-      for (size_t i = 0; i < ctx->e->count; i++) {
+      for (size_t i = 0; i < e->count; i++) {
         // Linear search to determine if elist already contains the key 
-        pair_t kv = ctx->e->pairs[i];
+        pair_t kv = e->pairs[i];
         if (kv.key == key) {
-          result = std::make_optional<V>(kv.val);
-          return true;
-        }
+          unlock(pool, get_lock(parent_ptr, bucket), E_UNLOCKED);
+          return std::make_optional<V>(kv.val);
+        }       
       }
-      return true;
-    });
-    return result;
+      unlock(pool, get_lock(parent_ptr, bucket), E_UNLOCKED);
+      return std::nullopt;
+    }
   }
 
   /// @brief Insert a key and value into the iht. Result will become the value
@@ -385,51 +319,67 @@ public:
   /// @param value the value to associate with the key
   /// @return an empty optional if the insert was successful. Otherwise it's the value at the key.
   std::optional<V> insert(std::shared_ptr<rdma_capability> pool, K key, V value) {
-    std::optional<V> result = std::nullopt;
-    do_with(pool, key, [&](descent_context* ctx){
-      // Past this point we have recursed to an elist
-      if (is_null(ctx->e)) {
-        // If we are we need to allocate memory for our elist
-        remote_elist e_new = pool->Allocate<EList>();
-        e_new->count = 0;
-        e_new->elist_insert(key, value);
-        remote_baseptr e_base = static_cast<remote_baseptr>(e_new);
-        // modify the parent's bucket's pointer and unlock
-        change_bucket_pointer(pool, ctx->parent_ptr, ctx->bucket, e_base);
-        // successful insert
-        return true;
+    // Define some constants
+    size_t depth = 1;
+    size_t count = PLIST_SIZE;
+    remote_plist parent_ptr = root;
+
+    // start at root
+    CachedObject<PList> curr = cache->Read<PList>(root);
+
+    while (true) {
+      uint64_t bucket = level_hash(key, depth, count);
+      // Normal descent
+      if (curr->buckets[bucket].lock == P_UNLOCKED){
+        auto bucket_base = static_cast<remote_plist>(curr->buckets[bucket].base);
+        curr = cache->ExtendedRead<PList>(bucket_base, 1 << depth);
+        parent_ptr = bucket_base;
+        depth++;
+        count *= 2;
+        continue;
       }
 
+      // Erroneous descent into EList (Think we are at an EList, but it turns out its a PList)
+      if (!acquire(pool, get_lock(parent_ptr, bucket))){
+          // We must re-fetch the PList to ensure freshness of our pointers (1 << depth-1 to adjust size of read with customized ExtendedRead)
+          curr = cache->ExtendedRead<PList>(parent_ptr, 1 << (depth - 1));
+          continue;
+      }
+
+      // We locked an elist, we can read the baseptr and progress
+      remote_elist bucket_base = static_cast<remote_elist>(curr->buckets[bucket].base);
+      remote_elist e = is_local(bucket_base) ? bucket_base : pool->Read<EList>(bucket_base, temp_elist);
+
       // We have recursed to an non-empty elist
-      for (size_t i = 0; i < ctx->e->count; i++) {
+      for (size_t i = 0; i < e->count; i++) {
         // Linear search to determine if elist already contains the key
-        pair_t kv = ctx->e->pairs[i];
+        pair_t kv = e->pairs[i];
         if (kv.key == key) {
-          result = std::make_optional<V>(kv.val);
-          return true;
+          std::optional<V> result = std::make_optional<V>(kv.val);
+          unlock(pool, get_lock(parent_ptr, bucket), E_UNLOCKED);
+          return result;
         }
       }
 
       // Check for enough insertion room
-      if (ctx->e->count < ELIST_SIZE) {
+      if (e->count < ELIST_SIZE) {
         // insert, unlock, return
-        ctx->e->elist_insert(key, value);
+        e->elist_insert(key, value);
         // If we are modifying a local copy, we need to write to the remote at the end
-        if (!is_local(ctx->bucket_base)) pool->Write<EList>(static_cast<remote_elist>(ctx->bucket_base), *ctx->e);
-        return true;
+        if (!is_local(bucket_base)) pool->Write<EList>(static_cast<remote_elist>(bucket_base), *e);
+        unlock(pool, get_lock(parent_ptr, bucket), E_UNLOCKED);
+        return std::nullopt;
       }
 
       // Need more room so rehash into plist and perma-unlock
-      // todo? Make it possible to prevent the loop by inserting with the current key/value in rehash function call
-      remote_plist p = rehash(pool, ctx->curr, ctx->count, ctx->depth, ctx->bucket);
+      remote_plist p = rehash(pool, curr.get(), count, depth, bucket);
 
       // modify the bucket's pointer, keeping local curr updated with remote curr
-      ctx->curr->buckets[ctx->bucket].base = static_cast<remote_baseptr>(p);
-      change_bucket_pointer(pool, ctx->parent_ptr, ctx->bucket, static_cast<remote_baseptr>(p));
-      ctx->curr->buckets[ctx->bucket].lock = P_UNLOCKED;
-      return false;
-    });
-    return result;
+      curr->buckets[bucket].base = static_cast<remote_baseptr>(p);
+      change_bucket_pointer(pool, parent_ptr, bucket, static_cast<remote_baseptr>(p));
+      curr->buckets[bucket].lock = P_UNLOCKED;
+      unlock(pool, get_lock(parent_ptr, bucket), P_UNLOCKED);
+    }
   }
 
   /// @brief Will remove a value at the key. Will stored the previous value in
@@ -438,53 +388,111 @@ public:
   /// @param key the key to remove at
   /// @return an optional containing the old value if the remove was successful. Otherwise an empty optional.
   std::optional<V> remove(std::shared_ptr<rdma_capability> pool, K key) {
-    std::optional<V> result = std::nullopt;
-    do_with(pool, key, [&](descent_context* ctx){
-      // If elist is null just return and unlock
-      if (is_null(ctx->e)) return true;
+    // Define some constants
+    size_t depth = 1;
+    size_t count = PLIST_SIZE;
+    remote_plist parent_ptr = root;
+
+    // start at root
+    CachedObject<PList> curr = cache->Read<PList>(root);
+
+    while (true) {
+      uint64_t bucket = level_hash(key, depth, count);
+      // Normal descent
+      if (curr->buckets[bucket].lock == P_UNLOCKED){
+        auto bucket_base = static_cast<remote_plist>(curr->buckets[bucket].base);
+        curr = cache->ExtendedRead<PList>(bucket_base, 1 << depth);
+        parent_ptr = bucket_base;
+        depth++;
+        count *= 2;
+        continue;
+      }
+
+      // Erroneous descent into EList (Think we are at an EList, but it turns out its a PList)
+      if (!acquire(pool, get_lock(parent_ptr, bucket))){
+          // We must re-fetch the PList to ensure freshness of our pointers (1 << depth-1 to adjust size of read with customized ExtendedRead)
+          curr = cache->ExtendedRead<PList>(parent_ptr, 1 << (depth - 1));
+          continue;
+      }
+
+      // We locked an elist, we can read the baseptr and progress
+      remote_elist bucket_base = static_cast<remote_elist>(curr->buckets[bucket].base);
+      // Past this point we have recursed to an elist
+      remote_elist e = is_local(bucket_base) ? bucket_base : pool->Read<EList>(bucket_base, temp_elist);
 
       // Get elist and linear search
-      for (size_t i = 0; i < ctx->e->count; i++) {
+      for (size_t i = 0; i < e->count; i++) {
         // Linear search to determine if elist already contains the value
-        pair_t kv = ctx->e->pairs[i];
+        pair_t kv = e->pairs[i];
         if (kv.key == key) {
-          result = std::make_optional<V>(kv.val); // saving the previous value at key
+          std::optional<V> result = std::make_optional<V>(kv.val); // saving the previous value at key
           // Edge swap if count != (0 or 1)
-          if (ctx->e->count > 1) {
-            ctx->e->pairs[i] = ctx->e->pairs[ctx->e->count - 1];
+          if (e->count > 1) {
+            e->pairs[i] = e->pairs[e->count - 1];
           }
-          ctx->e->count -= 1;
+          e->count -= 1;
           // If we are modifying the local copy, we need to write to the remote
-          if (!is_local(ctx->bucket_base)) pool->Write<EList>(static_cast<remote_elist>(ctx->bucket_base), *ctx->e);
+          if (!is_local(bucket_base)) pool->Write<EList>(static_cast<remote_elist>(bucket_base), *e);
+          unlock(pool, get_lock(parent_ptr, bucket), E_UNLOCKED);
+          return result;
         }
       }
-      return true;
-    });
-    return result;
+      unlock(pool, get_lock(parent_ptr, bucket), E_UNLOCKED);
+      return std::nullopt;
+    }
   }
 
   /// @brief Populate only works when we have numerical keys. Will add data
   /// @param pool the capability providing one-sided RDMA
-  /// @param op_count the number of values to insert. Recommended in total to do
-  /// key_range / 2
+  /// @param op_count the number of values to insert. Recommended in total to do key_range / 2
   /// @param key_lb the lower bound for the key range
   /// @param key_ub the upper bound for the key range
   /// @param value the value to associate with each key. Currently, we have
   /// asserts for result to be equal to the key. Best to set value equal to key!
-  void populate(std::shared_ptr<rdma_capability> pool, int op_count, K key_lb, K key_ub, std::function<K(V)> value) {
+  int populate(std::shared_ptr<rdma_capability> pool, int op_count, K key_lb, K key_ub, std::function<K(V)> value) {
     // Populate only works when we have numerical keys
     K key_range = key_ub - key_lb;
-    // todo: Under-populating because of insert collisions?
     // Create a random operation generator that is
     // - evenly distributed among the key range
+    int success_count = 0;
     std::uniform_real_distribution<double> dist = std::uniform_real_distribution<double>(0.0, 1.0);
-    std::default_random_engine gen(std::chrono::system_clock::now().time_since_epoch().count());
-    for (int c = 0; c < op_count; c++) {
+    std::default_random_engine gen(std::chrono::system_clock::now().time_since_epoch().count() * self_.id);
+    while (success_count != op_count) {
       int k = (dist(gen) * key_range) + key_lb;
-      insert(pool, k * 13, value(k) * 13);
-      // todo! remove^^^
+      if (insert(pool, k * 13, value(k) * 13) == std::nullopt) success_count++;
+      // todo! remove 13 trick^^^
       // Wait some time before doing next insert...
       std::this_thread::sleep_for(std::chrono::nanoseconds(10));
     }
+    return success_count;
+  }
+
+  /// Not thread safe
+  int count(std::shared_ptr<rdma_capability> pool){
+    return count_plist(pool, root, 1);
+  }
+
+private:
+  int count_plist(std::shared_ptr<rdma_capability> pool, remote_plist p, int size){
+    int count = 0;
+    remote_elist tmp = pool->Allocate<EList>();
+    remote_plist plocal_ = pool->ExtendedRead<PList>(p, size);
+    PList* plocal = to_address(plocal_);
+    for(int i = 0; i < (size * PLIST_SIZE); i++){
+      plist_pair_t pair = plocal->buckets[i];
+      if (pair.base == nullptr) continue;
+      if (pair.lock == E_UNLOCKED){
+        remote_elist elocal_ = pool->Read<EList>(static_cast<remote_elist>(pair.base), tmp);
+        EList* elocal = to_address(elocal_);
+        count += elocal->count;
+      } else if (pair.lock == E_LOCKED) {
+        REMUS_ERROR("Counting function should only be used on an IHT snapshot");
+      } else {
+        count += count_plist(pool, static_cast<remote_plist>(pair.base), size * 2);
+      }
+    }
+    pool->Deallocate<EList>(tmp);
+    pool->Deallocate<PList>(plocal_, size);
+    return count;
   }
 };
