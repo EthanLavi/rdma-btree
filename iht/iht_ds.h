@@ -8,10 +8,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <iterator>
 #include <memory>
 #include <optional>
-#include <unordered_map>
 
 using namespace remus::rdma;
 

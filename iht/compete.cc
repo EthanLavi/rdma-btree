@@ -7,7 +7,7 @@
 #include "common.h"
 #include "experiment.h"
 #include "role_client.h"
-#include "role_server.h"
+#include "tcp_barrier.h"
 #include "rpc.h"
 
 using namespace remus::util;
@@ -157,7 +157,7 @@ int main(int argc, char **argv) {
                 socket_handle.accept_conn();
             }
             // We are the server
-            ExperimentManager::ClientStopBarrier(socket_handle, params.runtime);
+            ExperimentManager::ServerStopBarrier(socket_handle, params.runtime);
             REMUS_INFO("[SERVER THREAD] -- End of execution; -- ");
         }));
     }
