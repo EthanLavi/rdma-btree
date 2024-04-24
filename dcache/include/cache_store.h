@@ -3,14 +3,15 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <remus/logging/logging.h>
 #include <remus/rdma/memory_pool.h>
 #include <remus/rdma/rdma.h>
 #include <remus/rdma/rdma_ptr.h>
 #include <shared_mutex>
 #include <vector>
 
-#include "mark_ptr.h"
 #include "cached_ptr.h"
+#include "mark_ptr.h"
 #include "metrics.h"
 
 using namespace remus::rdma;
@@ -81,6 +82,8 @@ public:
             if (!is_dupl)
                 remote_caches.push_back(p);
         }
+        // 1 to include themselves
+        REMUS_INFO("Number of peers in CacheClique {}", remote_caches.size() + 1);
     }
 
     ~RemoteCache(){
@@ -202,6 +205,45 @@ public:
                 // CAS the remote cache's address to have the mask
                 rdma_ptr<uint64_t> cache_line = static_cast<rdma_ptr<uint64_t>>(remote_caches[i][hash(ptr) % size]);
                 pool->CompareAndSwap<uint64_t>(cache_line, ptr.raw(), ptr.raw() | mask);
+                metrics.remote_cas++;
+                // todo: batch compare and swap
+            }
+            l->rwlock->unlock();
+            // todo: downgrade rw lock to read lock after we make the local switch, thus allowing reads to pass through but blocking writes
+        } else {
+            pool->Write(ptr, val, prealloc, write_behavior);
+            metrics.remote_writes++;
+        }
+    }
+
+    template <typename K, typename T>
+    void PartialWrite(rdma_ptr<K> object_ptr, rdma_ptr<T> ptr, const T& val, rdma_ptr<T> prealloc = nullptr, internal::RDMAWriteBehavior write_behavior = internal::RDMAWriteWithAck){
+        if (is_marked(object_ptr)){
+            object_ptr = unmark_ptr(object_ptr);
+            CacheLine* l = &lines[hash(object_ptr) % size];
+
+            l->rwlock->lock();
+            if ((l->address & ~mask) == object_ptr.address()){
+                // update my own cache if it is in there
+                // rdma_ptr<T> new_obj = pool->Allocate<T>();
+                // metrics.allocation++;
+                // *new_obj = val;
+                // rdma_ptr<T> old_ptr = static_cast<rdma_ptr<T>>(l->local_ptr);
+                // l->local_ptr = static_cast<rdma_ptr<Object>>(new_obj);
+                l->address = l->address | mask; // todo: uninvalidate the line
+                // capability->Deallocate(old_ptr); // todo: EBR
+            }
+            
+            // write to the value
+            // todo: check if ptr is local
+            pool->Write(ptr, val, prealloc, write_behavior);
+            metrics.remote_writes++;
+
+            // invalidate the other caches
+            for(int i = 0; i < remote_caches.size(); i++){
+                // CAS the remote cache's address to have the mask
+                rdma_ptr<uint64_t> cache_line = static_cast<rdma_ptr<uint64_t>>(remote_caches[i][hash(object_ptr) % size]);
+                pool->CompareAndSwap<uint64_t>(cache_line, object_ptr.raw(), object_ptr.raw() | mask);
                 metrics.remote_cas++;
                 // todo: batch compare and swap
             }

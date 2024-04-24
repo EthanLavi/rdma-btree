@@ -268,7 +268,6 @@ int main(int argc, char **argv) {
             REMUS_INFO("Delta = {}", all_delta);
             REMUS_ASSERT(final_size - all_delta == 0, "Initial size + delta ==? Final size");
             
-
             ExperimentManager::ClientArriveBarrier(endpoint_managers[thread_index]);
             REMUS_INFO("[CLIENT THREAD] -- End of execution; -- ");
             REMUS_INFO("Printing Metrics from Benchmark Execution");

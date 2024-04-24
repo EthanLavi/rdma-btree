@@ -5,6 +5,7 @@
 #include <remus/rdma/rdma.h>
 
 #include "../../dcache/include/cache_store.h"
+#include "../../dcache/include/cached_ptr.h"
 #include "../common.h"
 #include <cassert>
 #include <cstdint>
@@ -88,14 +89,14 @@ private:
   remote_lock get_lock(remote_plist arr_start, int index){
       uint64_t new_addy = arr_start.address();
       new_addy += (sizeof(plist_pair_t) * index) + 8;
-      return remote_lock(arr_start.id(), new_addy);
+      return unmark_ptr(remote_lock(arr_start.id(), new_addy));
   }
 
   // Get the address of the baseptr at bucket (index)
   rdma_ptr<remote_baseptr> get_baseptr(remote_plist arr_start, int index){
       uint64_t new_addy = arr_start.address();
       new_addy += sizeof(plist_pair_t) * index;
-      return rdma_ptr<remote_baseptr>(arr_start.id(), new_addy);
+      return unmark_ptr(rdma_ptr<remote_baseptr>(arr_start.id(), new_addy));
   }
 
   /// @brief Initialize the plist with values.
@@ -125,6 +126,8 @@ private:
       if (v == P_UNLOCKED) { return false; }
       // If we can switch from unlock to lock status
       if (v == E_UNLOCKED) { return true; }
+      // Check to make sure we aren't locking garbage
+      REMUS_ASSERT(v == E_LOCKED, "Normal lock state");
     }
   }
 
@@ -143,7 +146,8 @@ private:
                                     uint64_t bucket, remote_baseptr baseptr) {
     rdma_ptr<remote_baseptr> bucket_ptr = get_baseptr(list_start, bucket);
     if (!is_local(bucket_ptr)) {
-      cache->Write<remote_baseptr>(bucket_ptr, baseptr, temp_ptr);
+      // cache->Write<remote_baseptr>(bucket_ptr, baseptr, temp_ptr);
+      cache->PartialWrite<PList, remote_baseptr>(list_start, bucket_ptr, baseptr, temp_ptr);
     } else {
       *bucket_ptr = baseptr;
     }
@@ -184,8 +188,7 @@ private:
     // how much bigger than original size we are
     int plist_size_factor = (pcount / PLIST_SIZE);
 
-    // 2 ^ (depth) ==> in other words (depth:factor). 0:1, 1:2, 2:4, 3:8, 4:16,
-    // 5:32.
+    // 2 ^ (depth) ==> in other words (depth:factor). 0:1, 1:2, 2:4, 3:8, 4:16, 5:32.
     remote_plist new_p = pool->Allocate<PList>(plist_size_factor);
     InitPList(pool, new_p, plist_size_factor);
 
@@ -251,13 +254,15 @@ public:
   rdma_ptr<anon_ptr> InitAsFirst(std::shared_ptr<rdma_capability> pool){
       remote_plist iht_root = pool->Allocate<PList>();
       InitPList(pool, iht_root, 1);
-      this->root = iht_root;
+      this->root = mark_ptr(iht_root);
       return static_cast<rdma_ptr<anon_ptr>>(iht_root);
   }
 
   /// @brief Initialize an IHT from the pointer of another IHT
   /// @param root_ptr the root pointer of the other iht from InitAsFirst();
   void InitFromPointer(rdma_ptr<anon_ptr> root_ptr){
+      if (cache_depth_ >= 1)
+        root_ptr = mark_ptr(root_ptr);
       this->root = static_cast<remote_plist>(root_ptr);
   }
 
@@ -325,14 +330,15 @@ public:
     remote_plist parent_ptr = root;
 
     // start at root
-    CachedObject<PList> curr = cache->Read<PList>(root);
+    // todo: back to cache
+    CachedObject<PList> curr = cache->Read<PList>(unmark_ptr(root));
 
     while (true) {
       uint64_t bucket = level_hash(key, depth, count);
       // Normal descent
       if (curr->buckets[bucket].lock == P_UNLOCKED){
         auto bucket_base = static_cast<remote_plist>(curr->buckets[bucket].base);
-        curr = cache->ExtendedRead<PList>(bucket_base, 1 << depth);
+        curr = cache->ExtendedRead<PList>(unmark_ptr(bucket_base), 1 << depth);
         parent_ptr = bucket_base;
         depth++;
         count *= 2;
@@ -342,7 +348,7 @@ public:
       // Erroneous descent into EList (Think we are at an EList, but it turns out its a PList)
       if (!acquire(pool, get_lock(parent_ptr, bucket))){
           // We must re-fetch the PList to ensure freshness of our pointers (1 << depth-1 to adjust size of read with customized ExtendedRead)
-          curr = cache->ExtendedRead<PList>(parent_ptr, 1 << (depth - 1));
+          curr = cache->ExtendedRead<PList>(unmark_ptr(parent_ptr), 1 << (depth - 1));
           continue;
       }
 
@@ -373,6 +379,8 @@ public:
 
       // Need more room so rehash into plist and perma-unlock
       remote_plist p = rehash(pool, curr.get(), count, depth, bucket);
+      if (depth < cache_depth_)
+        p = mark_ptr(p);
 
       // modify the bucket's pointer, keeping local curr updated with remote curr
       curr->buckets[bucket].base = static_cast<remote_baseptr>(p);
@@ -476,7 +484,7 @@ private:
   int count_plist(std::shared_ptr<rdma_capability> pool, remote_plist p, int size){
     int count = 0;
     remote_elist tmp = pool->Allocate<EList>();
-    remote_plist plocal_ = pool->ExtendedRead<PList>(p, size);
+    CachedObject<PList> plocal_ = cache->ExtendedRead<PList>(p, size);
     PList* plocal = to_address(plocal_);
     for(int i = 0; i < (size * PLIST_SIZE); i++){
       plist_pair_t pair = plocal->buckets[i];
@@ -492,7 +500,6 @@ private:
       }
     }
     pool->Deallocate<EList>(tmp);
-    pool->Deallocate<PList>(plocal_, size);
     return count;
   }
 };

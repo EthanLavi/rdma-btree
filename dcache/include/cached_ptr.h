@@ -1,3 +1,5 @@
+#pragma once
+
 #include <remus/rdma/rdma.h>
 #include <remus/rdma/rdma_ptr.h>
 
