@@ -93,11 +93,11 @@ public:
     // [esl]  A remote barrier is defintely needed to make sure this all happens at the same time...
     int key_lb = client->params_.key_lb, key_ub = client->params_.key_ub;
     int op_count = (key_ub - key_lb) * frac;
-    REMUS_INFO("CLIENT :: Data structure ({}%) is being populated ({} items inserted) by this client", frac * 100, op_count);
+    REMUS_INFO("CLIENT :: ({}%) to populate (or {} items to insert)", frac * 100, op_count);
     // arrive at the barrier so we are populating in sync with local clients -- TODO: replace for remote barrier
     client->barrier_->arrive_and_wait();
     client->map_->prepare(op_count, key_lb, key_ub);
-    REMUS_DEBUG("CLIENT :: Done with populate!");
+    REMUS_INFO("CLIENT :: Done with populate!");
     // TODO: Sleeping for 1 second to account for difference between remote
     // client start times. Must fix this in the future to a better solution
     // The idea is even though remote nodes won't be starting a workload at the same
@@ -160,7 +160,7 @@ public:
     if (barr != nullptr) {
       barr->arrive_and_wait();
     }
-    REMUS_INFO("CLIENT :: Driver generated {}", driver.ToString());
+    REMUS_DEBUG("CLIENT :: Driver generated {}", driver.ToString());
     // [mfs]  It seems like these protos aren't being sent across machines.  Are
     //        they really needed?
     // [esl]  TODO: They are used by the workload driver. It was easier to live with

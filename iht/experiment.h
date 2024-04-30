@@ -136,24 +136,28 @@ public:
     }
 
     std::string result_as_debug_string(){
-        std::string builder = "Experimental Result {\n";
-        builder += "\tParams {\n";
-        builder += "\t\tnode_id: " + std::to_string(params.node_id) + "\n";
-        builder += "\t\truntime: " + std::to_string(params.runtime) + "\n";
-        builder += "\t\tunlimited_stream: " + std::to_string(params.unlimited_stream) + "\n";
-        builder += "\t\top_count: " + std::to_string(params.op_count) + "\n";
-        builder += "\t\tregion_size: " + std::to_string(params.region_size) + "\n";
-        builder += "\t\tthread_count: " + std::to_string(params.thread_count) + "\n";
-        builder += "\t\tnode_count: " + std::to_string(params.node_count) + "\n";
-        builder += "\t\tqp_max: " + std::to_string(params.qp_max) + "\n";
-        builder += "\t\tcontains: " + std::to_string(params.contains) + "\n";
-        builder += "\t\tinsert: " + std::to_string(params.insert) + "\n";
-        builder += "\t\tremove: " + std::to_string(params.remove) + "\n";
-        builder += "\t\tkey_lb: " + std::to_string(params.key_lb) + "\n";
-        builder += "\t\tkey_ub: " + std::to_string(params.key_ub) + "\n";
-        builder += "\t\tcache_depth: " + std::to_string(params.cache_depth) + "\n";
-        builder += "\t}\n";
-        builder += result.serialize();
-        return builder + "}";
+        if (REMUS_LOG_LEVEL != INFO){
+            std::string builder = "Experimental Result {\n";
+            builder += "\tParams {\n";
+            builder += "\t\tnode_id: " + std::to_string(params.node_id) + "\n";
+            builder += "\t\truntime: " + std::to_string(params.runtime) + "\n";
+            builder += "\t\tunlimited_stream: " + std::to_string(params.unlimited_stream) + "\n";
+            builder += "\t\top_count: " + std::to_string(params.op_count) + "\n";
+            builder += "\t\tregion_size: " + std::to_string(params.region_size) + "\n";
+            builder += "\t\tthread_count: " + std::to_string(params.thread_count) + "\n";
+            builder += "\t\tnode_count: " + std::to_string(params.node_count) + "\n";
+            builder += "\t\tqp_max: " + std::to_string(params.qp_max) + "\n";
+            builder += "\t\tcontains: " + std::to_string(params.contains) + "\n";
+            builder += "\t\tinsert: " + std::to_string(params.insert) + "\n";
+            builder += "\t\tremove: " + std::to_string(params.remove) + "\n";
+            builder += "\t\tkey_lb: " + std::to_string(params.key_lb) + "\n";
+            builder += "\t\tkey_ub: " + std::to_string(params.key_ub) + "\n";
+            builder += "\t\tcache_depth: " + std::to_string(params.cache_depth) + "\n";
+            builder += "\t}\n";
+            builder += result.serialize();
+            return builder + "}";
+        } else {
+            return result.qps.try_get_summary()->serialize();
+        }
     }
 };

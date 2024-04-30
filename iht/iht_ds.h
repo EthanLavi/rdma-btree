@@ -467,7 +467,7 @@ public:
       // PList must use all its space to obey the space requirements
       REMUS_FATAL("PList buckets must be continous. Therefore sizeof(PList) must be a multiple of 64. Try a multiple of 4");
     } else {
-      REMUS_INFO("PList Level 1 takes up {} bytes", PLIST_SIZE * sizeof(plist_pair_t));
+      REMUS_DEBUG("PList Level 1 takes up {} bytes", PLIST_SIZE * sizeof(plist_pair_t));
       assert(sizeof(PList) == PLIST_SIZE * sizeof(plist_pair_t));
     }
     auto size = ((ELIST_SIZE * sizeof(pair_t)) + sizeof(size_t));

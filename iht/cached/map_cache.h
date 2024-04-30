@@ -74,7 +74,7 @@ private:
   root_ptr root; // Start of plist
 
   /// Acquire a lock on the bucket. Will prevent others from modifying it
-  void acquire(std::shared_ptr<rdma_capability> pool, remote_lock lock) {
+  void acquire(rdma_capability* pool, remote_lock lock) {
     // Spin while trying to acquire the lock
     while (true) {
       // Can this be a CAS on an address within a PList?
@@ -88,7 +88,7 @@ private:
   /// @brief Unlock a lock ==> the reverse of acquire
   /// @param lock the lock to unlock
   /// @param unlock_status what should the end lock status be.
-  inline void unlock(std::shared_ptr<rdma_capability> pool, remote_lock lock) {
+  inline void unlock(rdma_capability* pool, remote_lock lock) {
     pool->Write<lock_type>(lock, UNLOCKED, temp_lock, internal::RDMAWriteWithNoAck);
   }
 
@@ -110,22 +110,22 @@ private:
   
   // preallocated memory for RDMA operations (avoiding frequent allocations)
   remote_lock temp_lock;
-  std::shared_ptr<RemoteCache> cache;
+  RemoteCache* cache;
 
 public:
-  RDMALinearProbingMap(Peer& self, CacheDepth::CacheDepth, std::shared_ptr<RemoteCache> cache,  std::shared_ptr<rdma_capability> pool) : cache(cache) {
+  RDMALinearProbingMap(Peer& self, CacheDepth::CacheDepth, RemoteCache* cache,  rdma_capability* pool) : cache(cache) {
     temp_lock = pool->Allocate<lock_type>();
   };
 
   /// Free all the resources associated with the IHT
-  void destroy(std::shared_ptr<rdma_capability> pool) {
+  void destroy(rdma_capability* pool) {
     pool->Deallocate(temp_lock);
   }
 
   /// @brief Create a fresh iht
   /// @param pool the capability to init the IHT with
   /// @return the iht root pointer
-  rdma_ptr<anon_ptr> InitAsFirst(std::shared_ptr<rdma_capability> pool){
+  rdma_ptr<anon_ptr> InitAsFirst(rdma_capability* pool){
       root_ptr iht_root = pool->Allocate<Map>();
       InitPList(iht_root);
       this->root = iht_root;
@@ -142,7 +142,7 @@ public:
   /// @param pool the capability providing one-sided RDMA
   /// @param key the key to search on
   /// @return an optional containing the value, if the key exists
-  std::optional<V> contains(std::shared_ptr<rdma_capability> pool, K key) {
+  std::optional<V> contains(rdma_capability* pool, K key) {
     auto global_lock = get_lock_ptr(root);
     acquire(pool, global_lock);
     bucket_ptr b = get_bucket_ptr(root);
@@ -169,7 +169,7 @@ public:
   /// @param key the key to insert
   /// @param value the value to associate with the key
   /// @return an empty optional if the insert was successful. Otherwise it's the value at the key.
-  std::optional<V> insert(std::shared_ptr<rdma_capability> pool, K key, V value) {
+  std::optional<V> insert(rdma_capability* pool, K key, V value) {
     auto global_lock = get_lock_ptr(root);
     acquire(pool, global_lock);
     bucket_ptr b = get_bucket_ptr(root);
@@ -205,7 +205,7 @@ public:
   /// @param pool the capability providing one-sided RDMA
   /// @param key the key to remove at
   /// @return an optional containing the old value if the remove was successful. Otherwise an empty optional.
-  std::optional<V> remove(std::shared_ptr<rdma_capability> pool, K key) {
+  std::optional<V> remove(rdma_capability* pool, K key) {
     auto global_lock = get_lock_ptr(root);
     acquire(pool, global_lock);
     bucket_ptr b = get_bucket_ptr(root);
@@ -233,7 +233,7 @@ public:
   /// Count the number of elements in the array
   /// @param pool the capability providing one-sided RDMA
   /// @return the number of elements in the map
-  int count(std::shared_ptr<rdma_capability> pool){
+  int count(rdma_capability* pool){
     auto global_lock = get_lock_ptr(root);
     acquire(pool, global_lock);
     bucket_ptr b = get_bucket_ptr(root);
@@ -257,7 +257,7 @@ public:
   /// @param key_ub the upper bound for the key range
   /// @param value the value to associate with each key. Currently, we have
   /// asserts for result to be equal to the key. Best to set value equal to key!
-  int populate(std::shared_ptr<rdma_capability> pool, int op_count, K key_lb, K key_ub, std::function<K(V)> value) {
+  int populate(rdma_capability* pool, int op_count, K key_lb, K key_ub, std::function<K(V)> value) {
     // Populate only works when we have numerical keys
     K key_range = key_ub - key_lb;
     // todo: Under-populating because of insert collisions?

@@ -104,14 +104,14 @@ int main(int argc, char **argv) {
     Peer host = peers.at(0);
     // Initialize memory pools into an array
     std::vector<std::thread> mempool_threads;
-    std::shared_ptr<rdma_capability> pools[mp];
+    rdma_capability* pools[mp];
     // Create multiple memory pools to be shared (have to use threads since Init is blocking)
     uint32_t block_size = 1 << params.region_size;
     for(int i = 0; i < mp; i++){
         mempool_threads.emplace_back(std::thread([&](int mp_index, int self_index){
             Peer self = peers.at(self_index);
             REMUS_DEBUG(mp != params.thread_count ? "Is shared" : "Is not shared");
-            std::shared_ptr<rdma_capability> pool = std::make_shared<rdma_capability>(self);
+            rdma_capability* pool = new rdma_capability(self);
             pool->init_pool(block_size, peers);
             pools[mp_index] = pool;
         }, i, (params.node_id * mp) + i));
@@ -150,9 +150,10 @@ int main(int argc, char **argv) {
             socket_handle->send_to_all(&ptr_message);
 
             // Block until client is done, helping synchronize clients when they need
-            ExperimentManager::ServerStopBarrier(socket_handle, 0);
-            ExperimentManager::ServerStopBarrier(socket_handle, 0);
-            ExperimentManager::ServerStopBarrier(socket_handle, params.runtime);
+            ExperimentManager::ServerStopBarrier(socket_handle, 0); // before populate
+            ExperimentManager::ServerStopBarrier(socket_handle, 0); // after populate
+            ExperimentManager::ServerStopBarrier(socket_handle, 0); // after count
+            ExperimentManager::ServerStopBarrier(socket_handle, params.runtime); // after operations
 
             // Collect and redistribute the size deltas
             tcp::message deltas[params.node_count * params.thread_count];
@@ -178,22 +179,16 @@ int main(int argc, char **argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     // Create our remote cache (can initialize the cache space with any pool)
-    std::shared_ptr<RemoteCache> cache = make_shared<RemoteCache>(pools[0], 1000);
+    RemoteCache* cache = new RemoteCache(pools[0], 1000);
 
     // Barrier to start all the clients at the same time
-    //
-    // [mfs]  This starts all the clients *on this machine*, but that's not really
-    //        a sufficient barrier.  A tree barrier is needed, to coordinate
-    //        across nodes.
-    // [esl]  Is this something that would need to be implemented using rome?
-    //        I'm not exactly sure what the implementation of an RDMA barrier would look like. If you have one in mind, lmk and I can start working on it.
     std::barrier client_sync = std::barrier(params.thread_count);
     WorkloadDriverResult workload_results[params.thread_count];
     for(int i = 0; i < params.thread_count; i++){
         threads.emplace_back(std::thread([&](int thread_index){
             // Get pool
             int mempool_index = thread_index % mp;
-            std::shared_ptr<rdma_capability> pool = pools[mempool_index];
+            rdma_capability* pool = pools[mempool_index];
 
             // initialize thread's thread_local pool
             RemoteCache::pool = pool; 
@@ -213,13 +208,13 @@ int main(int argc, char **argv) {
             tcp::message ptr_message;
             endpoint_managers[thread_index]->recv_server(&ptr_message);
             iht->InitFromPointer(rdma_ptr<anon_ptr>(ptr_message.get_first()));
-            
+
             REMUS_DEBUG("Creating client");
             // Create and run a client in a thread
             int delta = 0;
             int populate_amount = 0;
             MapAPI* iht_as_map = new MapAPI(
-                [&](int key, int value){ 
+                [&](int key, int value){
                     auto res = iht->insert(pool, key, value);
                     if (res == std::nullopt) delta++;
                     return res;
@@ -232,12 +227,12 @@ int main(int argc, char **argv) {
                 },
                 [&](int op_count, int key_lb, int key_ub){
                     pool->RegisterThread();
+                    ExperimentManager::ClientArriveBarrier(endpoint_managers[thread_index]);
                     delta += iht->populate(pool, op_count, key_lb, key_ub, [=](int key){ return key; });
                     ExperimentManager::ClientArriveBarrier(endpoint_managers[thread_index]);
                     populate_amount = iht->count(pool); // ? IMPORTANT - Count hits every element which in effect warms up the cache
                                       // ? BENCHMARK EXECUTION STARTS WITH NO INVALID CACHE LINES
                     ExperimentManager::ClientArriveBarrier(endpoint_managers[thread_index]);
-                    REMUS_INFO("Cache Metrics After Populating");
                     cache->print_metrics();
                     cache->reset_metrics();
                 }
@@ -263,14 +258,13 @@ int main(int argc, char **argv) {
             }
             // add count after syncing via endpoint exchange
             int final_size = iht->count(pool);
-            REMUS_INFO("Size (after populate) [{}]", populate_amount);
-            REMUS_INFO("Size (final) [{}]", final_size);
-            REMUS_INFO("Delta = {}", all_delta);
+            REMUS_DEBUG("Size (after populate) [{}]", populate_amount);
+            REMUS_DEBUG("Size (final) [{}]", final_size);
+            REMUS_DEBUG("Delta = {}", all_delta);
             REMUS_ASSERT(final_size - all_delta == 0, "Initial size + delta ==? Final size");
             
             ExperimentManager::ClientArriveBarrier(endpoint_managers[thread_index]);
             REMUS_INFO("[CLIENT THREAD] -- End of execution; -- ");
-            REMUS_INFO("Printing Metrics from Benchmark Execution");
             cache->print_metrics();
         }, i));
     }
@@ -286,19 +280,12 @@ int main(int argc, char **argv) {
     for(uint16_t i = 0; i < params.thread_count; i++){
         delete endpoint_managers[i];
     }
-    // [mfs]  Again, odd use of protobufs for relatively straightforward combining
-    //        of results.  Or am I missing something, and each node is sending its
-    //        results, so they are all accumulated at the main node?
-    // [esl]  Each thread will create a result proto. The result struct will parse this and save it in a csv which the launch script can scp.
     Result result[params.thread_count];
     for (int i = 0; i < params.thread_count; i++) {
         result[i] = Result(params, workload_results[i]);
         REMUS_INFO("Protobuf Result {}\n{}", i, result[i].result_as_debug_string());
     }
 
-    // [mfs] Does this produce one file per node?
-    // [esl] Yes, this produces one file per node, 
-    //       The launch.py script will scp this file and use the protobuf to interpret it
     std::ofstream filestream("iht_result.csv");
     filestream << Result::result_as_string_header();
     for (int i = 0; i < params.thread_count; i++) {
@@ -306,5 +293,10 @@ int main(int argc, char **argv) {
     }
     filestream.close();
     REMUS_INFO("[EXPERIMENT] -- End of execution; -- ");
+    // todo: deleting cache/pools needs to work
+    // delete cache;
+    // for(int i = 0; i < mp; i++){
+        // delete pools[mp];
+    // }
     return 0;
 }

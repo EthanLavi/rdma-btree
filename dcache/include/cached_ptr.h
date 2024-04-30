@@ -11,14 +11,14 @@ using namespace std;
 template <typename T>
 class CachedObject {
 private:
-    shared_ptr<rdma_capability> pool; // todo: make static so that we don't pass around pool?
+    rdma_capability* pool; // todo: make static so that we don't pass around pool?
     rdma_ptr<T> obj;
     bool temporary;
     int count;
 
 public:
     CachedObject() = default;
-    CachedObject(shared_ptr<rdma_capability> pool, rdma_ptr<T> obj, int count, bool temp) : pool(pool), obj(obj), count(count), temporary(temp) {}
+    CachedObject(rdma_capability* pool, rdma_ptr<T> obj, int count, bool temp) : pool(pool), obj(obj), count(count), temporary(temp) {}
 
     // delete copy but allow move
     CachedObject(CachedObject& o) = delete;
