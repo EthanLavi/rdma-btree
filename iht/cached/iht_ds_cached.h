@@ -3,6 +3,7 @@
 #include <atomic>
 #include <random>
 #include <remus/logging/logging.h>
+#include <remus/rdma/memory_pool.h>
 #include <remus/rdma/rdma.h>
 
 #include "../../dcache/include/cache_store.h"
@@ -136,7 +137,7 @@ private:
   /// @param lock the lock to unlock
   /// @param unlock_status what should the end lock status be.
   inline void unlock(rdma_capability* pool, remote_lock lock, uint64_t unlock_status) {
-    pool->Write<lock_type>(lock, unlock_status, temp_lock, internal::RDMAWriteWithAck);
+    pool->Write<lock_type>(lock, unlock_status, temp_lock, internal::RDMAWriteWithNoAck);
   }
 
   /// @brief Change the baseptr for a given bucket to point to a different EList or a different PList
@@ -181,9 +182,7 @@ private:
   /// @param pcount The number of elements in `parent`
   /// @param pdepth The depth of `parent`
   /// @param pidx   The index in `parent` of the bucket to rehash
-  remote_plist rehash(rdma_capability* pool, rdma_ptr<PList> parent, size_t pcount, size_t pdepth,
-                      size_t pidx) {
-    // pow(2, pdepth);
+  remote_plist rehash(rdma_capability* pool, rdma_ptr<PList> parent, size_t pcount, size_t pdepth, size_t pidx) {
     pcount = pcount * 2;
     // how much bigger than original size we are
     int plist_size_factor = (pcount / PLIST_SIZE);
@@ -205,7 +204,7 @@ private:
       dest->elist_insert(source->pairs[i]);
     }
     // Deallocate the old elist
-    // TODO replace for a remote deallocation at some point
+    // TODO replace for remote deallocation
     pool->Deallocate<EList>(source);
     return new_p;
   }
@@ -290,28 +289,35 @@ public:
         continue;
       }
 
-      // Erroneous descent into EList (Think we are at an EList, but it turns out its a PList)
-      if (!acquire(pool, get_lock(parent_ptr, bucket))){
-        // We must re-fetch the PList to ensure freshness of our pointers (1 << depth-1 to adjust size of read with customized ExtendedRead)
-        curr = cache->ExtendedRead<PList>(unmark_ptr(parent_ptr), 1 << (depth - 1));
-        continue;
+      // If we have a sizeof the elist 64, we can enable the lock-free GET
+      if (sizeof(EList) != 64){
+        // Erroneous descent into EList (Think we are at an EList, but it turns out its a PList)
+        if (!acquire(pool, get_lock(parent_ptr, bucket))){
+          // We must re-fetch the PList to ensure freshness of our pointers (1 << depth-1 to adjust size of read with customized ExtendedRead)
+          curr = cache->ExtendedRead<PList>(parent_ptr, 1 << (depth - 1));
+          continue;
+        }
       }
 
       // We locked an elist, we can read the baseptr and progress
       remote_elist bucket_base = static_cast<remote_elist>(curr->buckets[bucket].base);
       // Past this point we have recursed to an elist
-      remote_elist e = is_local(bucket_base) ? bucket_base : pool->Read<EList>(bucket_base, temp_elist);
+      remote_elist e = pool->Read<EList>(bucket_base, temp_elist);
 
       // Get elist and linear search
       for (size_t i = 0; i < e->count; i++) {
         // Linear search to determine if elist already contains the key 
         pair_t kv = e->pairs[i];
         if (kv.key == key) {
-          unlock(pool, get_lock(parent_ptr, bucket), E_UNLOCKED);
+          // If lock free get, no need to unlock
+          if (sizeof(EList) != 64)
+            unlock(pool, get_lock(parent_ptr, bucket), E_UNLOCKED);
           return std::make_optional<V>(kv.val);
         }
       }
-      unlock(pool, get_lock(parent_ptr, bucket), E_UNLOCKED);
+      // If lock free get, no need to unlock
+      if (sizeof(EList) != 64)
+        unlock(pool, get_lock(parent_ptr, bucket), E_UNLOCKED);
       return std::nullopt;
     }
   }
@@ -329,7 +335,6 @@ public:
     remote_plist parent_ptr = root;
 
     // start at root
-    // todo: back to cache
     CachedObject<PList> curr = cache->Read<PList>(root);
 
     while (true) {
@@ -347,7 +352,7 @@ public:
       // Erroneous descent into EList (Think we are at an EList, but it turns out its a PList)
       if (!acquire(pool, get_lock(parent_ptr, bucket))){
         // We must re-fetch the PList to ensure freshness of our pointers (1 << depth-1 to adjust size of read with customized ExtendedRead)
-        curr = cache->ExtendedRead<PList>(unmark_ptr(parent_ptr), 1 << (depth - 1));
+        curr = cache->ExtendedRead<PList>(parent_ptr, 1 << (depth - 1));
         continue;
       }
 
@@ -378,7 +383,7 @@ public:
 
       // Need more room so rehash into plist and perma-unlock
       remote_plist p = rehash(pool, curr.get(), count, depth, bucket);
-      if (depth < cache_depth_)
+      if (cache_depth_ > depth)
         p = mark_ptr(p);
 
       // modify the bucket's pointer, keeping local curr updated with remote curr
@@ -386,9 +391,10 @@ public:
       change_bucket_pointer(pool, parent_ptr, bucket, static_cast<remote_baseptr>(p));
       curr->buckets[bucket].lock = P_UNLOCKED;
       unlock(pool, get_lock(parent_ptr, bucket), P_UNLOCKED);
-      // todo: understand why this is so important!!
+      // Prevent invalidate occuring before unlock
       std::atomic_thread_fence(std::memory_order_seq_cst);
       // have to invalidate a line associated with the object at parent_ptr
+      // todo: async processing of unlock to ensure ordering (unlock -> invalidate)
       cache->Invalidate(parent_ptr);
     }
   }
@@ -422,7 +428,7 @@ public:
       // Erroneous descent into EList (Think we are at an EList, but it turns out its a PList)
       if (!acquire(pool, get_lock(parent_ptr, bucket))){
         // We must re-fetch the PList to ensure freshness of our pointers (1 << depth-1 to adjust size of read with customized ExtendedRead)
-        curr = cache->ExtendedRead<PList>(unmark_ptr(parent_ptr), 1 << (depth - 1));
+        curr = cache->ExtendedRead<PList>(parent_ptr, 1 << (depth - 1));
         continue;
       }
 
@@ -470,15 +476,14 @@ public:
     std::default_random_engine gen(std::chrono::system_clock::now().time_since_epoch().count() * self_.id);
     while (success_count != op_count) {
       int k = (dist(gen) * key_range) + key_lb;
-      if (insert(pool, k * 13, value(k) * 13) == std::nullopt) success_count++;
-      // todo! remove 13 trick^^^
+      if (insert(pool, k, value(k)) == std::nullopt) success_count++;
       // Wait some time before doing next insert...
       std::this_thread::sleep_for(std::chrono::nanoseconds(10));
     }
     return success_count;
   }
 
-  /// Not thread safe
+  /// No concurrent or thread safe. Counts the number of elements in the IHT
   int count(rdma_capability* pool){
     return count_plist(pool, root, 1);
   }

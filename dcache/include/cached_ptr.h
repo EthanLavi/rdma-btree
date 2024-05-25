@@ -11,23 +11,23 @@ using namespace std;
 template <typename T>
 class CachedObject {
 private:
-    rdma_capability* pool; // todo: make static so that we don't pass around pool?
-    rdma_ptr<T> obj;
+    rdma_capability* pool;  // todo: make static so that we don't pass around pool?
     bool temporary;
-    int count;
+    rdma_ptr<T> obj;
+    int size;
 
 public:
     CachedObject() = default;
-    CachedObject(rdma_capability* pool, rdma_ptr<T> obj, int count, bool temp) : pool(pool), obj(obj), count(count), temporary(temp) {}
+    CachedObject(rdma_capability* pool, rdma_ptr<T> obj, int size, bool temp) : pool(pool), obj(obj), size(size), temporary(temp) {}
 
     // delete copy but allow move
     CachedObject(CachedObject& o) = delete;
     CachedObject &operator=(CachedObject&) = delete;
     CachedObject(CachedObject&& o) {
         if (this->temporary){
-            pool->Deallocate(obj, count);
+            pool->Deallocate(obj, size);
         }
-        this->count = o.count;
+        this->size = o.size;
         this->obj = o.obj;
         this->temporary = o.temporary;
         this->pool = o.pool;
@@ -35,9 +35,9 @@ public:
     }
     CachedObject &operator=(CachedObject&& o){
         if (this->temporary){
-            pool->Deallocate(obj, count);
+            pool->Deallocate(obj, size);
         }
-        this->count = o.count;
+        this->size = o.size;
         this->obj = o.obj;
         this->temporary = o.temporary;
         this->pool = o.pool;
@@ -58,7 +58,7 @@ public:
 
     ~CachedObject(){
         if (temporary){
-            pool->Deallocate(obj, count);
+            pool->Deallocate(obj, size);
         }
     }
 

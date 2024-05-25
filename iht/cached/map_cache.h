@@ -263,17 +263,16 @@ public:
     // todo: Under-populating because of insert collisions?
     // Create a random operation generator that is
     // - evenly distributed among the key range
-    int inserts = 0;
+    int success_count = 0;
     std::uniform_real_distribution<double> dist = std::uniform_real_distribution<double>(0.0, 1.0);
     std::default_random_engine gen(std::chrono::system_clock::now().time_since_epoch().count());
-    for (int c = 0; c < op_count; c++) {
+    while (success_count != op_count) {
       int k = (dist(gen) * key_range) + key_lb;
-      auto res = insert(pool, k * 13, value(k) * 13);
-      // todo! remove^^ *13
-      if (res == std::nullopt) inserts++;
+      auto res = insert(pool, k, value(k));
+      if (res == std::nullopt) success_count++;
       // Wait some time before doing next insert...
       std::this_thread::sleep_for(std::chrono::nanoseconds(10));
     }
-    return inserts;
+    return success_count;
   }
 };

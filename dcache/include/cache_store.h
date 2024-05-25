@@ -38,7 +38,7 @@ private:
         // auto hashed = ptr.id() ^ ptr.address();
         // auto hashed = ptr.address() / 8;
         auto hashed = ptr.address() / 64;
-        
+
         // mix13
         // hashed ^= (hashed >> 33);
         // hashed *= 0xff51afd7ed558ccd;
@@ -68,12 +68,23 @@ public:
         }
     }
 
+    ~RemoteCache(){
+        pool->Deallocate(origin_address, size);
+    }
+
+    /// Get the root of the constructed cache
+    uint64_t root(){
+        return origin_address.raw();
+    }
+
     /// Initialize the cache with the roots of the other caches
     void init(vector<uint64_t> peer_roots){
         for(int i = 0; i < peer_roots.size(); i++){
             rdma_ptr<CacheLine> p = rdma_ptr<CacheLine>(peer_roots[i]);
             // don't mess with local cache
+            if (p.raw() == root()) continue;
             if (pool->is_local(p)) continue;
+
             // avoid duplicates
             bool is_dupl = false;
             for(int i = 0; i < remote_caches.size(); i++){
@@ -84,15 +95,6 @@ public:
         }
         // 1 to include themselves
         REMUS_INFO("Number of peers in CacheClique {}", remote_caches.size() + 1);
-    }
-
-    ~RemoteCache(){
-        pool->Deallocate(origin_address, size);
-    }
-
-    /// Get the root of the constructed cache
-    uint64_t root(){
-        return origin_address.raw();
     }
 
     /// Not thread safe. Use aside from operations
@@ -138,17 +140,17 @@ public:
                 if (l->address & mask){
                     // Cache miss (coherence)
                     rdma_ptr<T> old_ptr = static_cast<rdma_ptr<T>>(lines->local_ptr);
-                    // clear the invalid bit before reading 
+                    // clear the invalid bit before reading
                     //      ensure any writes that happen before this are noticed in the read
                     //      ensure any writes that happen after this are recorded in the bit
-                    l->address = l->address & ~mask; 
+                    l->address = l->address & ~mask;
                     atomic_thread_fence(std::memory_order_seq_cst);
                     l->local_ptr = static_cast<rdma_ptr<Object>>(pool->ExtendedRead(ptr, count));
                     l->size = count;
                     result = static_cast<rdma_ptr<T>>(l->local_ptr);
                     metrics.remote_reads++;
                     metrics.coherence_misses++;
-                    // capability->Deallocate(old_ptr); // todo: EBR
+                    // todo: EBR
                 } else {
                     // Cache hit
                     result = static_cast<rdma_ptr<T>>(l->local_ptr);
@@ -164,7 +166,7 @@ public:
                 result = static_cast<rdma_ptr<T>>(l->local_ptr);
                 metrics.remote_reads++;
                 metrics.conflict_misses++;
-                // capability->Deallocate(old_ptr); // todo: EBR
+                // todo: EBR
             }
             l->rwlock->unlock();
         } else {
@@ -173,7 +175,7 @@ public:
             metrics.remote_reads++;
             metrics.allocation++;
         }
-        return CachedObject(pool, result, count, temp);
+        return CachedObject<T>(pool, result, count, temp);
     }
 
     // todo: what if partial write to location is at head (API)
@@ -198,11 +200,11 @@ public:
                 *new_obj = val;
                 rdma_ptr<T> old_ptr = static_cast<rdma_ptr<T>>(l->local_ptr);
                 l->local_ptr = static_cast<rdma_ptr<Object>>(new_obj);
-                // capability->Deallocate(old_ptr); // todo: EBR
+                // todo: EBR
             }
-            
+
             // write to the value
-            // todo: check if ptr is local
+            // todo: check if ptr is local?
             pool->Write(ptr, val, prealloc, write_behavior);
             metrics.remote_writes++;
 
@@ -224,12 +226,13 @@ public:
 
     template <typename T>
     void Invalidate(rdma_ptr<T> ptr){
+        ptr = unmark_ptr(ptr);
         CacheLine* l = &lines[hash(ptr) % size];
         l->rwlock->lock();
         // Invalidate my own line
-        //if ((l->address & ~mask) == ptr.raw()){
+        if ((l->address & ~mask) == ptr.raw()){
             l->address = l->address | mask;
-        //}
+        }
         l->rwlock->unlock();
         // invalidate the other caches
         for(int i = 0; i < remote_caches.size(); i++){

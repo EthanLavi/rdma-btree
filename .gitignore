@@ -5,5 +5,6 @@ iht/scripts/results
 *.png
 .cache/
 scripts/log/
-
+remus/
+remus/remus-internal
 scripts/cloudlab.csv

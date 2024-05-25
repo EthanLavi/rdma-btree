@@ -121,9 +121,6 @@ public:
     function<Operation(void)> generator = [&]() {
       int rng = op_dist(gen);
       int k = k_dist(gen);
-      // todo: remove!
-      k *= 13;
-      // ! remove this^^^ changes the distribution!
       if (rng <= contains) {
         // between 0 and CONTAINS
         return Operation(CONTAINS, k, 0);
@@ -188,11 +185,6 @@ public:
     optional<int> res;
     switch (op.op_type) {
     case (CONTAINS):
-      // [mfs]  I don't understand the purpose of "progression".  Is it just for
-      //        getting periodic output?  If so, it's going to hurt the
-      //        experiment's latency, so it's probably a bad idea.
-      // [esl]  Periodic output helps me determine faster if my code is still running or if I've deadlocked
-      //        Changing it to REMUS_DEBUG to try and avoid hurting latency...
       if (count % progression == 0) {
         REMUS_DEBUG("Running Operation {}: contains({})", count, op.key);
       }

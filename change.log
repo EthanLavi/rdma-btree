@@ -159,3 +159,11 @@ public:
 };
 
 - examples/iht (Deleted directory)
+
++ In memory_pool.h
+if (conn_info_.find(ptr.id()) == conn_info_.end()) REMUS_ERROR("Cannot find {} as a node ID", ptr.id());
+auto info = conn_info_.at(ptr.id());
+
+// [esl] Getting the thread's index to determine it's owned flag
+if (this->thread_ids.find(std::this_thread::get_id()) == this->thread_ids.end()) 
+  REMUS_ERROR("Cannot find a thread ID. Make sure to call Register thread");
