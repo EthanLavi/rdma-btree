@@ -1,17 +1,17 @@
 {
     "qps_sample_rate": 10,
     "max_qps_second": -1,
-    "runtime": 15,
-    "unlimited_stream": false,
+    "runtime": 3,
+    "unlimited_stream": true,
     "op_count": 10000,
     "contains": 80,
     "insert": 10,
     "remove": 10,
     "key_lb": 5,
-    "key_ub": 1000,
-    "region_size": 22,
-    "thread_count": 2,
+    "key_ub": 10000,
+    "region_size": 25,
+    "thread_count": 8,
     "node_count": 2,
-    "qp_max": 1,
+    "qp_max": 30,
     "cache_depth": 0
 }
