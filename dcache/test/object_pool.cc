@@ -18,9 +18,13 @@ int main(){
     
     test(pool.fetch() == 1, "Empty pool calls generate");
     test(pool.fetch() == 2, "Empty pool still calls generate");
+    test(pool.empty(), "Pool has items unexpectedly");
     pool.release(10);
+    test(!pool.empty(), "Pool is unexpectedly empty");
     test(pool.fetch() == 10, "Release adds back to the pool");
+    test(pool.empty(), "Pool has items unexpectedly");
     test(pool.fetch() == 3, "Pool is now empty");
+    test(pool.empty(), "Pool has items unexpectedly");
 
-    REMUS_INFO("Passed all asserts");
+    REMUS_INFO("Test 1 -- PASSED");
 }

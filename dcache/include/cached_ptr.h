@@ -1,47 +1,72 @@
 #pragma once
 
+// #include "object_pool.h"
+#include <atomic>
+#include <remus/logging/logging.h>
 #include <remus/rdma/rdma.h>
 #include <remus/rdma/rdma_ptr.h>
 
 using namespace remus::rdma;
 using namespace std;
 
-/// It's not a problem to share via pointer. Just can only be deconstructed once
-/// A wrapper around rdma_ptr to handle conditional deallocation
+typedef std::atomic<int> ref_t;
+
+/// Cached object is given responsibility for decrementing the reference when it goes out of scope
+/// It can also only be moved so it will only ever decrease the value
 template <typename T>
 class CachedObject {
+    template<typename U>
+    friend class CachedObject;
 private:
-    rdma_capability* pool;  // todo: make static so that we don't pass around pool?
-    bool temporary;
+    ref_t* ref_count;
     rdma_ptr<T> obj;
     int size;
-
 public:
-    CachedObject() = default;
-    CachedObject(rdma_capability* pool, rdma_ptr<T> obj, int size, bool temp) : pool(pool), obj(obj), size(size), temporary(temp) {}
+    // Constructors
+    CachedObject() {
+        ref_count = nullptr;
+        obj = nullptr;
+    };
+
+    CachedObject(rdma_ptr<T> obj, int size, ref_t* ref_count) : obj(obj), size(size), ref_count(ref_count) {}
 
     // delete copy but allow move
     CachedObject(CachedObject& o) = delete;
-    CachedObject &operator=(CachedObject&) = delete;
+    CachedObject &operator=(CachedObject& o) = delete;
+
     CachedObject(CachedObject&& o) {
-        if (this->temporary){
-            pool->Deallocate(obj, size);
-        }
+        // Invalidate the moved from object since it takes ownership
         this->size = o.size;
+        this->ref_count = o.ref_count;
         this->obj = o.obj;
-        this->temporary = o.temporary;
-        this->pool = o.pool;
-        o.temporary = false;
+        o.size = 0;
+        o.ref_count = nullptr;
+        o.obj = nullptr;
     }
+
     CachedObject &operator=(CachedObject&& o){
-        if (this->temporary){
-            pool->Deallocate(obj, size);
+        if (ref_count != nullptr) {
+            int refs = ref_count->fetch_sub(1) - 1;
+            REMUS_ASSERT_DEBUG(refs >= 0, "Reference count became negative");
         }
+        // Swap object fields
         this->size = o.size;
+        this->ref_count = o.ref_count;
         this->obj = o.obj;
-        this->temporary = o.temporary;
-        this->pool = o.pool;
-        o.temporary = false;
+        o.size = 0;
+        o.ref_count = nullptr;
+        o.obj = nullptr;
+        return *this;
+    }
+
+    template <typename U>
+    CachedObject<T>& operator=(CachedObject<U>&& o) {
+        // Swap object fields
+        std::swap(this->size, o.size);
+        std::swap(this->ref_count, o.ref_count);
+        uint64_t tmp = this->obj.raw();
+        this->obj = rdma_ptr<T>(o.obj.raw());
+        o.obj = rdma_ptr<U>(tmp);
         return *this;
     }
 
@@ -52,14 +77,16 @@ public:
     T* operator->() const noexcept { return (T*) obj.address(); }
     T& operator*() const noexcept { return *((T*) obj.address()); }
 
-    template <typename U> friend std::ostream &operator<<(std::ostream &os, const CachedObject<U> &p) {
-        return os << p.obj;
-    }
+    // Compare the two
+    constexpr bool operator==(CachedObject<T> o) const volatile { return o.obj == obj && o.size == size; }
+
+    template <typename U> friend std::ostream &operator<<(std::ostream &os, const CachedObject<U> &p);
 
     ~CachedObject(){
-        if (temporary){
-            pool->Deallocate(obj, size);
-        }
+        if (ref_count == nullptr) return; // guard against empty objects
+        // Reduce number of references and deallocate if necessary
+        int refs = ref_count->fetch_sub(1) - 1;
+        REMUS_ASSERT_DEBUG(refs >= 0, "Reference count became negative");
     }
 
     /// The pointer returned by this object lives as long as the object is alive
@@ -67,4 +94,14 @@ public:
     rdma_ptr<T> get(){
         return obj;
     }
+
+    int get_ref_count(){
+        if (ref_count == nullptr) return 0;
+        return *ref_count;
+    }
 };
+
+/// Operator support for printing a rdma_ptr<U>
+template <typename U> std::ostream &operator<<(std::ostream &os, const CachedObject<U> &p) {
+  return os << p.obj;
+}
