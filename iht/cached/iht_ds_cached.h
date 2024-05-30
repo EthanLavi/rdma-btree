@@ -6,8 +6,9 @@
 #include <remus/rdma/memory_pool.h>
 #include <remus/rdma/rdma.h>
 
-#include "../../dcache/include/cache_store.h"
-#include "../../dcache/include/cached_ptr.h"
+#include <dcache/cache_store.h>
+#include <dcache/cached_ptr.h>
+
 #include "../common.h"
 #include <cassert>
 #include <cstdint>

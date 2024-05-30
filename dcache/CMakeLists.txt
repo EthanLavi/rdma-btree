@@ -1,5 +1,8 @@
 enable_testing()
 
+# Add the include directory to the include search path
+include_directories(../dcache/include)
+
 add_executable(mark_ptr_test test/mark_ptr.cc)
 target_link_libraries(mark_ptr_test PUBLIC remus::rdma remus::workload remus::util)
 add_test(mark_ptr_test mark_ptr_test)

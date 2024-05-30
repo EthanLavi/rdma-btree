@@ -12,8 +12,8 @@
 #include <optional>
 #include <stdexcept>
 
-#include "../../dcache/include/cache_store.h"
-#include "../../dcache/include/mark_ptr.h"
+#include <dcache/cache_store.h>
+#include <dcache/mark_ptr.h>
 
 using namespace remus::rdma;
 

@@ -1,3 +1,6 @@
+# Add the include directory to the include search path
+include_directories(../dcache/include)
+
 # Run a loop and compile separate executables for main, test, and the twosided competitor
 set(E1 "iht_rome")
 set(E2 "iht_rome_test")

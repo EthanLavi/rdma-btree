@@ -1,4 +1,4 @@
-#include "../include/object_pool.h"
+#include <dcache/object_pool.h>
 
 #include <functional>
 #include <remus/logging/logging.h>

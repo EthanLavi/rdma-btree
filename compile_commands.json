@@ -1,27 +1,27 @@
 [
   {
     "directory": "/workspaces/DOC/build/iht",
-    "command": "/usr/bin/c++ -DREMUS_LOG_LEVEL=DEBUG  -std=gnu++20 -o CMakeFiles/iht_rome.dir/main.cc.o -c /workspaces/DOC/iht/main.cc",
-    "file": "/workspaces/DOC/iht/main.cc"
-  },
-  {
-    "directory": "/workspaces/DOC/build/iht",
-    "command": "/usr/bin/c++ -DREMUS_LOG_LEVEL=DEBUG  -std=gnu++20 -o CMakeFiles/iht_rome_test.dir/test.cc.o -c /workspaces/DOC/iht/test.cc",
-    "file": "/workspaces/DOC/iht/test.cc"
-  },
-  {
-    "directory": "/workspaces/DOC/build/iht",
-    "command": "/usr/bin/c++ -DREMUS_LOG_LEVEL=DEBUG  -std=gnu++20 -o CMakeFiles/iht_twosided.dir/compete.cc.o -c /workspaces/DOC/iht/compete.cc",
-    "file": "/workspaces/DOC/iht/compete.cc"
+    "command": "/usr/bin/c++ -DFMT_LOCALE -DFMT_SHARED -DJSON_DIAGNOSTICS=0 -DJSON_USE_IMPLICIT_CONVERSIONS=1 -DREMUS_LOG_LEVEL=DEBUG -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB -I/workspaces/DOC/iht/../dcache/include -g -std=gnu++20 -o CMakeFiles/iht_rome_cached.dir/cached/main_cached.cc.o -c /workspaces/DOC/iht/cached/main_cached.cc",
+    "file": "/workspaces/DOC/iht/cached/main_cached.cc"
   },
   {
     "directory": "/workspaces/DOC/build/dcache",
-    "command": "/usr/bin/c++   -std=gnu++20 -o CMakeFiles/main.dir/main.cc.o -c /workspaces/DOC/dcache/main.cc",
-    "file": "/workspaces/DOC/dcache/main.cc"
-  },
-  {
-    "directory": "/workspaces/DOC/build/dcache",
-    "command": "/usr/bin/c++   -std=gnu++20 -o CMakeFiles/ptr_test.dir/test/mark_ptr.cc.o -c /workspaces/DOC/dcache/test/mark_ptr.cc",
+    "command": "/usr/bin/c++ -DFMT_LOCALE -DFMT_SHARED -DJSON_DIAGNOSTICS=0 -DJSON_USE_IMPLICIT_CONVERSIONS=1 -DREMUS_LOG_LEVEL=DEBUG -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB -I/workspaces/DOC/dcache/../dcache/include -g -std=gnu++20 -o CMakeFiles/mark_ptr_test.dir/test/mark_ptr.cc.o -c /workspaces/DOC/dcache/test/mark_ptr.cc",
     "file": "/workspaces/DOC/dcache/test/mark_ptr.cc"
+  },
+  {
+    "directory": "/workspaces/DOC/build/dcache",
+    "command": "/usr/bin/c++ -DFMT_LOCALE -DFMT_SHARED -DJSON_DIAGNOSTICS=0 -DJSON_USE_IMPLICIT_CONVERSIONS=1 -DREMUS_LOG_LEVEL=DEBUG -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB -I/workspaces/DOC/dcache/../dcache/include -g -std=gnu++20 -o CMakeFiles/cache_store_test.dir/test/cache_store.cc.o -c /workspaces/DOC/dcache/test/cache_store.cc",
+    "file": "/workspaces/DOC/dcache/test/cache_store.cc"
+  },
+  {
+    "directory": "/workspaces/DOC/build/dcache",
+    "command": "/usr/bin/c++ -DFMT_LOCALE -DFMT_SHARED -DJSON_DIAGNOSTICS=0 -DJSON_USE_IMPLICIT_CONVERSIONS=1 -DREMUS_LOG_LEVEL=DEBUG -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB -I/workspaces/DOC/dcache/../dcache/include -g -std=gnu++20 -o CMakeFiles/object_pool_test.dir/test/object_pool.cc.o -c /workspaces/DOC/dcache/test/object_pool.cc",
+    "file": "/workspaces/DOC/dcache/test/object_pool.cc"
+  },
+  {
+    "directory": "/workspaces/DOC/build/dcache",
+    "command": "/usr/bin/c++ -DFMT_LOCALE -DFMT_SHARED -DJSON_DIAGNOSTICS=0 -DJSON_USE_IMPLICIT_CONVERSIONS=1 -DREMUS_LOG_LEVEL=DEBUG -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB -I/workspaces/DOC/dcache/../dcache/include -g -std=gnu++20 -o CMakeFiles/cached_ptr_test.dir/test/cached_ptr.cc.o -c /workspaces/DOC/dcache/test/cached_ptr.cc",
+    "file": "/workspaces/DOC/dcache/test/cached_ptr.cc"
   }
   ]

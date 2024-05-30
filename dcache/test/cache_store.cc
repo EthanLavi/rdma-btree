@@ -1,5 +1,6 @@
-#include "../include/mark_ptr.h"
-#include "../include/cache_store.h"
+#include <dcache/mark_ptr.h>
+#include <dcache/cache_store.h>
+
 #include "faux_mempool.h"
 
 // Set remote cache static variables

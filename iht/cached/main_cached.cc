@@ -15,7 +15,7 @@
 #include "../role_client.h"
 #include "../tcp_barrier.h"
 
-#include "../../dcache/include/cache_store.h"
+#include <dcache/cache_store.h>
 
 using namespace remus::util;
 

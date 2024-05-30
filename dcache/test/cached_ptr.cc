@@ -1,8 +1,8 @@
 #include <remus/logging/logging.h>
 #include <remus/rdma/rdma.h>
 
+#include <dcache/cached_ptr.h>
 #include "faux_mempool.h"
-#include "../include/cached_ptr.h"
 
 using namespace remus::rdma;
 using namespace std;
