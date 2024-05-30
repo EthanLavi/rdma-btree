@@ -42,4 +42,6 @@ int main(){
     REMUS_ASSERT(j[11].id() == 2, "Incorrect id");
 
     REMUS_INFO("Test 1 -- PASSED");
+
+    return 0;
 }

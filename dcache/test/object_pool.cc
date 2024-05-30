@@ -3,11 +3,11 @@
 #include <functional>
 #include <remus/logging/logging.h>
 
-void test(bool condition, const char* message){
-    if (!condition){
-        REMUS_ERROR("Error: {}", message);
-        exit(1);
-    }
+#define test(condition, message){ \
+    if (!(condition)){ \
+        REMUS_ERROR("Error: {}", message); \
+        exit(1); \
+    } \
 }
 
 int main(){
@@ -27,4 +27,5 @@ int main(){
     test(pool.empty(), "Pool has items unexpectedly");
 
     REMUS_INFO("Test 1 -- PASSED");
+    return 0;
 }
