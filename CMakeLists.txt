@@ -34,5 +34,7 @@ message(STATUS "Using nlohmann_json version ${nlohmann_json_VERSION}")
 find_package(remus REQUIRED)
 message(STATUS "Using remus version ${remus_VERSION}")
 
+enable_testing()
+
 add_subdirectory(iht)
 add_subdirectory(dcache)

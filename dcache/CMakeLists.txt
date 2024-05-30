@@ -1,5 +1,3 @@
-enable_testing()
-
 # Add the include directory to the include search path
 include_directories(../dcache/include)
 

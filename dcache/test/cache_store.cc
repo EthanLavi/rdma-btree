@@ -55,6 +55,28 @@ void main_body(CountingPool* pool, RemoteCacheImpl<CountingPool>* cache){
     test(p5->x[2] == 0, "Check third value of x for safety");
     REMUS_INFO("Test 3 -- PASSED");
 
+    // -- Test 4 -- //
+    #define TRIAL_WIDTH 1000
+    rdma_ptr<Structure> ps[TRIAL_WIDTH];
+    for(int i = 0; i < TRIAL_WIDTH; i++){
+        ps[i] = pool->Allocate<Structure>();
+        ps[i]->x[0] = i;
+        ps[i]->x[1] = 0;
+    }
+    for(int i = 0; i < TRIAL_WIDTH * 10; i++){
+        int bucket = i % TRIAL_WIDTH;
+        int times_read = i / TRIAL_WIDTH;
+        rdma_ptr<Structure> at_ptr = mark_ptr(ps[bucket]);
+        CachedObject<Structure> tmp = cache->Read<Structure>(at_ptr);
+        test(tmp->x[0] == bucket, "Random read is correct value");
+        test(tmp->x[1] == times_read, "Read amount is correct");
+        tmp->x[1] += 1;
+        cache->Write<Structure>(at_ptr, *tmp);
+    }
+    for(int i = 0; i < TRIAL_WIDTH; i++){
+        pool->Deallocate<Structure>(ps[i]);
+    }
+
     pool->Deallocate<Structure>(p, 2);
 }
 
@@ -63,8 +85,18 @@ int main(){
     CountingPool* pool = new CountingPool(false);
 
     // Construct the remote cache
-    RemoteCacheImpl<CountingPool>* cache = new RemoteCacheImpl<CountingPool>(pool); // todo: same test with different pool
+    RemoteCacheImpl<CountingPool>* cache = new RemoteCacheImpl<CountingPool>(pool);
     RemoteCacheImpl<CountingPool>::pool = pool; // set pool to other pool so we acccept our own cacheline
+    cache->init({cache->root()}); // initialize with itself
+
+    main_body(pool, cache);
+
+    // Free memory
+    cache->free_all_tmp_objects();
+    delete cache;
+
+    // Construct the remote cache
+    cache = new RemoteCacheImpl<CountingPool>(pool, 4); // smaller cache so more conflicts
     cache->init({cache->root()}); // initialize with itself
 
     main_body(pool, cache);
