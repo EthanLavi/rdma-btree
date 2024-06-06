@@ -17,4 +17,8 @@ add_executable(cached_ptr_test test/cached_ptr.cc)
 target_link_libraries(cached_ptr_test PUBLIC remus::rdma remus::workload remus::util)
 add_test(cached_ptr_test cached_ptr_test)
 
+add_executable(cached_iht test/cached_iht.cc)
+target_link_libraries(cached_iht PUBLIC remus::rdma remus::workload remus::util)
+add_test(cached_iht cached_iht)
+
 # cmake .. && make && make test VERBOSE=1

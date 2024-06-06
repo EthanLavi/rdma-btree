@@ -58,11 +58,13 @@ void main_body(CountingPool* pool, RemoteCacheImpl<CountingPool>* cache){
     // -- Test 4 -- //
     #define TRIAL_WIDTH 1000
     rdma_ptr<Structure> ps[TRIAL_WIDTH];
+    // allocate an array of structures
     for(int i = 0; i < TRIAL_WIDTH; i++){
         ps[i] = pool->Allocate<Structure>();
         ps[i]->x[0] = i;
         ps[i]->x[1] = 0;
     }
+    // Test a psuedo-random element
     for(int i = 0; i < TRIAL_WIDTH * 10; i++){
         int bucket = i % TRIAL_WIDTH;
         int times_read = i / TRIAL_WIDTH;
@@ -73,10 +75,12 @@ void main_body(CountingPool* pool, RemoteCacheImpl<CountingPool>* cache){
         tmp->x[1] += 1;
         cache->Write<Structure>(at_ptr, *tmp);
     }
+    // free all the structures
     for(int i = 0; i < TRIAL_WIDTH; i++){
         pool->Deallocate<Structure>(ps[i]);
     }
 
+    // deallocate main pointer
     pool->Deallocate<Structure>(p, 2);
 }
 
