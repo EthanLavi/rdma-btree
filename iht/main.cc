@@ -73,10 +73,10 @@ int main(int argc, char **argv) {
     }
 
     // Determine the number of memory pools to use in the experiment
-    // Each memory pool represents 
+    // Each memory pool represents
     int mp = std::min(params.thread_count, (int) std::floor(params.qp_max / params.node_count));
     if (mp == 0) mp = 1; // Make sure if node_count > qp_max, we don't end up with 0 memory pools
-    
+
     REMUS_INFO("Distributing {} MemoryPools across {} threads", mp, params.thread_count);
 
     // Start initializing a vector of peers
@@ -210,19 +210,15 @@ int main(int argc, char **argv) {
     for(int i = 0; i < params.thread_count; i++){
         delete endpoint_managers[i];
     }
-    // [mfs]  Again, odd use of protobufs for relatively straightforward combining
-    //        of results.  Or am I missing something, and each node is sending its
-    //        results, so they are all accumulated at the main node?
-    // [esl]  Each thread will create a result proto. The result struct will parse this and save it in a csv which the launch script can scp.
+
+    // Print results to log file
     Result result[params.thread_count];
     for (int i = 0; i < params.thread_count; i++) {
         result[i] = Result(params, workload_results[i]);
         REMUS_INFO("Protobuf Result {}\n{}", i, result[i].result_as_debug_string());
     }
 
-    // [mfs] Does this produce one file per node?
-    // [esl] Yes, this produces one file per node, 
-    //       The launch.py script will scp this file and use the protobuf to interpret it
+    // Combine all the results into one csv for offline processing (won't merge results from different threads)
     std::ofstream filestream("iht_result.csv");
     filestream << Result::result_as_string_header();
     for (int i = 0; i < params.thread_count; i++) {

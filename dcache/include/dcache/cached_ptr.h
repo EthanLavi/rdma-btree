@@ -15,20 +15,21 @@ typedef std::atomic<int> ref_t;
 /// It can also only be moved so it will only ever decrease the value
 template <typename T>
 class CachedObject {
-    template<typename U>
-    friend class CachedObject;
 private:
     ref_t* ref_count;
     rdma_ptr<T> obj;
-    int size;
+    bool temp; // true if needs manual deallocation and isn't stored in a cache line
+    std::function<void()> dealloc;
 public:
     // Constructors
     CachedObject() {
         ref_count = nullptr;
         obj = nullptr;
+        temp = false;
     };
 
-    CachedObject(rdma_ptr<T> obj, int size, ref_t* ref_count) : obj(obj), size(size), ref_count(ref_count) {}
+    CachedObject(rdma_ptr<T> obj, ref_t* ref_count) : obj(obj), temp(false), ref_count(ref_count) {}
+    CachedObject(rdma_ptr<T> obj, std::function<void()> deallocator) : obj(obj), temp(true), ref_count(nullptr), dealloc(deallocator) {}
 
     // delete copy but allow move
     CachedObject(CachedObject& o) = delete;
@@ -36,37 +37,31 @@ public:
 
     CachedObject(CachedObject&& o) {
         // Invalidate the moved from object since it takes ownership
-        this->size = o.size;
         this->ref_count = o.ref_count;
         this->obj = o.obj;
-        o.size = 0;
+        this->temp = o.temp;
+        this->dealloc = o.dealloc;
         o.ref_count = nullptr;
         o.obj = nullptr;
+        o.temp = false;
     }
 
     CachedObject &operator=(CachedObject&& o){
+        if (temp){
+            dealloc();
+        }
         if (ref_count != nullptr) {
             int refs = ref_count->fetch_sub(1) - 1;
             REMUS_ASSERT_DEBUG(refs >= 0, "Reference count became negative");
         }
         // Swap object fields
-        this->size = o.size;
         this->ref_count = o.ref_count;
         this->obj = o.obj;
-        o.size = 0;
+        this->temp = o.temp;
+        this->dealloc = o.dealloc;
         o.ref_count = nullptr;
         o.obj = nullptr;
-        return *this;
-    }
-
-    template <typename U>
-    CachedObject<T>& operator=(CachedObject<U>&& o) {
-        // Swap object fields
-        std::swap(this->size, o.size);
-        std::swap(this->ref_count, o.ref_count);
-        uint64_t tmp = this->obj.raw();
-        this->obj = rdma_ptr<T>(o.obj.raw());
-        o.obj = rdma_ptr<U>(tmp);
+        o.temp = false;
         return *this;
     }
 
@@ -78,11 +73,15 @@ public:
     T& operator*() const noexcept { return *((T*) obj.address()); }
 
     // Compare the two
-    constexpr bool operator==(CachedObject<T> o) const volatile { return o.obj == obj && o.size == size; }
+    constexpr bool operator==(CachedObject<T> o) const volatile { return o.obj == obj; }
 
     template <typename U> friend std::ostream &operator<<(std::ostream &os, const CachedObject<U> &p);
 
     ~CachedObject(){
+        if (temp){
+            dealloc();
+            return;
+        }
         if (ref_count == nullptr) return; // guard against empty objects
         // Reduce number of references and deallocate if necessary
         int refs = ref_count->fetch_sub(1) - 1;

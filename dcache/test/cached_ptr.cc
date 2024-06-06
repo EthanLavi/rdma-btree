@@ -29,9 +29,9 @@ void test2(CountingPool* pool){
     std::atomic<int> ref_count;
     ref_count.store(3);
     {
-        CachedPtr objA = CachedPtr(ptrA, 1, &ref_count);
-        CachedPtr objB = CachedPtr(ptrA, 1, &ref_count);
-        CachedPtr objC = CachedPtr(ptrA, 1, &ref_count);
+        CachedPtr objA = CachedPtr(ptrA, &ref_count);
+        CachedPtr objB = CachedPtr(ptrA, &ref_count);
+        CachedPtr objC = CachedPtr(ptrA, &ref_count);
     }
     REMUS_ASSERT(ref_count.load() == 0, "Ref count is not 0, invalid number of decrements");
     pool->Deallocate(ptrA);
@@ -49,7 +49,7 @@ void test3(CountingPool* pool){
     std::atomic<int> ref_count;
     ref_count.store(1);
     {
-    CachedPtr obj2 = CachedPtr(ptr, 1, &ref_count);
+    CachedPtr obj2 = CachedPtr(ptr, &ref_count);
     CachedPtr obj3 = std::move(obj2);
     REMUS_ASSERT(obj3.get_ref_count() == 1, "Ref count is not the same (1) after move");
     REMUS_ASSERT(ref_count.load() == 1, "Number of decrements was invalid");
@@ -66,7 +66,7 @@ void test4(CountingPool* pool){
     std::atomic<int> ref_count;
     ref_count.store(1);
     {
-    CachedPtr obj5 = CachedPtr(ptr2, 1, &ref_count);
+    CachedPtr obj5 = CachedPtr(ptr2, &ref_count);
     {
     REMUS_ASSERT(obj5.get_ref_count() == 1, "Ref count is not 1 after construction");
     CachedPtr obj5_move = std::move(obj5);
@@ -90,8 +90,8 @@ void test5(CountingPool* pool){
     ref_count2.store(1);
 
     {
-    CachedPtr obj6 = CachedPtr(ptr3, 1, &ref_count1);
-    CachedPtr obj7 = CachedPtr(ptr4, 1, &ref_count2);
+    CachedPtr obj6 = CachedPtr(ptr3, &ref_count1);
+    CachedPtr obj7 = CachedPtr(ptr4, &ref_count2);
     obj6 = std::move(obj7);
     }
 
@@ -106,7 +106,7 @@ void test6(CountingPool* pool){
     std::atomic<int> ref_count;
     ref_count.store(1);
     {
-    CachedPtr obj8 = CachedPtr(ptr5, 3, &ref_count);
+    CachedPtr obj8 = CachedPtr(ptr5, &ref_count);
     }
     REMUS_ASSERT(ref_count.load() == 0, "Number of decrements was invalid");
     pool->Deallocate(ptr5, 3);
@@ -117,7 +117,7 @@ void test7(CountingPool* pool){
     std::atomic<int> ref_count;
     ref_count.store(1);
     {
-    CachedObject<BigInt> obj9 = CachedObject<BigInt>(ptr6, 1, &ref_count);
+    CachedObject<BigInt> obj9 = CachedObject<BigInt>(ptr6, &ref_count);
     CachedObject<BigInt> obj10;
     obj10 = std::move(obj9);
     }
@@ -142,6 +142,18 @@ void scope(CountingPool* pool){
     REMUS_INFO("Test 7 -- PASSED");
 }
 
+void scope2(CountingPool* pool){
+    rdma_ptr<BigInt> ptr = pool->Allocate<BigInt>();
+    CachedPtr obj = CachedPtr(ptr, [&](){
+        pool->Deallocate(ptr);
+    });
+
+    rdma_ptr<BigInt> ptr2 = pool->Allocate<BigInt>(8);
+    CachedPtr obj2 = CachedPtr(ptr2, [&](){
+        pool->Deallocate(ptr2, 8);
+    });
+}
+
 int main(){
     CountingPool* pool = new CountingPool(true);
     REMUS_INFO("Constructed pool");
@@ -149,6 +161,7 @@ int main(){
     rdma_ptr<BigInt> start = pool->Allocate<BigInt>();
     REMUS_ASSERT(start != nullptr, "Cannot allocate");
     scope(pool);
+    scope2(pool);
     // todo: check to_address, * and -> operators?
     // Test our first allocation
     pool->Deallocate(start);

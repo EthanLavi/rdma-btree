@@ -47,11 +47,10 @@ struct CacheLine {
     // int priority;
     std::shared_mutex* rwlock;
     rdma_ptr<Object> local_ptr;
-    int size; // todo: is this field necessary?
+    int size;
     std::atomic<int>* ref_counter;
 };
 
-// todo: make freeing memory lazy so that we don't have to wait
 template <typename Pool = rdma_capability>
 class RemoteCacheImpl {
 private:
@@ -93,7 +92,7 @@ private:
 
     // Handle a local_ptr no longer as an item in the cache
     void handle_free(rdma_ptr<Object> ptr, int size, ref_t* reference_counter){
-        // Busy wait until reference counter is 0
+        // Check if reference counter is 0
         if(reference_counter->load() == 0){
             // Then deallocate immediately
             if (ptr != nullptr)
@@ -266,30 +265,29 @@ public:
                 // Set result
                 result = static_cast<rdma_ptr<T>>(l->local_ptr);
                 reference_counter = l->ref_counter;
-                
+
                 // Increment metrics
                 metrics.remote_reads++;
                 metrics.conflict_misses++;
             }
             // Unlock mutex on cache line
             l->rwlock->unlock();
+            reference_counter->fetch_add(1);
+            return CachedObject<T>(result, reference_counter);
         } else {
             // -- No cache -- //
             // Setup the result
             result = pool->template ExtendedRead<T>(ptr, size);
-            reference_counter = reference_pool.fetch();
 
             // Increment metrics
             metrics.remote_reads++;
             metrics.allocation++;
+            return CachedObject<T>(result, [=](){
+                pool->template Deallocate<T>(result, size);
+            });
         }
-        reference_counter->fetch_add(1);
-        return CachedObject<T>(result, size, reference_counter);
     }
 
-    // todo: what if partial write to location is at head (API)
-    // INVALIDATE AFTER MULTIPLE WRITES
-    // todo: is prealloc necessary?
     template <typename T>
     void Write(CachedObject<T>& ptr, const T& val, rdma_ptr<T> prealloc = nullptr, internal::RDMAWriteBehavior write_behavior = internal::RDMAWriteWithAck){
         return Write(ptr.get(), val, prealloc, write_behavior);
@@ -330,6 +328,8 @@ public:
         }
     }
 
+    /// Semantics for invalidating an object
+    /// Useful if we need multiple writes
     template <typename T>
     void Invalidate(rdma_ptr<T> ptr){
         // Get the cache line
