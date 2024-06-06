@@ -17,7 +17,7 @@ using namespace remus::metrics;
 /// @param region_size How big the region should be in 2^x bytes
 /// @param thread_count How many threads to spawn with the operations
 /// @param node_count How many nodes are in the experiment
-/// @param qp_max The max number of queue pairs to allocate for the experiment.
+/// @param qp_per_conn The max number of queue pairs to allocate for the experiment.
 /// @param contains Percentage of operations are contains, (contains + insert + remove = 100)
 /// @param insert Percentage of operations are inserts, (contains + insert + remove = 100)
 /// @param remove Percentage of operations are removes, (contains + insert + remove = 100)
@@ -40,7 +40,7 @@ public:
     /// How many nodes are in the experiment
     int node_count;
     /// The max number of queue pairs to allocate for the experiment.
-    int qp_max;
+    int qp_per_conn;
     /// Percentage of operations are contains, (contains + insert + remove = 100)
     int contains;
     //. Percentage of operations are inserts, (contains + insert + remove = 100)
@@ -64,7 +64,7 @@ public:
         region_size = args.iget("--region_size");
         thread_count = args.iget("--thread_count");
         node_count = args.iget("--node_count");
-        qp_max = args.iget("--qp_max");
+        qp_per_conn = args.iget("--qp_per_conn");
         contains = args.iget("--contains");
         insert = args.iget("--insert");
         remove = args.iget("--remove");
@@ -101,7 +101,7 @@ public:
     Result(BenchmarkParams params_, WorkloadDriverResult result_) : params(params_), result(std::move(result_)) {}
 
     static const std::string result_as_string_header() {
-        return "node_id,runtime,unlimited_stream,op_count,region_size,thread_count,node_count,qp_max,contains,insert,remove,lb,ub,cache_depth,count,runtime_ns,units,mean,stdev,min,p50,p90,p95,p99,p999,max\n";
+        return "node_id,runtime,unlimited_stream,op_count,region_size,thread_count,node_count,qp_per_conn,contains,insert,remove,lb,ub,cache_depth,count,runtime_ns,units,mean,stdev,min,p50,p90,p95,p99,p999,max,units_2,mean_2,stdev_2,min_2,p50_2,p90_2,p95_2,p99_2,p999_2,max_2\n";
     }
 
     std::string result_as_string(){
@@ -113,7 +113,7 @@ public:
         builder += std::to_string(params.region_size) + ",";
         builder += std::to_string(params.thread_count) + ",";
         builder += std::to_string(params.node_count) + ",";
-        builder += std::to_string(params.qp_max) + ",";
+        builder += std::to_string(params.qp_per_conn) + ",";
         builder += std::to_string(params.contains) + ",";
         builder += std::to_string(params.insert) + ",";
         builder += std::to_string(params.remove) + ",";
@@ -132,6 +132,16 @@ public:
         builder += std::to_string(result.qps.try_get_summary()->p99) + ",";
         builder += std::to_string(result.qps.try_get_summary()->p999) + ",";
         builder += std::to_string(result.qps.try_get_summary()->max) + ",";
+        builder += result.latency.try_get_summary()->units + ",";
+        builder += to_string(result.latency.try_get_summary()->mean) + ",";
+        builder += to_string(result.latency.try_get_summary()->stddev) + ",";
+        builder += to_string(result.latency.try_get_summary()->min) + ",";
+        builder += std::to_string(result.latency.try_get_summary()->p50) + ",";
+        builder += std::to_string(result.latency.try_get_summary()->p90) + ",";
+        builder += std::to_string(result.latency.try_get_summary()->p95) + ",";
+        builder += std::to_string(result.latency.try_get_summary()->p99) + ",";
+        builder += std::to_string(result.latency.try_get_summary()->p999) + ",";
+        builder += std::to_string(result.latency.try_get_summary()->max) + ",";
         return builder + "\n";
     }
 
@@ -146,7 +156,7 @@ public:
             builder += "\t\tregion_size: " + std::to_string(params.region_size) + "\n";
             builder += "\t\tthread_count: " + std::to_string(params.thread_count) + "\n";
             builder += "\t\tnode_count: " + std::to_string(params.node_count) + "\n";
-            builder += "\t\tqp_max: " + std::to_string(params.qp_max) + "\n";
+            builder += "\t\tqp_per_conn: " + std::to_string(params.qp_per_conn) + "\n";
             builder += "\t\tcontains: " + std::to_string(params.contains) + "\n";
             builder += "\t\tinsert: " + std::to_string(params.insert) + "\n";
             builder += "\t\tremove: " + std::to_string(params.remove) + "\n";

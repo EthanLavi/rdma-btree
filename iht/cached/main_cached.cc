@@ -27,7 +27,7 @@ auto ARGS = {
     I64_ARG("--region_size", "How big the region should be in 2^x bytes"),
     I64_ARG("--thread_count", "How many threads to spawn with the operations"),
     I64_ARG("--node_count", "How many nodes are in the experiment"),
-    I64_ARG("--qp_max", "The max number of queue pairs to allocate for the experiment."),
+    I64_ARG("--qp_per_conn", "The max number of queue pairs to allocate for the experiment."),
     I64_ARG("--contains", "Percentage of operations are contains, (contains + insert + remove = 100)"),
     I64_ARG("--insert", "Percentage of operations are inserts, (contains + insert + remove = 100)"),
     I64_ARG("--remove", "Percentage of operations are removes, (contains + insert + remove = 100)"),
@@ -80,52 +80,34 @@ int main(int argc, char **argv) {
 
     // Determine the number of memory pools to use in the experiment
     // Each memory pool represents 
-    int mp = std::min(params.thread_count, (int) std::floor(params.qp_max / params.node_count));
-    if (mp == 0) mp = 1; // Make sure if node_count > qp_max, we don't end up with 0 memory pools
-    
+    int mp = std::min(params.thread_count, params.qp_per_conn);
+    if (mp == 0) mp = 1; // Make sure if thread_count > qp_per_conn, we don't end up with 0 memory pools
+
     REMUS_INFO("Distributing {} MemoryPools across {} threads", mp, params.thread_count);
 
     // Start initializing a vector of peers
     std::vector<Peer> peers;
-    for(uint16_t n = 0; n < mp * params.node_count; n++){
+    for(uint16_t n = 0; n < params.node_count; n++){
         // Create the ip_peer (really just node name)
-        std::string ippeer = "node";
-        std::string node_id = std::to_string((int) n / mp);
-        ippeer.append(node_id);
+        std::string node_id = std::to_string((int) n);
         // Create the peer and add it to the list
-        Peer next = Peer(n, ippeer, PORT_NUM + n + 1);
+        Peer next = Peer(n, std::string("node") + node_id, PORT_NUM + n + 1);
         peers.push_back(next);
-    }
-    // Print the peers included in this experiment
-    // This is just for debugging to ensure they are what you expect
-    for(int i = 0; i < peers.size(); i++){
-        REMUS_DEBUG("Peer list {}:{}@{}", i, peers.at(i).id, peers.at(i).address);
+        REMUS_INFO("Peer list {}:{}@{}", n, next.id, next.address);
     }
     Peer host = peers.at(0);
-    // Initialize memory pools into an array
-    std::vector<std::thread> mempool_threads;
-    rdma_capability* pools[mp];
-    // Create multiple memory pools to be shared (have to use threads since Init is blocking)
+    Peer self = peers.at(params.node_id);
+    // Initialize a rdma_capability
+    rdma_capability* capability = new rdma_capability(self, mp);
     uint32_t block_size = 1 << params.region_size;
-    for(int i = 0; i < mp; i++){
-        mempool_threads.emplace_back(std::thread([&](int mp_index, int self_index){
-            Peer self = peers.at(self_index);
-            REMUS_DEBUG(mp != params.thread_count ? "Is shared" : "Is not shared");
-            rdma_capability* pool = new rdma_capability(self);
-            pool->init_pool(block_size, peers);
-            pools[mp_index] = pool;
-        }, i, (params.node_id * mp) + i));
-    }
-    // Let the init finish
-    for(int i = 0; i < mp; i++){
-        mempool_threads[i].join();
-    }
+    capability->init_pool(block_size, peers);
 
     // Create a list of client and server  threads
     std::vector<std::thread> threads;
     if (params.node_id == 0){
         // If dedicated server-node, we must send IHT pointer and wait for clients to finish
         threads.emplace_back(std::thread([&](){
+            auto pool = capability->RegisterThread();
             // Initialize X connections
             tcp::SocketManager* socket_handle = new tcp::SocketManager(PORT_NUM);
             for(int i = 0; i < params.thread_count * params.node_count; i++){
@@ -133,7 +115,7 @@ int main(int argc, char **argv) {
                 // I haven't gotten around to coming up with a clean way to reduce the number of sockets connected to the server
                 socket_handle->accept_conn();
             }
-            
+
             // Collect and redistribute the CacheStore pointers
             tcp::message root_ptrs[params.node_count * params.thread_count];
             socket_handle->recv_from_all(root_ptrs);
@@ -143,8 +125,8 @@ int main(int argc, char **argv) {
 
             // Create a root ptr to the IHT
             Peer p = Peer();
-            KVStore iht = KVStore(p, CacheDepth::None, nullptr, pools[0]);
-            rdma_ptr<anon_ptr> root_ptr = iht.InitAsFirst(pools[0]);
+            KVStore iht = KVStore(p, CacheDepth::None, nullptr, pool);
+            rdma_ptr<anon_ptr> root_ptr = iht.InitAsFirst(pool);
             // Send the root pointer over
             tcp::message ptr_message = tcp::message(root_ptr.raw());
             socket_handle->send_to_all(&ptr_message);
@@ -179,7 +161,8 @@ int main(int argc, char **argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     // Create our remote cache (can initialize the cache space with any pool)
-    RemoteCache* cache = new RemoteCache(pools[0], 1000);
+    auto pool = capability->RegisterThread();
+    RemoteCache* cache = new RemoteCache(pool, 1000);
 
     // Barrier to start all the clients at the same time
     std::barrier client_sync = std::barrier(params.thread_count);
@@ -187,26 +170,25 @@ int main(int argc, char **argv) {
     for(int i = 0; i < params.thread_count; i++){
         threads.emplace_back(std::thread([&](int thread_index){
             // Get pool
-            int mempool_index = thread_index % mp;
-            rdma_capability* pool = pools[mempool_index];
+            rdma_capability_thread* pool = capability->RegisterThread();
+            tcp::EndpointManager* endpoint = endpoint_managers[thread_index];
 
             // initialize thread's thread_local pool
             RemoteCache::pool = pool; 
             // Exchange the root pointer of the other cache stores via TCP module
             tcp::message data(cache->root());
             vector<uint64_t> peer_roots;
-            endpoint_managers[thread_index]->send_server(&data);
+            endpoint->send_server(&data);
             for(int i = 0; i < params.node_count * params.thread_count; i++){
-                endpoint_managers[thread_index]->recv_server(&data);
+                endpoint->recv_server(&data);
                 peer_roots.push_back(data.get_first());
             }
             cache->init(peer_roots);
 
-            Peer self = peers.at((params.node_id * mp) + mempool_index);
             std::shared_ptr<KVStore> iht = std::make_shared<KVStore>(self, params.cache_depth, cache, pool);
             // Get the data from the server to init the IHT
             tcp::message ptr_message;
-            endpoint_managers[thread_index]->recv_server(&ptr_message);
+            endpoint->recv_server(&ptr_message);
             iht->InitFromPointer(rdma_ptr<anon_ptr>(ptr_message.get_first()));
 
             REMUS_DEBUG("Creating client");
@@ -226,34 +208,32 @@ int main(int argc, char **argv) {
                     return res;
                 },
                 [&](int op_count, int key_lb, int key_ub){
-                    pool->RegisterThread();
-                    ExperimentManager::ClientArriveBarrier(endpoint_managers[thread_index]);
+                    // capability->RegisterThread();
+                    ExperimentManager::ClientArriveBarrier(endpoint);
                     delta += iht->populate(pool, op_count, key_lb, key_ub, [=](int key){ return key; });
-                    ExperimentManager::ClientArriveBarrier(endpoint_managers[thread_index]);
+                    ExperimentManager::ClientArriveBarrier(endpoint);
                     populate_amount = iht->count(pool); // ? IMPORTANT - Count hits every element which in effect warms up the cache
                                       // ? BENCHMARK EXECUTION STARTS WITH NO INVALID CACHE LINES
-                    ExperimentManager::ClientArriveBarrier(endpoint_managers[thread_index]);
+                    ExperimentManager::ClientArriveBarrier(endpoint);
                     cache->print_metrics();
                     cache->reset_metrics();
                 }
             );
             // todo: for LinearProbingMap only REMUS_ASSERT(params.key_lb >= 2 && params.key_ub - params.key_lb <= 1000, "Keyspace is valid?");
-            std::unique_ptr<Client<IHT_Op<int, int>>> client = Client<IHT_Op<int, int>>::Create(host, endpoint_managers[thread_index], params, &client_sync, iht_as_map);
+            using client_t = Client<IHT_Op<int, int>>;
+            std::unique_ptr<client_t> client = client_t::Create(host, endpoint, params, &client_sync, iht_as_map);
             double populate_frac = 0.5 / (double) (params.node_count * params.thread_count);
 
-            StatusVal<WorkloadDriverResult> output = Client<IHT_Op<int, int>>::Run(std::move(client), thread_index, populate_frac);
-            if (output.status.t == StatusType::Ok && output.val.has_value()){
-                workload_results[thread_index] = output.val.value();
-            } else {
-                REMUS_ERROR("Client run failed");
-            }
+            StatusVal<WorkloadDriverResult> output = client_t::Run(std::move(client), thread_index, populate_frac);
+            REMUS_ASSERT(output.status.t == StatusType::Ok && output.val.has_value(), "Client run failed");
+            workload_results[thread_index] = output.val.value();
 
             // Check expected size
             int all_delta = 0;
             tcp::message d(delta);
-            endpoint_managers[thread_index]->send_server(&d);
+            endpoint->send_server(&d);
             for(int i = 0; i < params.node_count * params.thread_count; i++){
-                endpoint_managers[thread_index]->recv_server(&d);
+                endpoint->recv_server(&d);
                 all_delta += d.get_first();
             }
             // add count after syncing via endpoint exchange
@@ -263,7 +243,7 @@ int main(int argc, char **argv) {
             REMUS_DEBUG("Delta = {}", all_delta);
             REMUS_ASSERT(final_size - all_delta == 0, "Initial size + delta ==? Final size");
             
-            ExperimentManager::ClientArriveBarrier(endpoint_managers[thread_index]);
+            ExperimentManager::ClientArriveBarrier(endpoint);
             REMUS_INFO("[CLIENT THREAD] -- End of execution; -- ");
             cache->print_metrics();
         }, i));

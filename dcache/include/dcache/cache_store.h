@@ -45,13 +45,13 @@ thread_local static ObjectPool<DeallocTask> dealloc_pool = ObjectPool<DeallocTas
 struct CacheLine {
     uint64_t address;
     // int priority;
-    std::shared_mutex* rwlock;
+    std::mutex* mu;
     rdma_ptr<Object> local_ptr;
     int size;
     std::atomic<int>* ref_counter;
 };
 
-template <typename Pool = rdma_capability>
+template <typename Pool = rdma_capability_thread>
 class RemoteCacheImpl {
 private:
     rdma_ptr<CacheLine> origin_address;
@@ -85,13 +85,14 @@ private:
                 dealloc_pool.release(t); // add it back for later
                 return;
             }
-            pool->template  Deallocate<Object>(t.local_ptr, t.size);
+            pool->template Deallocate<Object>(t.local_ptr, t.size);
             reference_pool.release(t.ref_counter);
         }
     }
 
     // Handle a local_ptr no longer as an item in the cache
     void handle_free(rdma_ptr<Object> ptr, int size, ref_t* reference_counter){
+        reference_counter->fetch_sub(1);
         // Check if reference counter is 0
         if(reference_counter->load() == 0){
             // Then deallocate immediately
@@ -100,7 +101,6 @@ private:
             reference_pool.release(reference_counter);
         } else {
             // Send it to the pool to release if a real deallocation
-            REMUS_ASSERT_DEBUG(!(ptr == nullptr && reference_counter != nullptr), "Illegal case");
             if (reference_counter != nullptr && ptr != nullptr)
                 dealloc_pool.release(DeallocTask(ptr, size, reference_counter));
             else if (reference_counter != nullptr)
@@ -123,7 +123,8 @@ public:
             // lines[i].priority = 0;
             lines[i].local_ptr = nullptr;
             lines[i].ref_counter = reference_pool.fetch();
-            lines[i].rwlock = new std::shared_mutex();
+            lines[i].ref_counter->store(0);
+            lines[i].mu = new std::mutex();
         }
     }
 
@@ -172,7 +173,8 @@ public:
         while(!dealloc_pool.empty()){
             DeallocTask t = dealloc_pool.fetch();
             REMUS_ASSERT(t.ref_counter->load() == 0, "free_all_tmp_objects called before CachedObjects left scope");
-            pool->template  Deallocate<Object>(t.local_ptr, t.size);
+            if (t.local_ptr == nullptr) continue;
+            pool->template Deallocate<Object>(t.local_ptr, t.size);
             delete t.ref_counter;
         }
     }
@@ -218,7 +220,7 @@ public:
             // Get cache line and lock
             ptr = unmark_ptr(ptr);
             CacheLine* l = &lines[hash(ptr) % number_of_lines];
-            l->rwlock->lock(); // todo: upgrade lock on conditional write?
+            l->mu->lock(); // todo: upgrade lock on conditional write?
             if ((l->address & ~mask) == ptr.raw()){
                 if (l->address & mask){
                     // -- Cache miss (coherence) -- //
@@ -232,8 +234,9 @@ public:
                     rdma_ptr<T> data = pool->template ExtendedRead<T>(ptr, size);
                     handle_free(l->local_ptr, l->size, l->ref_counter); // free the old data
                     l->local_ptr = static_cast<rdma_ptr<Object>>(data);
-                    REMUS_ASSERT_DEBUG(l->size == size * sizeof(T), "Sizes are equal when accessing objects");
+                    REMUS_ASSERT(l->size == size * sizeof(T), "Sizes are equal when accessing objects");
                     l->ref_counter = reference_pool.fetch();
+                    l->ref_counter->store(1);
 
                     // set result
                     result = static_cast<rdma_ptr<T>>(l->local_ptr); // set result while we are at it
@@ -246,7 +249,7 @@ public:
                     // -- Cache hit -- //
                     result = static_cast<rdma_ptr<T>>(l->local_ptr);
                     reference_counter = l->ref_counter;
-                    REMUS_ASSERT_DEBUG(l->size == size * sizeof(T), "Size of read is equal to count");
+                    REMUS_ASSERT(l->size == size * sizeof(T), "Size of read is equal to count");
                     metrics.hits++;
                 }
             } else {
@@ -261,6 +264,7 @@ public:
                 l->local_ptr = static_cast<rdma_ptr<Object>>(data);
                 l->size = size * sizeof(T);
                 l->ref_counter = reference_pool.fetch();
+                l->ref_counter->store(1);
 
                 // Set result
                 result = static_cast<rdma_ptr<T>>(l->local_ptr);
@@ -271,7 +275,7 @@ public:
                 metrics.conflict_misses++;
             }
             // Unlock mutex on cache line
-            l->rwlock->unlock();
+            l->mu->unlock();
             reference_counter->fetch_add(1);
             return CachedObject<T>(result, reference_counter);
         } else {
@@ -305,11 +309,11 @@ public:
             metrics.remote_writes++;
 
             // Invalidate locally
-            l->rwlock->lock();
+            l->mu->lock();
             if ((l->address & ~mask) == ptr.raw()){
                 l->address = l->address | mask;
             }
-            l->rwlock->unlock();
+            l->mu->unlock();
 
             // Invalidate the other caches
             for(int i = 0; i < remote_caches.size(); i++){
@@ -337,11 +341,11 @@ public:
         CacheLine* l = &lines[hash(ptr) % number_of_lines];
 
         // Invalidate my own line
-        l->rwlock->lock();
+        l->mu->lock();
         if ((l->address & ~mask) == ptr.raw()){
             l->address = l->address | mask;
         }
-        l->rwlock->unlock();
+        l->mu->unlock();
 
         // invalidate the other caches
         for(int i = 0; i < remote_caches.size(); i++){
@@ -356,4 +360,4 @@ public:
 
 typedef RemoteCacheImpl<> RemoteCache;
 template<> inline thread_local CacheMetrics RemoteCache::metrics = CacheMetrics();
-template<> inline thread_local rdma_capability* RemoteCache::pool = nullptr;
+template<> inline thread_local rdma_capability_thread* RemoteCache::pool = nullptr;

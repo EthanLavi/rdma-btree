@@ -4,7 +4,6 @@ const rdma_ptr operator[](int index) const {
   new_ptr += index;
   return new_ptr;
 }
-// todo: ask depaul/amanda if we should leave the element type out of pointer calculations
 
 +115 workload/include/remus/workload/workload_driver.h
 template <typename T> class TimedStream : public Stream<T> {
@@ -167,3 +166,6 @@ auto info = conn_info_.at(ptr.id());
 // [esl] Getting the thread's index to determine it's owned flag
 if (this->thread_ids.find(std::this_thread::get_id()) == this->thread_ids.end()) 
   REMUS_ERROR("Cannot find a thread ID. Make sure to call Register thread");
+uint64_t index_as_id = this->thread_ids.at(std::this_thread::get_id());
+
+Also made the rdma_capability_thread edit

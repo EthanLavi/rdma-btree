@@ -85,7 +85,7 @@ public:
         if (ref_count == nullptr) return; // guard against empty objects
         // Reduce number of references and deallocate if necessary
         int refs = ref_count->fetch_sub(1) - 1;
-        REMUS_ASSERT_DEBUG(refs >= 0, "Reference count became negative");
+        REMUS_ASSERT(refs >= 0, "Reference count became negative");
     }
 
     /// The pointer returned by this object lives as long as the object is alive

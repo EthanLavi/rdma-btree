@@ -47,7 +47,7 @@ parser.add_argument('--region_size', type=int, default=25, help="2 ^ x bytes to 
 # Experiment resources
 parser.add_argument('--thread_count', type=int, default=1, help="The number of threads to start per client. Only applicable in send_exp")
 parser.add_argument('--node_count', type=int, default=1, help="The number of nodes to use in the experiment. Will use node0-nodeN")
-parser.add_argument('--qp_max', type=int, default=30, help="The number of queue pairs to use in the experiment MAX")
+parser.add_argument('--qp_per_conn', type=int, default=30, help="The number of queue pairs to use in the experiment MAX")
 parser.add_argument('--cache_depth', type=int, default=0, help="The depth of which to cache layers in the IHT")
 
 ARGS = parser.parse_args()
@@ -74,13 +74,13 @@ def process_exp_flags(node_id):
             # Load the json into the proto
             json_data = f.read()
             mapper = json.loads(json_data)
-            one_to_ones = ["runtime", "op_count", "contains", "insert", "remove", "key_lb", "key_ub", "region_size", "thread_count", "node_count", "qp_max", "cache_depth"]
+            one_to_ones = ["runtime", "op_count", "contains", "insert", "remove", "key_lb", "key_ub", "region_size", "thread_count", "node_count", "qp_per_conn", "cache_depth"]
             for param in one_to_ones:
                 params += f" --{param} " + str(mapper[param]).lower()
             if mapper['unlimited_stream']:
                 params += f" --unlimited_stream "
     else:
-        one_to_ones = ["runtime", "op_count", "region_size", "thread_count", "node_count", "qp_max", "cache_depth"]
+        one_to_ones = ["runtime", "op_count", "region_size", "thread_count", "node_count", "qp_per_conn", "cache_depth"]
         for param in one_to_ones:
             params += f" --{param} " + str(eval(f"ARGS.{param}")).lower()
         if ARGS.unlimited_stream:
