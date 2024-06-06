@@ -254,7 +254,9 @@ public:
   rdma_ptr<anon_ptr> InitAsFirst(rdma_capability* pool){
       remote_plist iht_root = pool->Allocate<PList>();
       InitPList(pool, iht_root, 1);
-      this->root = mark_ptr(iht_root);
+      this->root = iht_root;
+      if (cache_depth_ >= 1)
+        this->root = mark_ptr(this->root);
       return static_cast<rdma_ptr<anon_ptr>>(iht_root);
   }
 

@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstdlib>
 
+#include <cstring>
 #include <remus/logging/logging.h>
 #include <remus/rdma/rdma.h>
 
@@ -40,22 +41,32 @@ public:
 
     template <typename T>
     rdma_ptr<T> Read(rdma_ptr<T> p, rdma_ptr<T> prealloc = nullptr){
-        REMUS_ASSERT(prealloc == nullptr, "precondition, missing feature");
-        return ExtendedRead(p, 1);
+        return ExtendedRead(p, 1, prealloc);
     }
 
     template <typename T>
     rdma_ptr<T> ExtendedRead(rdma_ptr<T> p, int size, rdma_ptr<T> prealloc = nullptr){
-        REMUS_ASSERT(prealloc == nullptr, "precondition, missing feature");
-        rdma_ptr<T> p_new = Allocate<T>(size);
-        *p_new = *p;
-        return p_new;
+        if (prealloc == nullptr){
+            rdma_ptr<T> p_new = Allocate<T>(size);
+            memcpy(p_new.get(), p.get(), sizeof(T) * size);
+            return p_new;
+        } else {
+            // read into prealloc instead of internally allocating
+            memcpy(prealloc.get(), p.get(), sizeof(T) * size);
+            return prealloc;
+        }        
     }
 
     template <typename T>
-    void Write(rdma_ptr<T>& ptr, const T& val, rdma_ptr<T> prealloc = nullptr, internal::RDMAWriteBehavior write_behavior = internal::RDMAWriteWithAck){
-        REMUS_ASSERT(prealloc == nullptr, "precondition, missing feature");
-        *ptr = val;
+    void Write(rdma_ptr<T> ptr, const T& val, rdma_ptr<T> prealloc = nullptr, internal::RDMAWriteBehavior write_behavior = internal::RDMAWriteWithAck){
+        if (prealloc == nullptr){
+            // removed the un-necessary allocate and deallocate step...
+            *ptr = val;
+        } else {
+            // might rely on property that prealloc is written val before it gets written to the "remote" ptr
+            *prealloc = val;
+            *ptr = *prealloc;
+        }        
     }
 
     template <typename T>
