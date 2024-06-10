@@ -6,8 +6,8 @@
 #include <remus/rdma/memory_pool.h>
 #include <remus/rdma/rdma.h>
 #include <remus/rdma/rdma_ptr.h>
-#include <shared_mutex>
 #include <vector>
+#include <mutex>
 
 #include "object_pool.h"
 #include "cached_ptr.h"

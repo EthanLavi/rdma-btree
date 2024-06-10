@@ -21,7 +21,7 @@ auto ARGS = {
     remus::util::I64_ARG("--region_size", "How big the region should be in 2^x bytes"),
     remus::util::I64_ARG("--thread_count", "How many threads to spawn with the operations"),
     remus::util::I64_ARG("--node_count", "How many nodes are in the experiment"),
-    remus::util::I64_ARG("--qp_max", "The max number of queue pairs to allocate for the experiment."),
+    remus::util::I64_ARG("--qp_per_conn", "The max number of queue pairs to allocate for the experiment."),
     remus::util::I64_ARG("--contains", "Percentage of operations are contains, (contains + insert + remove = 100)"),
     remus::util::I64_ARG("--insert", "Percentage of operations are inserts, (contains + insert + remove = 100)"),
     remus::util::I64_ARG("--remove", "Percentage of operations are removes, (contains + insert + remove = 100)"),
@@ -74,52 +74,34 @@ int main(int argc, char **argv) {
 
     // Determine the number of memory pools to use in the experiment
     // Each memory pool represents
-    int mp = std::min(params.thread_count, (int) std::floor(params.qp_max / params.node_count));
-    if (mp == 0) mp = 1; // Make sure if node_count > qp_max, we don't end up with 0 memory pools
+    int mp = std::min(params.thread_count, params.qp_per_conn);
+    if (mp == 0) mp = 1; // Make sure if thread_count > qp_per_conn, we don't end up with 0 memory pools
 
     REMUS_INFO("Distributing {} MemoryPools across {} threads", mp, params.thread_count);
 
     // Start initializing a vector of peers
     std::vector<Peer> peers;
-    for(uint16_t n = 0; n < mp * params.node_count; n++){
+    for(uint16_t n = 0; n < params.node_count; n++){
         // Create the ip_peer (really just node name)
-        std::string ippeer = "node";
-        std::string node_id = std::to_string((int) n / mp);
-        ippeer.append(node_id);
+        std::string node_id = std::to_string((int) n);
         // Create the peer and add it to the list
-        Peer next = Peer(n, ippeer, PORT_NUM + n + 1);
+        Peer next = Peer(n, std::string("node") + node_id, PORT_NUM + n + 1);
         peers.push_back(next);
-    }
-    // Print the peers included in this experiment
-    // This is just for debugging to ensure they are what you expect
-    for(int i = 0; i < peers.size(); i++){
-        REMUS_DEBUG("Peer list {}:{}@{}", i, peers.at(i).id, peers.at(i).address);
+        REMUS_INFO("Peer list {}:{}@{}", n, next.id, next.address);
     }
     Peer host = peers.at(0);
-    // Initialize memory pools into an array
-    std::vector<std::thread> mempool_threads;
-    std::shared_ptr<rdma_capability> pools[mp];
-    // Create multiple memory pools to be shared (have to use threads since Init is blocking)
+    Peer self = peers.at(params.node_id);
+    // Initialize a rdma_capability
+    rdma_capability* capability = new rdma_capability(self, mp);
     uint32_t block_size = 1 << params.region_size;
-    for(int i = 0; i < mp; i++){
-        mempool_threads.emplace_back(std::thread([&](int mp_index, int self_index){
-            Peer self = peers.at(self_index);
-            REMUS_DEBUG(mp != params.thread_count ? "Is shared" : "Is not shared");
-            std::shared_ptr<rdma_capability> pool = std::make_shared<rdma_capability>(self);
-            pool->init_pool(block_size, peers);
-            pools[mp_index] = pool;
-        }, i, (params.node_id * mp) + i));
-    }
-    // Let the init finish
-    for(int i = 0; i < mp; i++){
-        mempool_threads[i].join();
-    }
-
+    capability->init_pool(block_size, peers);
+    
     // Create a list of client and server  threads
     std::vector<std::thread> threads;
     if (params.node_id == 0){
         // If dedicated server-node, we must send IHT pointer and wait for clients to finish
         threads.emplace_back(std::thread([&](){
+            auto pool = capability->RegisterThread();
             // Initialize X connections
             remus::util::tcp::SocketManager* socket_handle = new remus::util::tcp::SocketManager(PORT_NUM);
             for(int i = 0; i < params.thread_count * params.node_count; i++){
@@ -128,8 +110,8 @@ int main(int argc, char **argv) {
                 socket_handle->accept_conn();
             }
             // Create a root ptr to the IHT
-            IHT iht = IHT(host, params.cache_depth, pools[0]);
-            rdma_ptr<anon_ptr> root_ptr = iht.InitAsFirst(pools[0]);
+            IHT iht = IHT(host, params.cache_depth, nullptr, pool);
+            rdma_ptr<anon_ptr> root_ptr = iht.InitAsFirst(pool);
             // Send the root pointer over
             remus::util::tcp::message ptr_message = remus::util::tcp::message(root_ptr.raw());
             socket_handle->send_to_all(&ptr_message);
@@ -160,9 +142,7 @@ int main(int argc, char **argv) {
     WorkloadDriverResult workload_results[params.thread_count];
     for(int i = 0; i < params.thread_count; i++){
         threads.emplace_back(std::thread([&](int thread_index){
-            int mempool_index = thread_index % mp;
-            std::shared_ptr<rdma_capability> pool = pools[mempool_index];
-            Peer self = peers.at((params.node_id * mp) + mempool_index);
+            rdma_capability_thread* pool = capability->RegisterThread();
             std::shared_ptr<IHT> iht = std::make_shared<IHT>(self, params.cache_depth, pool);
             // sleep for a short while to ensure the receiving end (SocketManager) is up and running
             // If the endpoint cant connect, it will just wait and retry later
@@ -179,7 +159,6 @@ int main(int argc, char **argv) {
                 [&](int key){ return iht->contains(pool, key); },
                 [&](int key){ return iht->remove(pool, key); },
                 [&](int op_count, int key_lb, int key_ub){ 
-                    pool->RegisterThread();
                     iht->populate(pool, op_count, key_lb, key_ub, [=](int key){ return key; }); }
             );
             std::unique_ptr<Client<IHT_Op<int, int>>> client = Client<IHT_Op<int, int>>::Create(host, endpoint_managers[thread_index], params, &client_sync, iht_as_map);

@@ -9,7 +9,7 @@
 #include <dcache/cache_store.h>
 #include <dcache/cached_ptr.h>
 
-#include "../common.h"
+#include "../../common.h"
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>

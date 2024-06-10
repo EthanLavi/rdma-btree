@@ -20,7 +20,7 @@ auto ARGS = {
     I64_ARG("--region_size", "How big the region should be in 2^x bytes"),
     I64_ARG("--thread_count", "How many threads to spawn with the operations"),
     I64_ARG("--node_count", "How many nodes are in the experiment"),
-    I64_ARG("--qp_max", "The max number of queue pairs to allocate for the experiment."),
+    I64_ARG("--qp_per_conn", "The max number of queue pairs to allocate for the experiment."),
     I64_ARG("--contains", "Percentage of operations are contains, (contains + insert + remove = 100)"),
     I64_ARG("--insert", "Percentage of operations are inserts, (contains + insert + remove = 100)"),
     I64_ARG("--remove", "Percentage of operations are removes, (contains + insert + remove = 100)"),
