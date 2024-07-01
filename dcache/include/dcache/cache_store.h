@@ -20,6 +20,8 @@ typedef std::atomic<int> ref_t;
 
 class Object {};
 
+// todo: the object shouldn't be modifiable. It must be copied in order to modify (we need COW)
+
 struct DeallocTask {
     rdma_ptr<Object> local_ptr;
     int size;
@@ -132,8 +134,10 @@ public:
     ~RemoteCacheImpl(){
         for(int i = 0; i < number_of_lines; i++){
             // Deallocate forcefully, even if we have references to the object
-            if (lines[i].ref_counter != nullptr)
-                REMUS_ASSERT(lines[i].ref_counter->load() == 0, "RemoteCache deconstructor called before CachedObjects left scope");
+            if (lines[i].ref_counter != nullptr){
+                int c = lines[i].ref_counter->load();
+                REMUS_ASSERT(c <= 1, "RemoteCache deconstructor called before CachedObjects left scope {}", c);
+            }
             if (lines[i].local_ptr != nullptr)
                 pool->template Deallocate<Object>(lines[i].local_ptr, lines[i].size);
             delete lines[i].ref_counter; // delete the ptr to the atomic int
@@ -172,7 +176,7 @@ public:
     void free_all_tmp_objects(){
         while(!dealloc_pool.empty()){
             DeallocTask t = dealloc_pool.fetch();
-            REMUS_ASSERT(t.ref_counter->load() == 0, "free_all_tmp_objects called before CachedObjects left scope");
+            REMUS_ASSERT(t.ref_counter->load() <= 1, "free_all_tmp_objects called before CachedObjects left scope {}", t.ref_counter->load());
             if (t.local_ptr == nullptr) continue;
             pool->template Deallocate<Object>(t.local_ptr, t.size);
             delete t.ref_counter;
@@ -277,7 +281,8 @@ public:
             // Unlock mutex on cache line
             l->mu->unlock();
             reference_counter->fetch_add(1);
-            return CachedObject<T>(result, reference_counter);
+            // remark the ptr for the remote origin
+            return CachedObject<T>(mark_ptr(ptr), result, reference_counter);
         } else {
             // -- No cache -- //
             // Setup the result
@@ -286,15 +291,10 @@ public:
             // Increment metrics
             metrics.remote_reads++;
             metrics.allocation++;
-            return CachedObject<T>(result, [=](){
+            return CachedObject<T>(ptr, result, [=](){
                 pool->template Deallocate<T>(result, size);
             });
         }
-    }
-
-    template <typename T>
-    void Write(CachedObject<T>& ptr, const T& val, rdma_ptr<T> prealloc = nullptr, internal::RDMAWriteBehavior write_behavior = internal::RDMAWriteWithAck){
-        return Write(ptr.get(), val, prealloc, write_behavior);
     }
 
     template <typename T>

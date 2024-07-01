@@ -9,7 +9,7 @@
 using namespace remus::rdma;
 using namespace std;
 
-typedef std::atomic<int> ref_t;
+typedef atomic<int> ref_t;
 
 /// Cached object is given responsibility for decrementing the reference when it goes out of scope
 /// It can also only be moved so it will only ever decrease the value
@@ -17,19 +17,21 @@ template <typename T>
 class CachedObject {
 private:
     ref_t* ref_count;
+    rdma_ptr<T> parent;
     rdma_ptr<T> obj;
     bool temp; // true if needs manual deallocation and isn't stored in a cache line
-    std::function<void()> dealloc;
+    function<void()> dealloc;
 public:
     // Constructors
     CachedObject() {
         ref_count = nullptr;
+        parent = nullptr;
         obj = nullptr;
         temp = false;
     };
 
-    CachedObject(rdma_ptr<T> obj, ref_t* ref_count) : obj(obj), temp(false), ref_count(ref_count) {}
-    CachedObject(rdma_ptr<T> obj, std::function<void()> deallocator) : obj(obj), temp(true), ref_count(nullptr), dealloc(deallocator) {}
+    CachedObject(rdma_ptr<T> p, rdma_ptr<T> obj, ref_t* ref_count) : parent(p), obj(obj), temp(false), ref_count(ref_count) {}
+    CachedObject(rdma_ptr<T> p, rdma_ptr<T> obj, function<void()> deallocator) : parent(p), obj(obj), temp(true), ref_count(nullptr), dealloc(deallocator) {}
 
     // delete copy but allow move
     CachedObject(CachedObject& o) = delete;
@@ -39,15 +41,18 @@ public:
         // Invalidate the moved from object since it takes ownership
         this->ref_count = o.ref_count;
         this->obj = o.obj;
+        this->parent = o.parent;
         this->temp = o.temp;
         this->dealloc = o.dealloc;
         o.ref_count = nullptr;
         o.obj = nullptr;
+        o.parent = nullptr;
         o.temp = false;
     }
 
     CachedObject &operator=(CachedObject&& o){
         if (temp){
+            // delete the object we are moving into
             dealloc();
         }
         if (ref_count != nullptr) {
@@ -57,20 +62,25 @@ public:
         // Swap object fields
         this->ref_count = o.ref_count;
         this->obj = o.obj;
+        this->parent = o.parent;
         this->temp = o.temp;
         this->dealloc = o.dealloc;
         o.ref_count = nullptr;
         o.obj = nullptr;
+        o.parent = nullptr;
         o.temp = false;
         return *this;
     }
 
     // Pointer-like functions
-    static constexpr T *to_address(const CachedObject& p) { return (T*) p.obj.address(); }
-    static constexpr CachedObject pointer_to(T& p) { return CachedObject(-1, &p); }
-    T* get() const { return (T*) obj.address(); }
-    T* operator->() const noexcept { return (T*) obj.address(); }
-    T& operator*() const noexcept { return *((T*) obj.address()); }
+    // static constexpr T* to_address(const CachedObject& p) { return (T*) p.obj.address(); }
+    // static constexpr CachedObject pointer_to(T& p) { return CachedObject(-1, &p); }
+
+    // Cached objects are readonly
+    const rdma_ptr<T> remote_origin(){ return parent; }
+    const T* get() const { return (T*) obj.address(); }
+    const T* operator->() const noexcept { return (T*) obj.address(); }
+    const T& operator*() const noexcept { return *((T*) obj.address()); }
 
     // Compare the two
     constexpr bool operator==(CachedObject<T> o) const volatile { return o.obj == obj; }
