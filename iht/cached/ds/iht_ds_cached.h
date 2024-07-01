@@ -390,15 +390,19 @@ public:
         p = mark_ptr(p);
 
       // modify the bucket's pointer, keeping local curr updated with remote curr
-      curr->buckets[bucket].base = static_cast<remote_baseptr>(p);
+      // todo: remove these lines if they can be removed (we want our cached object to have read-only semantics)
+      // curr->buckets[bucket].base = static_cast<remote_baseptr>(p);
+      // curr->buckets[bucket].lock = P_UNLOCKED;
       change_bucket_pointer(pool, parent_ptr, bucket, static_cast<remote_baseptr>(p));
-      curr->buckets[bucket].lock = P_UNLOCKED;
       unlock(pool, get_lock(parent_ptr, bucket), P_UNLOCKED);
       // Prevent invalidate occuring before unlock
       std::atomic_thread_fence(std::memory_order_seq_cst);
       // have to invalidate a line associated with the object at parent_ptr
       // todo: async processing of unlock to ensure ordering (unlock -> invalidate)
       cache->Invalidate(parent_ptr);
+
+      // we need to refresh our copy as well :)
+      curr = cache->ExtendedRead<PList>(parent_ptr, 1 << (depth - 1)); // todo: check this
     }
   }
 
@@ -498,7 +502,7 @@ private:
     // unmarked because we don't want to read incorrect lock states :) (and we don't synchronize them)
     // I use the cache because I like the CachedObject since it automatically frees data
     CachedObject<PList> plocal_ = cache->ExtendedRead<PList>(unmark_ptr(p), size);
-    PList* plocal = to_address(plocal_);
+    PList* plocal = to_address(plocal_.get());
     for(int i = 0; i < (size * PLIST_SIZE); i++){
       plist_pair_t pair = plocal->buckets[i];
       if (pair.base == nullptr) continue;
