@@ -35,7 +35,6 @@ int main(){
         REMUS_ASSERT(iht->contains(pool, i).value_or(0) == i, "Found correct value in IHT");
         REMUS_ASSERT(iht->remove(pool, i).value_or(0) == i, "Removed value at i");
     }
-   
 
     // Free memory
     cache->free_all_tmp_objects();

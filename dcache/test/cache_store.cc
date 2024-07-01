@@ -32,17 +32,17 @@ void main_body(CountingPool* pool, RemoteCacheImpl<CountingPool>* cache){
     memset((Structure*) p.address(), 0, sizeof(Structure) * 2);
     rdma_ptr<Structure> marked_p = mark_ptr(p);
     CachedPtr p2 = cache->ExtendedRead(marked_p, 2); // put it in cache
-    p2->x[0] = 1; // write to the cached version
     REMUS_INFO("Test 1 -- PASSED");
 
     // -- Test 2 -- //
     Structure s = *p2;
-    cache->Write(marked_p, *p2); // write it back
+    s.x[0] = 1; // write to the cached version
+    cache->Write(marked_p, s); // write it back
     test(p->x[0] == 1, "Write didn't occur");
     CachedPtr p3 = cache->ExtendedRead(marked_p, 2); // read it again
     test(p3->x[0] == 1, "Cache didn't invalidate the write"); // check we observed the cached result
     test(p3->x[1] == 0, "Check second value of x for safety"); 
-    REMUS_INFO("Test 3 -- PASSED");
+    REMUS_INFO("Test 2 -- PASSED");
 
     // -- Test 3 -- //
     p->x[1] = 1; // write to the object not through the cache
@@ -72,8 +72,9 @@ void main_body(CountingPool* pool, RemoteCacheImpl<CountingPool>* cache){
         CachedObject<Structure> tmp = cache->Read<Structure>(at_ptr);
         test(tmp->x[0] == bucket, "Random read is correct value");
         test(tmp->x[1] == times_read, "Read amount is correct");
-        tmp->x[1] += 1;
-        cache->Write<Structure>(at_ptr, *tmp);
+        Structure tmp_copy = *tmp;
+        tmp_copy.x[1] += 1;
+        cache->Write<Structure>(at_ptr, tmp_copy);
     }
     // free all the structures
     for(int i = 0; i < TRIAL_WIDTH; i++){
