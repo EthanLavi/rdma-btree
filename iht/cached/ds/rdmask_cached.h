@@ -36,11 +36,24 @@ private:
         }
     };
 
+    typedef rdma_ptr<Node> nodeptr;
+
+    struct Task {
+        rdma_ptr<nodeptr> ptr;
+        nodeptr to_be;
+        nodeptr org;
+
+        Task() {
+            ptr = nullptr;
+        }
+        Task(nodeptr org, rdma_ptr<nodeptr> ptr, nodeptr to_be) : org(org), ptr(ptr), to_be(to_be) {}
+    };
+
     template <typename T> inline bool is_local(rdma_ptr<T> ptr) {
         return ptr.id() == self_.id;
     }
 
-    rdma_ptr<Node> root;
+    nodeptr root;
     RemoteCacheImpl<capability>* cache;
 
     // Got from synchrobench
@@ -91,7 +104,7 @@ public:
     /// @brief Initialize an IHT from the pointer of another IHT
     /// @param root_ptr the root pointer of the other iht from InitAsFirst();
     void InitFromPointer(rdma_ptr<anon_ptr> root_ptr){
-        this->root = static_cast<rdma_ptr<Node>>(mark_ptr(root_ptr));
+        this->root = static_cast<nodeptr>(mark_ptr(root_ptr));
     }
 
     /// @brief Gets a value at the key.
@@ -133,11 +146,18 @@ public:
         // first node is a sentinel, it will always be linked in the data structure
         CachedObject<Node> next_curr;
         CachedObject<Node> curr = cache->Read<Node>(root);
-        rdma_ptr<Node> new_node = pool->Allocate<Node>();
+        nodeptr new_node = pool->Allocate<Node>();
         *new_node = Node(key, value);
+        int level = get_rand_level();
+        REMUS_INFO("Creating node with level={}", level);
+        Task tasks[MAX_HEIGHT];
         while(height != -1){
             if (curr->next[height] == nullptr){
-                new_node->next[height] = nullptr;
+                if (level >= height){
+                    rdma_ptr<char> ptr = static_cast<rdma_ptr<char>>(unmark_ptr(curr.remote_origin()));
+                    ptr += sizeof(K) + sizeof(V) + (height * sizeof(nodeptr));
+                    tasks[height] = Task(curr.remote_origin(), static_cast<rdma_ptr<nodeptr>>(ptr), new_node);
+                }
                 height--;
             } else {
                 next_curr = cache->Read<Node>(curr->next[height]);
@@ -148,22 +168,20 @@ public:
                     curr = std::move(next_curr);
                 } else {
                     // Key is greater than the next, so we need to descend in the level and save the ptr
-                    new_node->next[height] = curr->next[height];
+                    if (level >= height){
+                        new_node->next[height] = curr->next[height];
+                        rdma_ptr<char> ptr = static_cast<rdma_ptr<char>>(unmark_ptr(curr.remote_origin()));
+                        ptr += sizeof(K) + sizeof(V) + (height * sizeof(nodeptr));
+                        tasks[height] = Task(curr.remote_origin(), static_cast<rdma_ptr<nodeptr>>(ptr), new_node);
+                    }
                     height--;
                 }
             }
         }
-        // curr is now the node previous to the new node
-        Node new_curr = *curr;
-        int level = get_rand_level();
-        for(int i = 0; i < MAX_HEIGHT; i++){
-            if (i <= level){
-                new_curr.next[i] = new_node;
-            } else {
-                new_node->next[i] = nullptr;
-            }
+        for(int i = 0; i <= level; i++){
+            pool->Write<nodeptr>(tasks[i].ptr, tasks[i].to_be);
+            cache->Invalidate<Node>(tasks[i].org);
         }
-        cache->Write(curr.remote_origin(), new_curr); // write the ptrs
         return std::nullopt;
     }
 
@@ -177,32 +195,34 @@ public:
         // first node is a sentinel, it will always be linked in the data structure
         CachedObject<Node> next_curr;
         CachedObject<Node> curr = cache->Read<Node>(root);
-        V result;
+        Task tasks[MAX_HEIGHT];
+        V value;
         while(height != -1){
             if (curr->next[height] == nullptr){
                 height--;
             } else {
                 next_curr = cache->Read<Node>(curr->next[height]);
                 if (key == next_curr->key) {
-                    result = next_curr->value; // set result
-
-                    // Update the pointers
-                    Node n = *curr;
-                    while(n.next[height].raw() == next_curr.remote_origin().raw()){
-                        n.next[height] = next_curr->next[height]; // swing over next_curr
-                        height--;
-                    }
-                    cache->Write(curr.remote_origin(), n);
-                    height--; // decrease height and continue
+                    value = next_curr->value;
+                    rdma_ptr<char> ptr = static_cast<rdma_ptr<char>>(unmark_ptr(curr.remote_origin()));
+                    ptr += sizeof(K) + sizeof(V) + (height * sizeof(nodeptr));
+                    tasks[height] = Task(curr.remote_origin(), static_cast<rdma_ptr<nodeptr>>(ptr), next_curr->next[height]);
+                    height--;
                 } else if (key > next_curr->key){
                     // go to the next node
                     curr = std::move(next_curr);
                 } else {
-                    return std::nullopt;
+                    // Key is greater than the next, so we need to descend in the level and save the ptr
+                    height--;
                 }
             }
         }
-        return make_optional(result);
+        for(int i = 0; i < MAX_HEIGHT; i++){
+            if (tasks[i].ptr == nullptr) break;
+            pool->Write<nodeptr>(tasks[i].ptr, tasks[i].to_be);
+            cache->Invalidate<Node>(tasks[i].org);
+        }
+        return std::nullopt;
     }
 
     /// @brief Populate only works when we have numerical keys. Will add data
@@ -238,13 +258,15 @@ public:
 
     /// Single threaded, local print
     void debug(){
-        Node curr = *root;
-        std::cout << "SENT" << " [" << calc_height(curr) << "] -> ";
-        while(curr.next[0] != nullptr){
-            curr = *curr.next[0];
-            std::cout << curr.key << " [" << calc_height(curr) << "] -> ";
+        for(int height = MAX_HEIGHT - 1; height != -1; height--){
+            Node curr = *root;
+            std::cout << "SENT -> ";
+            while(curr.next[height] != nullptr){
+                curr = *curr.next[height];
+                std::cout << curr.key << " -> ";
+            }
+            std::cout << "END" << std::endl;
         }
-        std::cout << "END" << std::endl;
     }
 
     /// No concurrent or thread safe (if everyone is readonly, then its fine). Counts the number of elements in the IHT
