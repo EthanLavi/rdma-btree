@@ -1,5 +1,6 @@
 #pragma once
 
+#include <climits>
 #include <cstdint>
 #include <ostream>
 #include <random>
@@ -12,20 +13,53 @@
 
 #include "../../dcache/test/faux_mempool.h"
 
-#include "btree_helper.h"
 #include "../../common.h"
 #include <optional>
+#include <remus/rdma/rdma_ptr.h>
 
 using namespace remus::rdma;
 
 /// SIZE is DEGREE * 2
 typedef CountingPool capability;
+typedef int32_t K;
+static const K SENTINEL = INT_MAX;
+
 template <class V, int DEGREE> class RdmaBPTree {
 private:
   static const int SIZE = (DEGREE * 2) + 1;
   static const uint64_t LOCK_BIT = (uint64_t) 1 << 63;
   Peer self_;
   CacheDepth::CacheDepth cache_depth_;
+
+  static const int VLINE_SIZE = 56 / sizeof(V);
+  static const int HLINE_SIZE = 48 / sizeof(V);
+  #define KLINE_SIZE 14
+  #define PLINE_SIZE 7
+
+  /// A hybrid struct for the next ptr
+  struct hline {
+    long version;
+    V values[HLINE_SIZE];
+    rdma_ptr<hline> next;
+  };
+
+  /// A line with keys
+  struct kline {
+      long version;
+      K keys[KLINE_SIZE];
+  };
+
+  /// A line with keys
+  struct vline {
+      long version;
+      V values[VLINE_SIZE];
+  };
+
+  /// A line with ptrs
+  struct pline {
+      long version;
+      rdma_ptr<pline> ptrs[PLINE_SIZE];
+  };
 
   struct BNode;
 
@@ -40,38 +74,6 @@ private:
       height++;
     }
   };
-
-  // struct alignas(64) BNode {
-  //   uint64_t lock;
-  //   K keys[SIZE];
-  //   rdma_ptr<BNode> ptrs[SIZE+1];
-  // };
-
-  struct alignas(64) BLeaf {
-    K keys[SIZE];
-    V values[SIZE];
-    rdma_ptr<BLeaf> next_leaf;
-
-    K key_at(int index) const {
-      return keys[index];
-    }
-
-    void set_key(int index, K key) {
-      keys[index] = key;
-    }
-
-    int search_node(K key) const {
-      // todo: binary search
-      for(int i = 0; i < SIZE; i++){
-        if (key <= keys[i]){
-          return i;
-        }
-      }
-      return -1;
-    }
-  };
-
-  typedef rdma_ptr<BLeaf> bleaf_ptr;
 
   struct alignas(64) BNode {
   private:
@@ -107,6 +109,11 @@ private:
       return true;
     }
 
+    /// Get version of the node without the lock bit
+    long version() const {
+      return key_lines[0].version & ~LOCK_BIT;
+    }
+
     /// unchecked increment version (also unlocks)
     void increment_version(){
       key_lines[0].version = (key_lines[0].version & ~LOCK_BIT) + 1;
@@ -129,42 +136,85 @@ private:
     void set_ptr(int index, rdma_ptr<BNode> ptr){
       ptr_lines[index / PLINE_SIZE].ptrs[index % PLINE_SIZE] = static_cast<rdma_ptr<pline>>(ptr);
     }
+  };
 
-    /// Return the first index where the provided key is less than the element at that index 
-    /// (-1 if the end element)
-    int search_node(K key) const {
-      // todo: binary search
-      for(int i = 0; i < SIZE; i++){
-        if (key <= key_at(i)){
-          return i;
-        }
+  struct alignas(64) BLeaf {
+  private:
+    const static int KLINES = (SIZE + KLINE_SIZE) / KLINE_SIZE;
+    const static int VLINES = (SIZE + VLINE_SIZE - HLINE_SIZE) / VLINE_SIZE;
+    kline key_lines[KLINES];
+    vline value_lines[VLINES];
+    hline last_line;
+  public:
+    BLeaf(){
+      for(int i = 0; i < KLINES; i++){
+        key_lines[i].version = 0;
       }
-      return -1;
+      for(int i = 0; i < VLINES; i++){
+        value_lines[i].version = 0;
+      }
+      last_line.version = 0;
+      for(int i = 0; i < SIZE; i++){
+        set_key(i, SENTINEL);
+      }
+      set_next(nullptr);
+    }
+
+    /// Checks if the version is valid
+    bool is_valid() const {
+      long base = last_line.version;
+      for(int i = 0; i < KLINES; i++){
+        if (key_lines[i].version != base) return false;
+      }
+      for(int i = 0; i < VLINES; i++){
+        if (value_lines[i].version != base) return false;
+      }
+      return true;
+    }
+
+    /// Get version of the node without the lock bit
+    long version() const {
+      return key_lines[0].version & ~LOCK_BIT;
+    }
+
+    /// unchecked increment version (also unlocks)
+    void increment_version(){
+      key_lines[0].version = (key_lines[0].version & ~LOCK_BIT) + 1;
+      for(int i = 1; i < KLINES; i++) key_lines[i].version++;
+      for(int i = 0; i < VLINES; i++) value_lines[i].version++;
+      last_line.version++;
+    }
+
+    /// Get the next ptr for traversal
+    const rdma_ptr<BLeaf> get_next() const {
+      return static_cast<rdma_ptr<BLeaf>>(last_line.next);
+    }
+    /// Set the next ptr
+    void set_next(rdma_ptr<BLeaf> next_leaf){
+      last_line.next = static_cast<rdma_ptr<hline>>(next_leaf);
+    }
+
+    K key_at(int index) const {
+      return key_lines[index / KLINE_SIZE].keys[index % KLINE_SIZE];
+    }
+
+    void set_key(int index, K key) {
+      key_lines[index / KLINE_SIZE].keys[index % KLINE_SIZE] = key;
+    }
+
+    V value_at(int index) const {
+      if ((index / VLINE_SIZE) >= VLINES) return last_line.values[index % VLINE_SIZE];
+      else return value_lines[index / VLINE_SIZE].values[index % VLINE_SIZE];
+    }
+
+    void set_value(int index, V value) {
+      if ((index / VLINE_SIZE) >= VLINES) last_line.values[index % VLINE_SIZE] = value;
+      else value_lines[index / VLINE_SIZE].values[index % VLINE_SIZE] = value;
     }
   };
 
+  typedef rdma_ptr<BLeaf> bleaf_ptr;
   typedef rdma_ptr<BNode> bnode_ptr;
-
-  /// Binary count the number of nodes
-  // static int size_node(K* keys){
-  //   // Return edge conditions
-  //   if (keys[0] == SENTINEL) return 0;
-  //   if (keys[SIZE - 1] != SENTINEL) return SIZE;
-  //   int lower = 0;
-  //   int upper = SIZE - 1;
-  //   while (true){
-  //     int mid = (lower + upper) / 2;
-  //     if (mid == SIZE - 1 && keys[mid] != SENTINEL) return SIZE; // guard edge case
-  //     else if (keys[mid] != SENTINEL && keys[mid + 1] == SENTINEL){
-  //       return mid + 1;
-  //     } else if (keys[mid] == SENTINEL){
-  //       upper = mid;
-  //     } else {
-  //       lower = mid;
-  //     }
-  //   }
-  // }
-
 
   template <typename T> inline bool is_local(rdma_ptr<T> ptr) {
     return ptr.id() == self_.id;
@@ -177,16 +227,20 @@ private:
   rdma_ptr<uint64_t> temp_lock;
 
   /// returns true if we can acquire the version of the bnode
-  bool acquire(capability* pool, bnode_ptr node, long version){
+  bool try_acquire(capability* pool, bnode_ptr node, long version){
     // swap the first 8 bytes (the lock) from unlocked to locked
-    uint64_t v = pool->CompareAndSwap<uint64_t>(node, version, version | LOCK_BIT);
+    uint64_t v = pool->CompareAndSwap<uint64_t>(static_cast<rdma_ptr<uint64_t>>(node), version, version | LOCK_BIT);
     if (v == version) return true;
     return false;
   }
 
+  void release(capability* pool, bnode_ptr node, long version){
+    pool->Write<uint64_t>(static_cast<rdma_ptr<uint64_t>>(node), version, temp_lock);
+  }
+
   /// Allocate a middle layer node
   static bnode_ptr allocate_bnode(capability* pool){
-    REMUS_ASSERT(56 % sizeof(K) == 0, "K must be a multiple of 2,4,8,14,28,56");
+    REMUS_ASSERT(56 % sizeof(V) == 0, "V must be a multiple of 2,4,8,14,28,56");
     bnode_ptr bnode = pool->Allocate<BNode>();
     *bnode = BNode();
     return bnode;
@@ -195,11 +249,21 @@ private:
   /// Allocate a leaf node with sentinel values and nullptr for next
   static bleaf_ptr allocate_bleaf(capability* pool){
     bleaf_ptr bleaf = pool->Allocate<BLeaf>();
-    for(int i = 0; i < SIZE; i++){
-      bleaf->keys[i] = SENTINEL;
-    }
-    bleaf->next_leaf = nullptr;
+    *bleaf = BLeaf();
     return bleaf;
+  }
+
+  /// Return the first index where the provided key is less than the element at that index 
+  /// (-1 if the end element)
+  template <class SRC>
+  int search_node(const CachedObject<SRC>& origin, K key) {
+    // todo: binary search
+    for(int i = 0; i < SIZE; i++){
+      if (key <= origin->key_at(i)){
+        return i;
+      }
+    }
+    return -1;
   }
 
   /// Returns the Key to go to the parent
@@ -222,14 +286,14 @@ private:
     return ret;
   }
 
-  inline void split_values(V* values_full, V* values_empty){
+  inline void split_values(BLeaf* values_full, BLeaf* values_empty){
     for(int i = 0; i < SIZE; i++){
       if (i < DEGREE){
-        values_empty[i] = values_full[DEGREE + i + 1];
-        values_full[DEGREE + i + 1] = SENTINEL;
+        values_empty->set_value(i, values_full->value_at(DEGREE + i + 1));
+        values_full->set_value(DEGREE + i + 1, SENTINEL);
       } else {
         // otherwise initialize sentinels
-        values_empty[i] = SENTINEL;
+        values_empty->set_value(i, SENTINEL);
       }
     }
   }
@@ -292,8 +356,8 @@ private:
     bleaf_ptr new_neighbor = allocate_bleaf(pool);
     
     K to_parent = split_keys<BLeaf*, bleaf_ptr>(&node, new_neighbor, false);
-    split_values(node.values, new_neighbor->values);
-    node.next_leaf = new_neighbor;
+    split_values(&node, (BLeaf*) new_neighbor);
+    node.set_next(new_neighbor);
 
     new_parent->set_key(0, to_parent);
     new_parent->set_ptr(0, static_cast<bnode_ptr>(node_p.remote_origin()));
@@ -313,7 +377,7 @@ private:
     K to_parent = split_keys<BNode*, bnode_ptr>(&node, new_neighbor, true);
     split_ptrs(&node, (BNode*) new_neighbor);
 
-    int bucket = parent_p->search_node(to_parent);
+    int bucket = search_node<BNode>(parent_p, to_parent);
     REMUS_ASSERT(bucket != -1, "Implies a full parent");
 
     shift_up(&parent, bucket);
@@ -335,11 +399,11 @@ private:
     // Full node so split
     bleaf_ptr new_neighbor = allocate_bleaf(pool);
     K to_parent = split_keys<BLeaf*, bleaf_ptr>(&node, new_neighbor, false);
-    split_values(node.values, new_neighbor->values);
-    new_neighbor->next_leaf = node.next_leaf;
-    node.next_leaf = new_neighbor;
+    split_values(&node, (BLeaf*) new_neighbor);
+    new_neighbor->set_next(node.get_next());
+    node.set_next(new_neighbor);
 
-    int bucket = parent_p->search_node(to_parent);
+    int bucket = search_node<BNode>(parent_p, to_parent);
     REMUS_ASSERT(bucket != -1, "Implies a full parent");
 
     shift_up(&parent, bucket);
@@ -368,10 +432,10 @@ private:
 
     if (height == 0){
       CachedObject<BLeaf> next_leaf = cache->Read<BLeaf>(static_cast<bleaf_ptr>(next_level));
-      if (do_split && next_leaf->keys[SIZE - 1] != SENTINEL){
+      if (do_split && next_leaf->key_at(SIZE - 1) != SENTINEL){
         // failed to get locks, retraverse
-        // if (!acquire(pool, curr_root, 0)) return traverse(pool, key, do_split);
-        // if (!acquire(pool, next_leaf, 0)) return traverse(pool, key, do_split);
+        // if (!try_acquire(pool, curr_root, 0)) return traverse(pool, key, do_split);
+        // if (!try_acquire(pool, next_leaf, 0)) return traverse(pool, key, do_split);
         split_node(pool, curr_root, next_leaf);
         // Just restart
         return traverse(pool, key, do_split);
@@ -389,13 +453,13 @@ private:
     CachedObject<BNode> parent;
     // if split, we updated the root and we need to retraverse
     if (do_split && curr->key_at(SIZE - 1) != SENTINEL){
-      // if (!acquire(pool, curr_root, 0)) return traverse(pool, key, do_split);
-      // if (!acquire(pool, curr, curr->version())) return traverse(pool, key, do_split);
+      // if (!try_acquire(pool, curr_root, 0)) return traverse(pool, key, do_split);
+      if (!try_acquire(pool, curr.remote_origin(), curr->version())) return traverse(pool, key, do_split);
       split_node(pool, curr_root, curr);
       return traverse(pool, key, do_split); // todo: if we split, there should be no need to re-read
     } 
 
-    int bucket = curr->search_node(key);
+    int bucket = search_node<BNode>(curr, key);
     while(height != 1){
       // Get the next level ptr
       next_level = read_level((BNode*) curr.get(), bucket);
@@ -407,16 +471,24 @@ private:
         curr = cache->Read<BNode>(next_level);
       }
       if (do_split && curr->key_at(SIZE - 1) != SENTINEL) {
-        split_node(pool, parent, curr);
+        if (try_acquire(pool, parent.remote_origin(), parent->version())) {
+          if (try_acquire(pool, curr.remote_origin(), curr->version())) {
+            // can acquire parent and current, so split
+            split_node(pool, parent, curr);
+          } else {
+            // cannot acquire child so release parent and try again
+            release(pool, parent.remote_origin(), parent->version());
+          }
+        }
         // re-read the parent and continue
         curr = cache->Read<BNode>(parent.remote_origin());
         while (!curr->is_valid()){
           curr = cache->Read<BNode>(next_level);
         }
-        bucket = curr->search_node(key);
+        bucket = search_node<BNode>(curr, key);
         continue;
       }
-      bucket = curr->search_node(key);
+      bucket = search_node<BNode>(curr, key);
       height--;
     }
 
@@ -426,14 +498,20 @@ private:
     // Read it as a BLeaf
     auto next_leaf = static_cast<bleaf_ptr>(next_level);
     CachedObject<BLeaf> leaf = cache->Read<BLeaf>(next_leaf);
-    if (do_split && leaf->keys[SIZE - 1] != SENTINEL) {
-      split_node(pool, curr, leaf);
+    // todo: acquire leaf here? todo: how do we retry?
+    if (do_split && leaf->key_at(SIZE - 1) != SENTINEL) {
+      if (try_acquire(pool, curr.remote_origin(), curr->version())){
+        split_node(pool, curr, leaf);
+      } else {
+        REMUS_ERROR("UNIMPLEMENTED");
+      }
+
       // Refresh if we caused a split
       curr = cache->Read<BNode>(curr.remote_origin());
       while (!curr->is_valid()){
         curr = cache->Read<BNode>(next_level);
       }
-      bucket = curr->search_node(key);
+      bucket = search_node<BNode>(curr, key);
       auto next_leaf = static_cast<bleaf_ptr>(read_level((BNode*) curr.get(), bucket));
       leaf = cache->Read<BLeaf>(next_leaf);
     }
@@ -481,9 +559,12 @@ public:
   /// @return an optional containing the value, if the key exists
   std::optional<V> contains(capability* pool, K key) {
     CachedObject<BLeaf> leaf = traverse(pool, key, false);
-    int bucket = leaf->search_node(key);
-    if (bucket == -1) return nullopt;
-    if (leaf->keys[bucket] == key) return make_optional(leaf->values[bucket]);
+    int bucket = search_node<BLeaf>(leaf, key);
+    while (bucket == -1){ // traverse to the right until we find the correct node
+      leaf = cache->Read<BLeaf>(leaf->get_next());
+      bucket = search_node<BLeaf>(leaf, key);
+    }
+    if (leaf->key_at(bucket) == key) return make_optional(leaf->value_at(bucket));
     return nullopt;
   }
 
@@ -495,22 +576,20 @@ public:
   /// @return an empty optional if the insert was successful. Otherwise it's the value at the key.
   std::optional<V> insert(capability* pool, K key, V value) {
     CachedObject<BLeaf> leaf = traverse(pool, key, true);
-    int bucket = leaf->search_node(key);
-    if (bucket == -1) {
-      // todo: traverse to the next node? Issue with descent?
-      REMUS_FATAL("Unimplemented");
+    int bucket = search_node<BLeaf>(leaf, key);
+    while (bucket == -1){ // traverse to the right until we find the correct node
+      leaf = cache->Read<BLeaf>(leaf->get_next());
+      bucket = search_node(leaf, key);
     }
-    V prev_value = leaf->values[bucket];
-    if (leaf->keys[bucket] != key) { // N.B. this is an inverted condition. Action upon the key is absent
+    V prev_value = leaf->value_at(bucket);
+    if (leaf->key_at(bucket) != key) { // N.B. this is an inverted condition. Action upon the key is absent
       BLeaf new_leaf = *leaf;
-      REMUS_ASSERT(new_leaf.keys[SIZE - 1] == SENTINEL, "Splitting required!");
+      REMUS_ASSERT(new_leaf.key_at(SIZE - 1) == SENTINEL, "Splitting required!");
       // shift up to make room for the KV (if possible)
-      for(int i = SIZE - 1; i > bucket; i--){
-        new_leaf.keys[i] = new_leaf.keys[i - 1];
-        new_leaf.values[i] = new_leaf.values[i - 1];
-      }
-      new_leaf.keys[bucket] = key;
-      new_leaf.values[bucket] = value;
+      for(int i = SIZE - 1; i > bucket; i--) new_leaf.set_value(i, new_leaf.value_at(i - 1));
+      for(int i = SIZE - 1; i > bucket; i--) new_leaf.set_key(i, new_leaf.key_at(i - 1));
+      new_leaf.set_key(bucket, key);
+      new_leaf.set_value(bucket, value);
       cache->Write<BLeaf>(leaf.remote_origin(), new_leaf);
       return nullopt;
     }
@@ -524,8 +603,11 @@ public:
   /// @return an optional containing the old value if the remove was successful. Otherwise an empty optional.
   std::optional<V> remove(capability* pool, K key) {
     CachedObject<BLeaf> leaf = traverse(pool, key, true);
-    int bucket = leaf->search_node(key);
-    if (bucket == -1) return nullopt;
+    int bucket = search_node<BLeaf>(leaf, key);
+    while (bucket == -1){ // traverse to the right until we find the correct node
+      leaf = cache->Read<BLeaf>(leaf->next_leaf);
+      bucket = search_node(leaf, key);
+    }
     if (leaf->keys[bucket] == key) {
       BLeaf new_leaf = *leaf;
       V prev_val = new_leaf.values[bucket];
@@ -569,12 +651,12 @@ public:
     for(int i = 0; i < indent; i++){
       std::cout << "\t";
     }
-    std::cout << "Leaf<next=" << (leaf.next_leaf != nullptr) << "> ";
+    std::cout << "Leaf<next=" << (leaf.get_next() != nullptr) << "> ";
     for(int i = 0; i < SIZE; i++){
-      if (leaf.keys[i] == SENTINEL)
-        std::cout << "(SENT, " << leaf.values[i] << ") ";
+      if (leaf.key_at(i) == SENTINEL)
+        std::cout << "(SENT, " << leaf.value_at(i) << ") ";
       else
-        std::cout << "(" << leaf.keys[i] << ", " << leaf.values[i] << ") ";
+        std::cout << "(" << leaf.key_at(i) << ", " << leaf.value_at(i) << ") ";
     }
     std::cout << std::endl;
   }
@@ -588,18 +670,19 @@ public:
     for(int i = 0; i < indent; i++){
       std::cout << "\t";
     }
+    std::cout << (n.is_valid() ? "valid " : "invalid ") << n.version();
     std::cout << " => ";
-    std::cout << (n.ptrs[0] != nullptr);
+    std::cout << (n.ptr_at(0) != nullptr);
     for(int i = 0; i < SIZE; i++){
-      if (n.keys[i] == SENTINEL)
-        std::cout << " (SENT) " << (n.ptrs[i+1] != nullptr);
+      if (n.key_at(i) == SENTINEL)
+        std::cout << " (SENT) " << (n.ptr_at(i+1) != nullptr);
       else
-        std::cout << " (" << n.keys[i] << ") " << (n.ptrs[i+1] != nullptr);
+        std::cout << " (" << n.key_at(i) << ") " << (n.ptr_at(i+1) != nullptr);
     }
     std::cout << std::endl;
     for(int i = 0; i <= SIZE; i++){
-      if (n.ptrs[i] != nullptr)
-        debug(height - 1, n.ptrs[i], indent + 1);
+      if (n.ptr_at(i) != nullptr)
+        debug(height - 1, n.ptr_at(i), indent + 1);
     }
   }
 
@@ -619,10 +702,10 @@ public:
     while(true){
       // Add to count
       for(int i = 0; i < SIZE; i++){
-        if (curr->keys[i] != SENTINEL) count++;
+        if (curr->key_at(i) != SENTINEL) count++;
       }
-      if (curr->next_leaf == nullptr) break;
-      curr = cache->Read<BLeaf>(curr->next_leaf);
+      if (curr->get_next() == nullptr) break;
+      curr = cache->Read<BLeaf>(curr->get_next());
     }
     return count;
   }

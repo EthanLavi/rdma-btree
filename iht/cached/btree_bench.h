@@ -1,4 +1,3 @@
-#include <climits>
 #include <protos/workloaddriver.pb.h>
 #include <remus/logging/logging.h>
 #include <remus/util/cli.h>
@@ -40,9 +39,11 @@ inline void btree_run(BenchmarkParams& params, rdma_capability* capability, Remo
 
     int second_cnt = 0;
     for(int i = 0; i <= 5000; i++){
-        if (tree.contains(pool, i).has_value()) second_cnt++;
+        if (tree.contains(pool, i).value_or(-1) == i) second_cnt++;
     }
     REMUS_INFO(second_cnt);
+
+    tree.debug();
 
     cach->free_all_tmp_objects();
     tree.destroy(pool);
