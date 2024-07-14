@@ -27,19 +27,35 @@ enum OpType {
     RAISE,
 };
 
-template <class K, class V>
+template <class K>
 struct UpdateOperation {
   K key;
   int height;
   OpType type;
 };
 
-/// Is a task pool for update operations
-template <class K, class V>
-class UpdaterThread {
-    std::thread t;
+/// Configuration information
+template <class K, int MAX_HEIGHT>
+struct alignas(64) node {
+    K key;
+    uint64_t value;
+    rdma_ptr<node> next[MAX_HEIGHT];
 
-    using Operation = UpdateOperation<K, V>;
+    node(K key, uint64_t value) : key(key), value(value) {
+        for(int i = 0; i < MAX_HEIGHT; i++){
+            next[i] = nullptr;
+        }
+    }
+};
+
+/// Is a task pool for update operations
+template <class K, int MAX_HEIGHT>
+class UpdaterThread {
+    typedef node<K, MAX_HEIGHT> Node;
+    std::thread t;
+    rdma_ptr<Node> root;
+
+    using Operation = UpdateOperation<K>;
     using Queue = ConcurrentQueue<Operation>;
 
     /// Frequency is the number of milliseconds to sleep for on timeout
@@ -62,40 +78,13 @@ class UpdaterThread {
     }
 };
 
-template <class T>
-inline bool is_deleted(rdma_ptr<T> obj){
-    return obj.address() & 0x1;
-}
-
-template <class T>
-inline rdma_ptr<T> marked_del(rdma_ptr<T> obj){
-    return rdma_ptr<T>(obj.raw() | 0x1);
-}
-
-template <class T>
-inline rdma_ptr<T> unmarked_del(rdma_ptr<T> obj){
-    return rdma_ptr<T>(obj.raw() & ~0x1);
-}
-
 /// SIZE is DEGREE * 2
-template <class K, class V, int MAX_HEIGHT, K SENTINEL> class RdmaSkipList {
+template <class K, int MAX_HEIGHT, K MINKEY, uint64_t DELETE_SENTINEL, uint64_t UNLINK_SENTINEL> class RdmaSkipList {
 private:
     Peer self_;
     CacheDepth::CacheDepth cache_depth_;
-
-    /// Configuration information
-    struct alignas(64) Node {
-        K key;
-        V value;
-        rdma_ptr<Node> next[MAX_HEIGHT];
-
-        Node(K key, V value) : key(key), value(value) {
-            for(int i = 0; i < MAX_HEIGHT; i++){
-                next[i] = nullptr;
-            }
-        }
-    };
-
+    
+    typedef node<K, MAX_HEIGHT> Node;
     typedef rdma_ptr<Node> nodeptr;
 
     struct Task {
@@ -142,7 +131,7 @@ private:
 public:
     RdmaSkipList(Peer& self, CacheDepth::CacheDepth depth, RemoteCacheImpl<capability>* cache, capability* pool, int thread_count, vector<Peer> peers) 
     : self_(std::move(self)), cache_depth_(depth), cache(cache) {
-        REMUS_INFO("SENTINEL is MIN? {}", SENTINEL);
+        REMUS_INFO("SENTINEL is MIN? {}", MINKEY);
         ebr = new EBRObjectPool<Node, 100>(pool, thread_count);
         // todo: uncomment ebr->Init((rdma_capability*) pool, self.id, peers);
     }
@@ -162,7 +151,8 @@ public:
     /// @return the iht root pointer
     rdma_ptr<anon_ptr> InitAsFirst(capability* pool){
         this->root = pool->Allocate<Node>();
-        this->root->key = SENTINEL;
+        this->root->key = MINKEY;
+        this->root->value = 0;
         for(int i = 0; i < MAX_HEIGHT; i++)
             this->root->next[i] = nullptr;
         this->root = mark_ptr(this->root);
@@ -175,85 +165,46 @@ public:
         this->root = static_cast<nodeptr>(mark_ptr(root_ptr));
     }
 
-    /// @brief Gets a value at the key.
-    /// @param pool the capability providing one-sided RDMA
-    /// @param key the key to search on
-    /// @return an optional containing the value, if the key exists
-    std::optional<V> contains(capability* pool, K key) {
-        int height = MAX_HEIGHT - 1;
-        // first node is a sentinel, it will always be linked in the data structure
-        CachedObject<Node> next_curr;
-        CachedObject<Node> curr = cache->Read<Node>(root);
-        while(height != -1){
-            if (unmarked_del(curr->next[height]) == nullptr){
-                height--;
-            } else {
-                next_curr = cache->Read<Node>(unmarked_del(curr->next[height]));
-                if (key == next_curr->key) {
-                    ebr->match_version();
-                    if (is_deleted(next_curr->next[0]))
-                        return std::nullopt;
-                    return make_optional(next_curr->value);
-                } else if (key > next_curr->key){
-                    // go to the next node
-                    curr = std::move(next_curr);
-                } else {
-                    // Key is greater than the next, so we need to descend in the level
-                    height--;
-                }
-            }
-        }
-        ebr->match_version();
-        return std::nullopt;
-    }
+    private: inline rdma_ptr<uint64_t> get_value_ptr(nodeptr node) {
+        Node* tmp = (Node*) 0x0;
+        return rdma_ptr<uint64_t>(node.id(), node.address() + (uint64_t) &tmp->value);
+    } public:
 
-    private: inline rdma_ptr<uint64_t> get_level_ptr(nodeptr node, int level) {                
-        return rdma_ptr<uint64_t>(node.id(), node.address() + sizeof(K) + sizeof(V) + (level * sizeof(nodeptr)));
+    private: inline rdma_ptr<uint64_t> get_level_ptr(nodeptr node, int level) {          
+        Node* tmp = (Node*) 0x0;
+        return rdma_ptr<uint64_t>(node.id(), node.address() + (uint64_t) &tmp->next[level]);
     } public:
 
     /// Search for a node where it's result->key is <= key
     /// Will unlink nodes only at the data level leaving them indexable
     private: CachedObject<Node> find(capability* pool, K key){
         // first node is a sentinel, it will always be linked in the data structure
-        CachedObject<Node> next_curr;
         CachedObject<Node> curr = cache->Read<Node>(root); // root is never deleted, let's say curr is never a deleted node
-        for(int height = MAX_HEIGHT - 1; height != 0; height--){
-            // iterate on this level until we find the last node that is not deleted and <= the key
+        CachedObject<Node> next_curr;
+        for(int height = MAX_HEIGHT - 1; height != -1; height--){
+            // iterate on this level until we find the last node that <= the key
             while(true){
                 if (curr->next[height] == nullptr) break; // if next is the END, descend a level
                 next_curr = cache->Read<Node>(curr->next[height]);
-                while(key >= next_curr->key && next_curr->next[height] != nullptr && is_deleted(next_curr->next[0])){ // while the next is less and deleted
-                    next_curr = cache->Read<Node>(unmarked_del(next_curr->next[height]));
-                }
-                if (key < next_curr->key) break;
-                if (is_deleted(next_curr->next[0])) break; // couldn't find a non-deleted node with next as less, descend a level
-                curr = std::move(next_curr); // safely transfer to the next one
-            }
-        } // we've traversed all the way down to the root level
-        while(true){
-            if (curr->next[0] == nullptr) return curr; // if next is the END, return curr
-            next_curr = cache->Read<Node>(curr->next[0]);
-            if (is_deleted(next_curr->next[0])){
-                // if the next is a deleted node, we need to physically delete
-                rdma_ptr<uint64_t> dest = get_level_ptr(curr.remote_origin(), 0);
-                uint64_t old = pool->CompareAndSwap<uint64_t>(dest, curr->next[0].raw(), unmarked_del(next_curr->next[0]).raw());
-                if (old == curr->next[0].raw()){ // if our CAS was successful, invalidate the object we modified
-                    cache->Invalidate(curr.remote_origin());
-                    // todo: add a task to the queue for unlinking next_curr
-                } else {
-                    // the removal failed (either an insert or delete occured), just retry the operation by refreshing curr
-                    curr = cache->Read(curr.remote_origin());
-                    // the removal failed because curr was deleted... hard-restart
-                    if (is_deleted(curr->next[0]))
-                        return find(pool, key);
-                }
-            } else if (key >= next_curr->key) {
-                curr = std::move(next_curr); // safely transfer to the next one
-            } else {
-                return curr;
+                if (next_curr->key <= key) curr = std::move(next_curr); // next_curr is eligible, continue with it
+                else break; // otherwise descend a level since next_curr is past the limit
             }
         }
+        return curr;
     } public:
+
+    /// @brief Gets a value at the key.
+    /// @param pool the capability providing one-sided RDMA
+    /// @param key the key to search on
+    /// @return an optional containing the value, if the key exists
+    std::optional<uint64_t> contains(capability* pool, K key) {
+        CachedObject<Node> node = find(pool, key);
+        ebr->match_version();
+        if (key == node->key && node->value != DELETE_SENTINEL && node->value != UNLINK_SENTINEL) {
+            return make_optional(node->value);
+        }
+        return std::nullopt;
+    }
 
     /// @brief Insert a key and value into the iht. Result will become the value
     /// at the key if already present.
@@ -261,21 +212,44 @@ public:
     /// @param key the key to insert
     /// @param value the value to associate with the key
     /// @return an empty optional if the insert was successful. Otherwise it's the value at the key.
-    std::optional<V> insert(capability* pool, K key, V value) {
+    std::optional<uint64_t> insert(capability* pool, K key, uint64_t value) {
         retry:
         CachedObject<Node> curr = find(pool, key);
         if (curr->key == key) {
-            ebr->match_version();
-            return make_optional(curr->value);
+            if (curr->value == UNLINK_SENTINEL) goto retry; // it is being unlinked, retry
+            if (curr->value == DELETE_SENTINEL){
+                rdma_ptr<uint64_t> curr_remote_value = get_value_ptr(curr.remote_origin());
+                if (pool->CompareAndSwap<uint64_t>(curr_remote_value, DELETE_SENTINEL, value) == DELETE_SENTINEL){
+                    // cas succeeded, reinstantiated the node
+                    cache->Invalidate(curr.remote_origin());
+                    ebr->match_version();
+                    return std::nullopt;
+                } else {
+                    // cas failed, either someone else inserted or is being unlinked
+                    goto retry;
+                }
+            } else {
+                // kv already exists
+                ebr->match_version();
+                return make_optional(curr->value);
+            }
         }
-        // first node is a sentinel, it will always be linked in the data structure
-        nodeptr new_node = ebr->allocate(); // allocates a node
-        *new_node = Node(key, value);
-        new_node->next[0] = curr->next[0];
+
+        // allocates a node
+        nodeptr new_node_ptr = ebr->allocate();
+        if (pool->is_local(new_node_ptr)){
+            *new_node_ptr = Node(key, value);
+            new_node_ptr->next[0] = curr->next[0];
+        } else {
+            Node new_node = Node(key, value);
+            new_node.next[0] = curr->next[0];
+            pool->Write<Node>(new_node_ptr, new_node);
+        }
 
         // if the next is a deleted node, we need to physically delete
+        // todo: couldn't I CAS the ptr after unlinking?! --> unlinking procedure needs two CAS to succeed, one on the value, one on the ptr
         rdma_ptr<uint64_t> dest = get_level_ptr(curr.remote_origin(), 0);
-        uint64_t old = pool->CompareAndSwap<uint64_t>(dest, curr->next[0].raw(), new_node.raw());
+        uint64_t old = pool->CompareAndSwap<uint64_t>(dest, curr->next[0].raw(), new_node_ptr.raw());
         if (old == curr->next[0].raw()){ // if our CAS was successful, invalidate the object we modified
             cache->Invalidate(curr.remote_origin());
             ebr->match_version();
@@ -283,8 +257,8 @@ public:
             // todo: add a task to the queue for raising the level
         } else {
             // the insert failed (either an insert or delete occured), retry the operation
+            ebr->requeue(new_node_ptr); // recycle the data
             goto retry;
-            // todo: fix leaked memory
         }
     }
 
@@ -293,26 +267,27 @@ public:
     /// @param pool the capability providing one-sided RDMA
     /// @param key the key to remove at
     /// @return an optional containing the old value if the remove was successful. Otherwise an empty optional.
-    std::optional<V> remove(capability* pool, K key) {
+    std::optional<uint64_t> remove(capability* pool, K key) {
         retry:
         CachedObject<Node> curr = find(pool, key);
         if (curr->key != key) {
-            std::cout << "!!!" << curr->key << std::endl;
+            // Couldn't find the key, return
             ebr->match_version();
             return std::nullopt;
         }
 
         // if the next is a deleted node, we need to physically delete
-        rdma_ptr<uint64_t> dest = get_level_ptr(curr.remote_origin(), 0);
-        uint64_t old = pool->CompareAndSwap<uint64_t>(dest, curr->next[0].raw(), marked_del(curr->next[0]).raw()); // mark for deletion
-        if (old == unmarked_del(curr->next[0]).raw()){ // if our CAS was successful, invalidate the object we modified
+        rdma_ptr<uint64_t> dest = get_value_ptr(curr.remote_origin());
+        uint64_t old = pool->CompareAndSwap<uint64_t>(dest, curr->value, DELETE_SENTINEL); // mark for deletion
+        if (old == curr->value){ // if our CAS was successful, invalidate the object we modified
             cache->Invalidate(curr.remote_origin());
             ebr->match_version();
             return make_optional(curr->value);
             // todo: add a task to the queue for raising the level
         } else {
-            // the insert failed (either an insert or delete occured), retry the operation
-            goto retry;
+            // the remove failed (a different delete occured), return nullopt
+            ebr->match_version();
+            return std::nullopt;
         }
         // todo: deallocate old node
     }
@@ -324,7 +299,7 @@ public:
     /// @param key_ub the upper bound for the key range
     /// @param value the value to associate with each key. Currently, we have
     /// asserts for result to be equal to the key. Best to set value equal to key!
-    int populate(capability* pool, int op_count, K key_lb, K key_ub, std::function<K(V)> value) {
+    int populate(capability* pool, int op_count, K key_lb, K key_ub, std::function<K(uint64_t)> value) {
         // Populate only works when we have numerical keys
         K key_range = key_ub - key_lb;
         // Create a random operation generator that is
@@ -341,13 +316,6 @@ public:
         return success_count;
     }
 
-    int calc_height(Node& n){
-        for(int i = MAX_HEIGHT - 1; i >= 0; i--){
-            if (n.next[i] != nullptr) return i + 1;
-        }
-        return 0;
-    }
-
     /// Single threaded, local print
     void debug(){
         for(int height = MAX_HEIGHT - 1; height != 0; height--){
@@ -362,9 +330,10 @@ public:
 
         Node curr = *root;
         std::cout << 0 << " SENT -> ";
-        while(unmarked_del(curr.next[0]) != nullptr){
-            curr = *unmarked_del(curr.next[0]);
-            if (is_deleted(curr.next[0])) std::cout << "DELETED(" << curr.key << ") -> ";
+        while(curr.next[0] != nullptr){
+            curr = *curr.next[0];
+            if (curr.value == DELETE_SENTINEL) std::cout << "DELETED(" << curr.key << ") -> ";
+            else if (curr.value == UNLINK_SENTINEL) std::cout << "UNLINKED(" << curr.key << ") -> ";
             else std::cout << curr.key << " -> ";
         }
         std::cout << "END" << std::endl;
@@ -375,9 +344,9 @@ public:
         // Get leftmost leaf by wrapping SENTINEL
         int count = 0;
         Node curr = *cache->Read<Node>(root);
-        while(unmarked_del(curr.next[0]) != nullptr){
-            curr = *cache->Read<Node>(unmarked_del(curr.next[0]));
-            if (!is_deleted(curr.next[0]))
+        while(curr.next[0] != nullptr){
+            curr = *cache->Read<Node>(curr.next[0]);
+            if (curr.value != DELETE_SENTINEL && curr.value != UNLINK_SENTINEL)
                 count++;
         }
         return count;
