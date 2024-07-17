@@ -50,7 +50,7 @@ private:
       K keys[KLINE_SIZE];
   };
 
-  /// A line with keys
+  /// A line with values
   struct vline {
       long version;
       V values[VLINE_SIZE];
@@ -282,16 +282,27 @@ private:
 
   /// Return the first index where the provided key is less than the element at that index 
   /// (-1 if the end element)
+  public:
   template <class SRC>
   int search_node(const SRC* origin, K key) {
-    // todo: binary search
-    for(int i = 0; i < SIZE; i++){
-      if (key <= origin->key_at(i)){
-        return i;
-      }
+    if (key > origin->key_at(SIZE - 1)) return -1;
+    int low = 0;
+    int high = SIZE - 1;
+    int mid;
+    while(low != high){
+      mid = (low + high) / 2;
+      if (key == origin->key_at(mid))
+        return mid;
+      else if (key < origin->key_at(mid))
+        high = mid;
+      else
+        low = mid + 1;
     }
-    return -1;
-  }
+    return low; // low = mid = high (but mid hasn't been updated)
+    /* reference for equivalence
+    for(int i = 0; i < SIZE; i++) if (key <= origin->key_at(i)) return i;
+    */
+  } private:
 
   template <class SRC>
   int search_node(const CachedObject<SRC>& origin, K key) {
