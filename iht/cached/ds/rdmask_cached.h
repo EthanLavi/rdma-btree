@@ -34,13 +34,13 @@ private:
         y^=(y>>17);
         y^=(y<<5);
         uint32_t temp = y;
-        uint32_t level = 0;
+        uint32_t level = 1;
         while (((temp >>= 1) & 1) != 0) {
             ++level;
         }
         /* 0 <= level < MAX_HEIGHT */
-        if (level >= MAX_HEIGHT) {
-            return (int) MAX_HEIGHT - 1;
+        if (level > MAX_HEIGHT) {
+            return (int) MAX_HEIGHT;
         } else {
             return (int) level;
         }
@@ -62,21 +62,18 @@ public:
 
 template <class T>
 inline bool is_marked_del(rdma_ptr<T> ptr){
-    return false;
-    // return ptr.raw() & 0x1;
+    return ptr.raw() & 0x1;
 }
 
 template <class T>
 inline rdma_ptr<T> marked_del(rdma_ptr<T> ptr){
-    return ptr;
-    // return rdma_ptr<T>(ptr.raw() | 0x1);
+    return rdma_ptr<T>(ptr.raw() | 0x1);
 }
 
 /// A ptr without the marking (ptr "sans" marking)
 template <class T>
 inline rdma_ptr<T> sans(rdma_ptr<T> ptr){
-    return ptr;
-    // return rdma_ptr<T>(ptr.raw() & ~0x1);
+    return rdma_ptr<T>(ptr.raw() & ~0x1);
 }
 
 /// SIZE is DEGREE * 2
@@ -84,7 +81,7 @@ template <class K, int MAX_HEIGHT, K MINKEY, uint64_t DELETE_SENTINEL, uint64_t 
 private:
     Peer self_;
     CacheDepth::CacheDepth cache_depth_;
-    
+
     typedef node<K, MAX_HEIGHT> Node;
     typedef rdma_ptr<Node> nodeptr;
 
@@ -108,8 +105,8 @@ private:
   
     // preallocated memory for RDMA operations (avoiding frequent allocations)
     // rdma_ptr<T> temp_lock;
-    EBRObjectPool<Node, 100>* ebr; // todo: thread_local
-    
+    EBRObjectPool<Node, 100>* ebr; // todo: thread_local?
+
     inline rdma_ptr<uint64_t> get_value_ptr(nodeptr node) {
         Node* tmp = (Node*) 0x0;
         return rdma_ptr<uint64_t>(node.id(), node.address() + (uint64_t) &tmp->value);
@@ -122,16 +119,16 @@ private:
 
     /// Calculate the height of a node by how many levels can reach the current
     /// Returns 0 if completely unlinked
-    int height(CachedObject<Node>& node, rdma_ptr<Node> prevs[MAX_HEIGHT]){
+    int height(CachedObject<Node>& node, rdma_ptr<Node> nexts[MAX_HEIGHT]){
         for(int i = 0; i < MAX_HEIGHT; i++){
-            if (prevs[i].raw() != node.remote_origin().raw()) return i;
+            if (nexts[i].raw() != node.remote_origin().raw()) return i;
         }
         return MAX_HEIGHT;
     }
 
     /// Unlink a node (lower height to 0)
     void unlink_node(capability* pool, CachedObject<Node>& node, rdma_ptr<Node> prevs[MAX_HEIGHT], rdma_ptr<Node> nexts[MAX_HEIGHT]){
-        for(int i = height(node, prevs) - 1; i != -1; i--){
+        for(int i = height(node, nexts) - 1; i != -1; i--){
             rdma_ptr<uint64_t> node_ptr = get_level_ptr(node.remote_origin(), i);
             if (!is_marked_del(node->next[i])){
                 if (pool->CompareAndSwap<uint64_t>(node_ptr, node->next[i].raw(), marked_del(node->next[i]).raw()) == node->next[i].raw()){
@@ -141,7 +138,7 @@ private:
                 }
             }
             rdma_ptr<uint64_t> prev_ptr = get_level_ptr(prevs[i], i);
-            if (pool->CompareAndSwap<uint64_t>(prev_ptr, node.remote_origin().raw(), nexts[i].raw()) == node.remote_origin().raw()){
+            if (pool->CompareAndSwap<uint64_t>(prev_ptr, node.remote_origin().raw(), sans(node->next[i]).raw()) == node.remote_origin().raw()){
                 // Unlink was successful
                 cache->Invalidate<Node>(prevs[i]);
             } else {
@@ -155,7 +152,7 @@ private:
     /// Raise a node to a random new height
     int raise_node(capability* pool, CachedObject<Node>& node, rdma_ptr<Node> prevs[MAX_HEIGHT], rdma_ptr<Node> nexts[MAX_HEIGHT]){
         int desired_height = node->height;
-        for(int i = height(node, prevs); i < desired_height; i++){
+        for(int i = height(node, nexts); i < desired_height; i++){
             rdma_ptr<uint64_t> node_ptr = get_level_ptr(node.remote_origin(), i);
             uint64_t old_ptr_curr = pool->CompareAndSwap<uint64_t>(node_ptr, node->next[i].raw(), nexts[i].raw());
             if (old_ptr_curr == node->next[i].raw()) {
@@ -199,22 +196,25 @@ public:
             }
             while(sans(curr->next[0]) != nullptr){
                 curr = cache->Read<Node>(sans(curr->next[0]));
-                for(int i = 0; i < height(curr, prevs); i++){
+                int curr_height = height(curr, nexts);
+                if (curr->value == DELETE_SENTINEL){
+                    rdma_ptr<uint64_t> ptr = get_value_ptr(curr.remote_origin());
+                    if (pool->CompareAndSwap<uint64_t>(ptr, DELETE_SENTINEL, UNLINK_SENTINEL) == DELETE_SENTINEL){
+                        unlink_node(pool, curr, prevs, nexts);
+                    }
+                } else if (curr->value != UNLINK_SENTINEL){
+                    // Have a value, check if it needs to be raised
+                    if (curr->height != curr_height){
+                        // The intended height isn't equal to the true height of curr
+                        raise_node(pool, curr, prevs, nexts);
+                    }
+                } // else do nothing, someone else unlinking
+                
+                // Then update prevs and next (prev was curr up to its height, next is the next node of the curr)
+                for(int i = 0; i < curr_height; i++){
                     prevs[i] = curr.remote_origin();
                     nexts[i] = curr->next[i];
                 }
-                if (curr->value == DELETE_SENTINEL){
-                    rdma_ptr<uint64_t> ptr = get_value_ptr(curr.remote_origin());
-                    // if (pool->CompareAndSwap<uint64_t>(ptr, DELETE_SENTINEL, UNLINK_SENTINEL) == DELETE_SENTINEL){
-                    //     unlink_node(pool, curr, prevs, nexts);
-                    // }
-                } else if (curr->value != UNLINK_SENTINEL){
-                    // Have a value, check if it needs to be raised
-                    if (curr->height != height(curr, prevs)){
-                        // The intended height isn't equal to the true height of curr
-                        // raise_node(pool, curr, prevs, nexts);
-                    }
-                } // else do nothing, someone else unlinking
             }
         }
     }
@@ -400,15 +400,18 @@ public:
     /// Single threaded, local print
     void debug(){
         for(int height = MAX_HEIGHT - 1; height != 0; height--){
+            int counter = 0;
             Node curr = *root;
             std::cout << height << " SENT -> ";
             while(sans(curr.next[height]) != nullptr){
                 curr = *curr.next[height];
                 std::cout << curr.key << " -> ";
+                counter++;
             }
-            std::cout << "END" << std::endl;
+            std::cout << "END{" << counter << "}" << std::endl;
         }
 
+        int counter = 0;
         Node curr = *root;
         std::cout << 0 << " SENT -> ";
         while(sans(curr.next[0]) != nullptr){
@@ -416,8 +419,9 @@ public:
             if (curr.value == DELETE_SENTINEL) std::cout << "DELETED(" << curr.key << ") -> ";
             else if (curr.value == UNLINK_SENTINEL) std::cout << "UNLINKED(" << curr.key << ") -> ";
             else std::cout << curr.key << " -> ";
+            counter++;
         }
-        std::cout << "END" << std::endl;
+        std::cout << "END{" << counter << "}" << std::endl;
     }
 
     /// No concurrent or thread safe (if everyone is readonly, then its fine). Counts the number of elements in the IHT
