@@ -85,17 +85,6 @@ private:
     typedef node<K, MAX_HEIGHT> Node;
     typedef rdma_ptr<Node> nodeptr;
 
-    struct Task {
-        rdma_ptr<nodeptr> ptr;
-        nodeptr to_be;
-        nodeptr org;
-
-        Task() {
-            ptr = nullptr;
-        }
-        Task(nodeptr org, rdma_ptr<nodeptr> ptr, nodeptr to_be) : org(org), ptr(ptr), to_be(to_be) {}
-    };
-
     template <typename T> inline bool is_local(rdma_ptr<T> ptr) {
         return ptr.id() == self_.id;
     }
@@ -104,8 +93,9 @@ private:
     RemoteCacheImpl<capability>* cache;
   
     // preallocated memory for RDMA operations (avoiding frequent allocations)
-    // rdma_ptr<T> temp_lock;
-    EBRObjectPool<Node, 100>* ebr; // todo: thread_local?
+    rdma_ptr<Node> tmp_node;
+    // shared EBRObjectPool has thread_local internals so its all thread safe
+    EBRObjectPool<Node, 100>* ebr;
 
     inline rdma_ptr<uint64_t> get_value_ptr(nodeptr node) {
         Node* tmp = (Node*) 0x0;
@@ -127,25 +117,29 @@ private:
     }
 
     /// Unlink a node (lower height to 0)
-    void unlink_node(capability* pool, CachedObject<Node>& node, rdma_ptr<Node> prevs[MAX_HEIGHT], rdma_ptr<Node> nexts[MAX_HEIGHT]){
-        for(int i = height(node, nexts) - 1; i != -1; i--){
+    /// Return true if we can deallocate the node
+    bool unlink_node(capability* pool, CachedObject<Node>& node, rdma_ptr<Node> prevs[MAX_HEIGHT], rdma_ptr<Node> nexts[MAX_HEIGHT]){
+        int h = height(node, nexts);
+        for(int i = h - 1; i != -1; i--){
             rdma_ptr<uint64_t> node_ptr = get_level_ptr(node.remote_origin(), i);
             if (!is_marked_del(node->next[i])){
                 if (pool->CompareAndSwap<uint64_t>(node_ptr, node->next[i].raw(), marked_del(node->next[i]).raw()) == node->next[i].raw()){
                     cache->Invalidate<Node>(node.remote_origin());
                 } else {
-                    break; // failed on the level, retry on the next go around
+                    return false; // failed on the level, retry on the next go around
                 }
             }
             rdma_ptr<uint64_t> prev_ptr = get_level_ptr(prevs[i], i);
             if (pool->CompareAndSwap<uint64_t>(prev_ptr, node.remote_origin().raw(), sans(node->next[i]).raw()) == node.remote_origin().raw()){
                 // Unlink was successful
                 cache->Invalidate<Node>(prevs[i]);
+                nexts[i] = sans(node->next[i]); // update next to be accurate
             } else {
                 // failed on the level, retry on the next go-around
-                break;
+                return false;
             }
         }
+        return true;
     }
 
     /// Returns new height
@@ -167,6 +161,7 @@ private:
             if (old_ptr_prev == nexts[i].raw()) {
                 // insert on this level was successful
                 cache->Invalidate<Node>(prevs[i]);
+                nexts[i] = node.remote_origin(); // update nexts to the correct value
             } else {
                 // couldn't set prev, only raised to height i
                 return i;
@@ -176,17 +171,18 @@ private:
     }
 
 public:
-    RdmaSkipList(Peer& self, CacheDepth::CacheDepth depth, RemoteCacheImpl<capability>* cache, capability* pool, int thread_count, vector<Peer> peers) 
-    : self_(std::move(self)), cache_depth_(depth), cache(cache) {
+    RdmaSkipList(Peer& self, CacheDepth::CacheDepth depth, RemoteCacheImpl<capability>* cache, capability* pool, int thread_count, vector<Peer> peers, EBRObjectPool<Node, 100>* ebr) 
+    : self_(std::move(self)), cache_depth_(depth), cache(cache), ebr(ebr) {
         REMUS_INFO("SENTINEL is MIN? {}", MINKEY);
-        ebr = new EBRObjectPool<Node, 100>(pool, thread_count);
+        tmp_node = pool->Allocate<Node>();
         // todo: uncomment ebr->Init((rdma_capability*) pool, self.id, peers);
     }
 
-    void helper_thread(std::atomic<bool>* do_cont, capability* pool){
+    void helper_thread(std::atomic<bool>* do_cont, capability* pool, EBRObjectPool<Node, 100>* ebr_helper, vector<LimboLists<Node>*> qs){
         rdma_ptr<Node> prevs[MAX_HEIGHT];
         rdma_ptr<Node> nexts[MAX_HEIGHT];
         CachedObject<Node> curr;
+        int i = 0;
         while(do_cont->load()){ // endlessly traverse and maintain the index
             curr = cache->Read<Node>(root);
             // init prevs and nexts
@@ -200,33 +196,41 @@ public:
                 if (curr->value == DELETE_SENTINEL){
                     rdma_ptr<uint64_t> ptr = get_value_ptr(curr.remote_origin());
                     if (pool->CompareAndSwap<uint64_t>(ptr, DELETE_SENTINEL, UNLINK_SENTINEL) == DELETE_SENTINEL){
-                        unlink_node(pool, curr, prevs, nexts);
+                        if (unlink_node(pool, curr, prevs, nexts)){
+                            // if unlink was successful, deallocate
+                            LimboLists<Node>* q = qs.at(i);
+                            q->free_lists[2].load()->push(curr.remote_origin());
+                            // cycle the index
+                            i++;
+                            i %= qs.size();
+                        }
+                        curr = cache->Read<Node>(curr.remote_origin()); // jump a node back to refresh nexts and prevs
+                        curr_height = height(curr, nexts);
                     }
                 } else if (curr->value != UNLINK_SENTINEL){
                     // Have a value, check if it needs to be raised
                     if (curr->height != curr_height){
                         // The intended height isn't equal to the true height of curr
                         raise_node(pool, curr, prevs, nexts);
+                        curr = cache->Read<Node>(curr.remote_origin()); // jump a node back to refresh nexts and prevs
+                        curr_height = height(curr, nexts);
                     }
                 } // else do nothing, someone else unlinking
-                
+
                 // Then update prevs and next (prev was curr up to its height, next is the next node of the curr)
                 for(int i = 0; i < curr_height; i++){
                     prevs[i] = curr.remote_origin();
                     nexts[i] = curr->next[i];
                 }
             }
+            ebr_helper->match_version(true); // indicate done with epoch
         }
     }
 
-    /// Register the thread --> needed for EBR
-    void RegisterThread(){
-        ebr->RegisterThread();
-    }
-
     /// Free all the resources associated with the data structure
-    void destroy(capability* pool) {
-        delete ebr;
+    void destroy(capability* pool, bool delete_as_first = true) {
+        pool->Deallocate<Node>(tmp_node);
+        if (delete_as_first) pool->Deallocate<Node>(root);
     }
 
     /// @brief Create a fresh iht
@@ -321,13 +325,13 @@ public:
             } else {
                 Node new_node = Node(key, value);
                 new_node.next[0] = curr->next[0];
-                pool->Write<Node>(new_node_ptr, new_node); // todo: prealloc
+                pool->Write<Node>(new_node_ptr, new_node, tmp_node);
             }
 
             // if the next is a deleted node, we need to physically delete
-            // todo: couldn't I CAS the ptr after unlinking?! --> unlinking procedure needs two CAS to succeed, one on the value, one on the ptr
             rdma_ptr<uint64_t> dest = get_level_ptr(curr.remote_origin(), 0);
-            uint64_t old = pool->CompareAndSwap<uint64_t>(dest, curr->next[0].raw(), new_node_ptr.raw());
+            // will fail if the ptr is marked for unlinking
+            uint64_t old = pool->CompareAndSwap<uint64_t>(dest, sans(curr->next[0]).raw(), new_node_ptr.raw());
             if (old == curr->next[0].raw()){ // if our CAS was successful, invalidate the object we modified
                 cache->Invalidate(curr.remote_origin());
                 ebr->match_version();
@@ -370,7 +374,6 @@ public:
             ebr->match_version();
             return std::nullopt;
         }
-        // todo: deallocate old node
     }
 
     /// @brief Populate only works when we have numerical keys. Will add data
@@ -404,7 +407,7 @@ public:
             Node curr = *root;
             std::cout << height << " SENT -> ";
             while(sans(curr.next[height]) != nullptr){
-                curr = *curr.next[height];
+                curr = *sans(curr.next[height]);
                 std::cout << curr.key << " -> ";
                 counter++;
             }
@@ -415,13 +418,28 @@ public:
         Node curr = *root;
         std::cout << 0 << " SENT -> ";
         while(sans(curr.next[0]) != nullptr){
-            curr = *curr.next[0];
+            std::cout << sans(curr.next[0]) << " ";
+            curr = *sans(curr.next[0]);
             if (curr.value == DELETE_SENTINEL) std::cout << "DELETED(" << curr.key << ") -> ";
             else if (curr.value == UNLINK_SENTINEL) std::cout << "UNLINKED(" << curr.key << ") -> ";
             else std::cout << curr.key << " -> ";
             counter++;
         }
         std::cout << "END{" << counter << "}" << std::endl;
+    }
+
+    /// A simple check to determine if we caused a corruption of our list (used in single-threaded, local debugging)
+    bool is_infinite(){
+        for(int height = MAX_HEIGHT - 1; height != -1; height--){
+            Node curr = *root;
+            K last_key = curr.key;
+            while(sans(curr.next[height]) != nullptr){
+                curr = *sans(curr.next[height]);
+                if (curr.key == last_key) return true;
+                last_key = curr.key;
+            }
+        }
+        return false;
     }
 
     /// No concurrent or thread safe (if everyone is readonly, then its fine). Counts the number of elements in the IHT

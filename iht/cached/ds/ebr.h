@@ -14,8 +14,14 @@ using namespace std;
 
 typedef CountingPool capability;
 
+template <class T>
+struct LimboLists {
+    atomic<queue<rdma_ptr<T>>*> free_lists[3];
+    LimboLists() = default;
+};
+
 /// An object pool that can reallocate objects as well
-template <class T, int WAIT>
+template <class T, int OPS_PER_EPOCH>
 class EBRObjectPool {
     /// version that the node can wait on. Once it sees it increments, in can rotate its free lists and increment the next node
     struct alignas(64) ebr_ref {
@@ -32,15 +38,16 @@ class EBRObjectPool {
     atomic<int> at_version;
     static thread_local int id; // the id matches a local version in the version_slots
     static thread_local int counter;
-    static thread_local queue<rdma_ptr<T>>* free_lists[3]; // thread queues to use as free-lists
+    static thread_local LimboLists<T>* limbo; // thread queues to use as free-lists
 
+public:
     EBRObjectPool(capability* pool, int thread_count) : pool(pool), thread_count(thread_count) {
         my_version = pool->Allocate<ebr_ref>();
         my_version->version = 0;
         id_gen.store(0);
         thread_slots = new ebr_ref[thread_count]();
         for(int i = 0; i < thread_count; i++){
-            thread_slots[i]->version = 0;
+            thread_slots[i].version = 0;
         }
         at_version.store(0);
         // todo: delete? (until init is called, it's self-ebr)
@@ -49,9 +56,18 @@ class EBRObjectPool {
 
     ~EBRObjectPool(){
         delete[] thread_slots;
-        delete free_lists[0];
-        delete free_lists[1];
-        delete free_lists[2];
+    }
+
+    void destroy(capability* pool){
+        for(int i = 0; i < 3; i++){
+            while(!limbo->free_lists[i].load()->empty()){
+                rdma_ptr<T> to_free = limbo->free_lists[i].load()->front();
+                if (pool->is_local(to_free)){
+                    pool->Deallocate(to_free);
+                }
+                limbo->free_lists[i].load()->pop();
+            }
+        }
     }
 
     /// Connect to the other peers
@@ -60,7 +76,7 @@ class EBRObjectPool {
         RemoteObjectProto my_proto;
         my_proto.set_raddr((uint64_t) my_version);
         RemoteObjectProto next_proto;
-        
+
         int send_id = (node_id - 1) % peers.size();
         int recv_id = (node_id + 1) % peers.size();
         Peer sender, recvr;
@@ -88,57 +104,65 @@ class EBRObjectPool {
     }
 
     // Get an id for the thread...
-    void RegisterThread(){
+    LimboLists<T>* RegisterThread(){
         id = id_gen.fetch_add(1);
-        free_lists[0] = new queue<rdma_ptr<T>>();
-        free_lists[1] = new queue<rdma_ptr<T>>();
-        free_lists[2] = new queue<rdma_ptr<T>>();
+        EBRObjectPool<T, OPS_PER_EPOCH>::limbo = new LimboLists<T>();
+        limbo->free_lists[0] = new queue<rdma_ptr<T>>();
+        limbo->free_lists[1] = new queue<rdma_ptr<T>>();
+        limbo->free_lists[2] = new queue<rdma_ptr<T>>();
+        return limbo;
     }
 
     /// Called at the end of every operation to indicate a finish 
-    void match_version(){
-        counter++;
-        if (counter % WAIT != 0) return; // wait before cycling iterations
+    void match_version(bool override_epoch = false){
         REMUS_ASSERT(id != -1, "Forgot to call RegisterThread");
-        int new_version = my_version->version + 1;
+        counter++;
+        if (override_epoch || counter % OPS_PER_EPOCH != 0) return; // wait before cycling iterations
+        long new_version = my_version->version + 1;
         // If my version is behind the current version, hop ahead
-        if (thread_slots[id] < new_version){
-            thread_slots[id] = new_version;
+        if (thread_slots[id].version < new_version){
+            thread_slots[id].version = new_version;
 
             // cycle free lists (its fine if deallocations gets pushed back two iterations)
-            auto tmp = free_lists[0];
-            free_lists[0] = free_lists[1];
-            free_lists[1] = free_lists[2];
-            free_lists[2] = tmp;
+            auto tmp = limbo->free_lists[0].load();
+            limbo->free_lists[0].store(limbo->free_lists[1].load());
+            limbo->free_lists[1].store(limbo->free_lists[2].load());
+            limbo->free_lists[2].store(tmp);
         }
 
         // Guard agaisnt a behind-thread
         for(int i = 0; i < thread_count; i++)
-            if (thread_slots[i] != new_version) return;
+            if (thread_slots[i].version != new_version) return;
 
         // All threads are up-to-date.
         // If the next-node version is not update_to_date, try to be the one to write to it
         if (new_version > at_version.load()){
             int v = at_version.exchange(new_version);
             if (v != new_version){ // actually I was the one that incremented the version
-                // write to the next
-                pool->Write(next_node_version, my_version, new_version, remus::rdma::internal::RDMAWriteWithNoAck); // we don't care when it completes
+                // write to the next async (we don't care when it completes, as long as it isn't lost)
+                pool->Write<ebr_ref>(next_node_version, (ebr_ref) new_version, my_version, remus::rdma::internal::RDMAWriteWithNoAck);
             }
         }
     }
 
+    /// Requeue something that was pushed but wasn't used
+    void requeue(rdma_ptr<T> obj){
+        limbo->free_lists[0].load()->push(obj);
+    }
+
+    /// Technically, this method shouldn't be used since the queues being rotated enable it to be single producer, single consumer
     void deallocate(rdma_ptr<T> obj){
-        free_lists[2]->push(obj); // add to the free list
+        limbo->free_lists[2].load()->push(obj); // add to the free list
     }
 
     /// Allocate from the pool. Might allocate locally using the pool but not guaranteed (could be a remote!)
     /// Guaranteed via EBR to be exclusive
     rdma_ptr<T> allocate(){
-        if (free_lists[0]->empty()){
+        if (limbo->free_lists[0].load()->empty()){
             return pool->Allocate<T>();
         } else {
-            rdma_ptr<T> ret = free_lists[0]->back();
-            free_lists[0]->pop();
+            rdma_ptr<T> ret = limbo->free_lists[0].load()->back();
+            limbo->free_lists[0].load()->pop();
             return ret;
         }
     }
@@ -151,4 +175,4 @@ template <class T, int WAIT>
 inline thread_local int EBRObjectPool<T, WAIT>::counter = 0;
 
 template <class T, int WAIT>
-inline thread_local queue<rdma_ptr<T>>* EBRObjectPool<T, WAIT>::free_lists[3];
+inline thread_local LimboLists<T>* EBRObjectPool<T, WAIT>::limbo = nullptr;

@@ -56,11 +56,15 @@ public:
         }
         if (prealloc == nullptr){
             rdma_ptr<T> p_new = Allocate<T>(size);
+            mu.lock();
             memcpy(p_new.get(), p.get(), sizeof(T) * size);
+            mu.unlock();
             return p_new;
         } else {
             // read into prealloc instead of internally allocating
+            mu.lock();
             memcpy(prealloc.get(), p.get(), sizeof(T) * size);
+            mu.unlock();
             return prealloc;
         }        
     }
