@@ -11,7 +11,6 @@
 
 #include "../../dcache/test/faux_mempool.h"
 
-#include "spscq.h"
 #include "ebr.h"
 
 #include "../../common.h"
