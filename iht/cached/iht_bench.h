@@ -120,7 +120,6 @@ inline void iht_run(BenchmarkParams& params, rdma_capability* capability, Remote
                     cache->reset_metrics();
                 }
             );
-            // todo: for LinearProbingMap only REMUS_ASSERT(params.key_lb >= 2 && params.key_ub - params.key_lb <= 1000, "Keyspace is valid?");
             using client_t = Client<Map_Op<int, int>>;
             std::unique_ptr<client_t> client = client_t::Create(host, endpoint, params, &client_sync, iht_as_map);
             double populate_frac = 0.5 / (double) (params.node_count * params.thread_count);
