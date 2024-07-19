@@ -3,6 +3,7 @@
 #include <atomic>
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <ostream>
 #include <random>
 #include <remus/logging/logging.h>
@@ -12,7 +13,7 @@
 #include <dcache/cache_store.h>
 #include <dcache/cached_ptr.h>
 
-#include "../../dcache/test/faux_mempool.h"
+// #include "../../dcache/test/faux_mempool.h"
 
 #include "../../common.h"
 #include <optional>
@@ -20,12 +21,14 @@
 
 using namespace remus::rdma;
 
-/// SIZE is DEGREE * 2
-typedef CountingPool capability;
 typedef int32_t K;
 static const K SENTINEL = INT_MAX;
 
-template <class V, int DEGREE> class RdmaBPTree {
+template <class V, int DEGREE, class capability> class RdmaBPTree {
+  /// SIZE is DEGREE * 2
+  // typedef CountingPool capability;
+  // typedef rdma_capability_thread capability;
+
 private:
   static const int SIZE = (DEGREE * 2) + 1;
   static const uint64_t LOCK_BIT = (uint64_t) 1 << 63;
@@ -161,6 +164,7 @@ private:
       last_line.version = 0;
       for(int i = 0; i < SIZE; i++){
         set_key(i, SENTINEL);
+        set_value(i, 0); // set just for debugging
       }
       set_next(nullptr);
     }
@@ -245,22 +249,22 @@ private:
   template <class ptr_t>
   bool try_acquire(capability* pool, rdma_ptr<ptr_t> node, long version){
     // swap the first 8 bytes (the lock) from unlocked to locked
-    uint64_t v = pool->CompareAndSwap<uint64_t>(static_cast<rdma_ptr<uint64_t>>(node), version, version | LOCK_BIT);
-    if (v == version) return true;
-    REMUS_INFO("Found acquire to be false? How?");
+    uint64_t v = pool->template CompareAndSwap<uint64_t>(static_cast<rdma_ptr<uint64_t>>(unmark_ptr(node)), version, version | LOCK_BIT);
+    if (v == (version & ~LOCK_BIT)) return true; // I think the lock bit will never be set in this scenario since we'd detect a broken read primarily
     return false;
   }
 
   template <class ptr_t>
   void release(capability* pool, rdma_ptr<ptr_t> node, long version){
-    pool->Write<uint64_t>(static_cast<rdma_ptr<uint64_t>>(node), version, temp_lock);
+    // todo: optimize using write behaviors and caching
+    pool->template Write<uint64_t>(static_cast<rdma_ptr<uint64_t>>(unmark_ptr(node)), version, temp_lock);
   }
 
   template <class ptr_t>
   inline CachedObject<ptr_t> reliable_read(rdma_ptr<ptr_t> node){
-    CachedObject<ptr_t> obj = cache->Read<ptr_t>(node);
+    CachedObject<ptr_t> obj = cache->template Read<ptr_t>(node);
     while(!obj->is_valid()){
-      obj = cache->Read<ptr_t>(node);
+      obj = cache->template Read<ptr_t>(node);
     }
     return obj;
   }
@@ -268,14 +272,14 @@ private:
   /// Allocate a middle layer node
   static bnode_ptr allocate_bnode(capability* pool){
     REMUS_ASSERT(56 % sizeof(V) == 0, "V must be a multiple of 2,4,8,14,28,56");
-    bnode_ptr bnode = pool->Allocate<BNode>();
+    bnode_ptr bnode = pool->template Allocate<BNode>();
     *bnode = BNode();
     return bnode;
   }
 
   /// Allocate a leaf node with sentinel values and nullptr for next
   static bleaf_ptr allocate_bleaf(capability* pool){
-    bleaf_ptr bleaf = pool->Allocate<BLeaf>();
+    bleaf_ptr bleaf = pool->template Allocate<BLeaf>();
     *bleaf = BLeaf();
     return bleaf;
   }
@@ -308,7 +312,6 @@ private:
   int search_node(const CachedObject<SRC>& origin, K key) {
     return search_node(origin.get(), key);
   }
-
 
   /// Returns the Key to go to the parent
   template <class OG, class TO>
@@ -385,8 +388,8 @@ private:
     parent.reset_lock();
     node.increment_version(); // increment version before writing
 
-    cache->Write<BRoot>(parent_p.remote_origin(), parent);      
-    cache->Write<BNode>(node_p.remote_origin(), node);
+    cache->template Write<BRoot>(parent_p.remote_origin(), parent);      
+    cache->template Write<BNode>(node_p.remote_origin(), node);
   }
 
   /// Move
@@ -411,8 +414,8 @@ private:
     parent.reset_lock();
     node.increment_version();
 
-    cache->Write<BRoot>(parent_p.remote_origin(), parent);
-    cache->Write<BLeaf>(node_p.remote_origin(), node);
+    cache->template Write<BRoot>(parent_p.remote_origin(), parent);
+    cache->template Write<BLeaf>(node_p.remote_origin(), node);
   }
 
   /// Not at root
@@ -435,8 +438,8 @@ private:
     parent.increment_version(); // increment version before writing
     node.increment_version();
 
-    cache->Write<BNode>(parent_p.remote_origin(), parent);
-    cache->Write<BNode>(node_p.remote_origin(), node);
+    cache->template Write<BNode>(parent_p.remote_origin(), parent);
+    cache->template Write<BNode>(node_p.remote_origin(), node);
   }
 
   /// At leaf. Try to split the leaf into two and move a key to the parent
@@ -462,7 +465,8 @@ private:
     parent.increment_version();
     node.increment_version();
 
-    cache->Write<BNode>(parent_p.remote_origin(), parent);
+    // todo: prealloc?
+    cache->template Write<BNode>(parent_p.remote_origin(), parent);
     // leave the leaf unmodified and locked for further use
     // cache->Write<BLeaf>(node_p.remote_origin(), node); ! don't uncomment !
     return node;
@@ -475,9 +479,13 @@ private:
     return next_level;
   }
 
+  void breakpoint(){}
+
+  // todo: doesn't work in release mode!!!!
+  // compiling with optimizations turned on breaks correctness
   CachedObject<BLeaf> traverse(capability* pool, K key, bool modifiable, function<void(BLeaf*, int)> effect){
     // read root first
-    CachedObject<BRoot> curr_root = cache->Read<BRoot>(root);
+    CachedObject<BRoot> curr_root = cache->template Read<BRoot>(root);
     int height = curr_root->height;
     bnode_ptr next_level = curr_root->start;
     REMUS_ASSERT(next_level != nullptr, "Accessing SENTINEL's ptr");
@@ -501,7 +509,7 @@ private:
         BLeaf leaf_updated = *next_leaf;
         effect(&leaf_updated, search_node<BLeaf>(&leaf_updated, key));
         leaf_updated.increment_version();
-        cache->Write<BLeaf>(next_leaf.remote_origin(), leaf_updated);
+        cache->template Write<BLeaf>(next_leaf.remote_origin(), leaf_updated);
       }
 
       // Made it to the leaf
@@ -519,7 +527,7 @@ private:
         return traverse(pool, key, modifiable, effect);
       }
       split_node(pool, curr_root, curr);
-      return traverse(pool, key, modifiable, effect); // todo: if we split, there should be no need to re-read
+      return traverse(pool, key, modifiable, effect);
     } 
 
     int bucket = search_node<BNode>(curr, key);
@@ -562,6 +570,12 @@ private:
       if ((bucket == -1 || leaf->key_at(bucket) == SENTINEL) && next_leaf != nullptr) continue;
       if (modifiable && leaf->key_at(SIZE - 1) != SENTINEL){
         // should split
+        bool is_valid_parent = false; // test to make sure parent is still correct
+        for(int i = 0; i < SIZE + 1; i++){
+          if (curr->ptr_at(i).raw() == leaf.remote_origin().raw()) is_valid_parent = true;
+        }
+        if (!is_valid_parent) return traverse(pool, key, modifiable, effect);
+        
         if (try_acquire<BNode>(pool, curr.remote_origin(), curr->version())){
           if (try_acquire<BLeaf>(pool, leaf.remote_origin(), leaf->version())){
             BLeaf leaf_updated = split_node(pool, curr, leaf);
@@ -569,7 +583,7 @@ private:
             bucket = search_node<BLeaf>(&leaf_updated, key);
             if (bucket == -1 || leaf_updated.key_at(bucket) == SENTINEL) {
               // key goes into next
-              cache->Write<BLeaf>(leaf.remote_origin(), leaf_updated); // write and unlock the prev
+              cache->template Write<BLeaf>(leaf.remote_origin(), leaf_updated); // write and unlock the prev
               effect(next_leaf.get(), search_node<BLeaf>(next_leaf.get(), key)); // modify the next
               atomic_thread_fence(memory_order::seq_cst);
               next_leaf->unlock();
@@ -578,7 +592,7 @@ private:
               // key goes into current, unlock next
               next_leaf->unlock();
               effect(&leaf_updated, bucket);
-              cache->Write<BLeaf>(leaf.remote_origin(), leaf_updated);
+              cache->template Write<BLeaf>(leaf.remote_origin(), leaf_updated);
               return leaf;
             }
           } else {
@@ -586,6 +600,10 @@ private:
             release<BNode>(pool, curr.remote_origin(), curr->version());
             next_leaf = leaf.remote_origin(); // reset next_leaf to be the current leaf to cause a retry
           }
+        } else {
+          // cannot acquire parent (it's changed), retry by retraversing?
+          // todo: can I recover by rereading the parent?
+          return traverse(pool, key, modifiable, effect);
         }
       } else if (modifiable){
         // no split but still modifiable
@@ -594,7 +612,7 @@ private:
           BLeaf leaf_updated = *leaf;
           effect(&leaf_updated, search_node<BLeaf>(&leaf_updated, key));
           leaf_updated.increment_version();
-          cache->Write<BLeaf>(leaf.remote_origin(), leaf_updated);
+          cache->template Write<BLeaf>(leaf.remote_origin(), leaf_updated);
           return leaf;
         } else {
           next_leaf = leaf.remote_origin(); // reset next_leaf to be the current leaf to cause a retry
@@ -612,19 +630,19 @@ public:
     REMUS_INFO("Sentinel = {}", SENTINEL);
     REMUS_INFO("Struct Memory (BNode): {} % 64 = {}", sizeof(BNode), sizeof(BNode) % 64);
     REMUS_INFO("Struct Memory (BLeaf): {} % 64 = {}", sizeof(BLeaf), sizeof(BLeaf) % 64);
-    temp_lock = pool->Allocate<uint64_t>(8); // todo: undo 8
+    temp_lock = pool->template Allocate<uint64_t>(8); // todo: undo 8
   };
 
   /// Free all the resources associated with the IHT
   void destroy(capability* pool) {
-    pool->Deallocate<uint64_t>(temp_lock, 8);
+    pool->template Deallocate<uint64_t>(temp_lock, 8);
   }
 
   /// @brief Create a fresh iht
   /// @param pool the capability to init the IHT with
   /// @return the iht root pointer
   rdma_ptr<anon_ptr> InitAsFirst(capability* pool){
-    rdma_ptr<BRoot> broot = pool->Allocate<BRoot>();
+    rdma_ptr<BRoot> broot = pool->template Allocate<BRoot>();
     broot->height = 0; // set height to 1
     broot->lock = 0; // initialize lock
     this->root = broot;
@@ -684,16 +702,16 @@ public:
   std::optional<V> remove(capability* pool, K key) {
     optional<V> prev_value = nullopt;
     traverse(pool, key, true, function([&](BLeaf* new_leaf, int bucket){
-      if (new_leaf->keys[bucket] == key) {
-        prev_value = optional(new_leaf->values[bucket]);
+      if (new_leaf->key_at(bucket) == key) {
+        prev_value = optional(new_leaf->value_at(bucket));
         // shift down to overwrite the key
         for(int i = bucket + 1; i < SIZE; i++){
           new_leaf->set_key(i - 1, new_leaf->key_at(i));
           new_leaf->set_value(i - 1, new_leaf->value_at(i));
         }
       }
-    }));    
-    return nullopt;
+    }));
+    return prev_value;
   }
 
   /// @brief Populate only works when we have numerical keys. Will add data
@@ -779,7 +797,7 @@ public:
         if (curr->key_at(i) != SENTINEL) count++;
       }
       if (curr->get_next() == nullptr) break;
-      curr = cache->Read<BLeaf>(curr->get_next());
+      curr = cache->template Read<BLeaf>(curr->get_next());
     }
     return count;
   }
