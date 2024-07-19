@@ -169,3 +169,8 @@ if (this->thread_ids.find(std::this_thread::get_id()) == this->thread_ids.end())
 uint64_t index_as_id = this->thread_ids.at(std::this_thread::get_id());
 
 Also made the rdma_capability_thread edit
+
++ In memory_pool.h
+Line 117, memset is a bug, should be bytes
+changed comparison from >= to p->first == bytes
+also the deallocation has (bytes, ptr);
