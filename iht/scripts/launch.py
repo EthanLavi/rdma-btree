@@ -25,7 +25,6 @@ parser.add_argument('-e', '--experiment_name', type=str, required=True, help="Us
 parser.add_argument('--nodefile', type=str, default="../../scripts/cloudlab.csv", help='Path to csv with the node names')
 parser.add_argument('--dry_run', action='store_true', help='Print the commands instead of running them')
 parser.add_argument('--rerun', action='store_true', help='Dont remove the binary to reuse the old one')
-parser.add_argument('--exp_result', type=str, default='iht_result.csv', help='File to retrieve experiment result')
 parser.add_argument('-v', '--verbose', action='store_true', help="If to be verbose in output")
 parser.add_argument('--devmode', action='store_true', help="If to save the results to a separate dev folder instead of results")
 
@@ -49,7 +48,12 @@ parser.add_argument('--thread_count', type=int, default=1, help="The number of t
 parser.add_argument('--node_count', type=int, default=1, help="The number of nodes to use in the experiment. Will use node0-nodeN")
 parser.add_argument('--qp_per_conn', type=int, default=30, help="The number of queue pairs to use in the experiment MAX")
 parser.add_argument('--cache_depth', type=int, default=0, help="The depth of which to cache layers in the IHT")
-
+parser.add_argument('--structure', type=str, default="iht", help="The data structure")
+exp_result = {
+    "iht": "iht_result.csv", 
+    "btree": "btree_result.csv", 
+    "skiplist": "skiplist_result.csv"
+}
 ARGS = parser.parse_args()
 
 # Get parent folder name
@@ -74,13 +78,13 @@ def process_exp_flags(node_id):
             # Load the json into the proto
             json_data = f.read()
             mapper = json.loads(json_data)
-            one_to_ones = ["runtime", "op_count", "contains", "insert", "remove", "key_lb", "key_ub", "region_size", "thread_count", "node_count", "qp_per_conn", "cache_depth"]
+            one_to_ones = ["runtime", "op_count", "contains", "insert", "remove", "key_lb", "key_ub", "region_size", "thread_count", "node_count", "qp_per_conn", "cache_depth", "structure"]
             for param in one_to_ones:
                 params += f" --{param} " + str(mapper[param]).lower()
             if mapper['unlimited_stream']:
                 params += f" --unlimited_stream "
     else:
-        one_to_ones = ["runtime", "op_count", "region_size", "thread_count", "node_count", "qp_per_conn", "cache_depth"]
+        one_to_ones = ["runtime", "op_count", "region_size", "thread_count", "node_count", "qp_per_conn", "cache_depth", "structure"]
         for param in one_to_ones:
             params += f" --{param} " + str(eval(f"ARGS.{param}")).lower()
         if ARGS.unlimited_stream:
@@ -130,6 +134,9 @@ def main():
     # Simple input validation
     if not is_valid(ARGS.experiment_name):
         print("Invalid Experiment Name")
+        exit(1)
+    if ARGS.structure not in exp_result:
+        print("Invalid data structure")
         exit(1)
     print("Starting Experiment")
     # Create results directory
@@ -184,11 +191,11 @@ def main():
             # Tuple: (Creating Command | Output File Name)
             commands.append((' '.join([ssh_login, quote(payload)]), nodename))
             if ARGS.runtype == "bench" or ARGS.runtype == "twosided" or ARGS.runtype == "cached":
-                filepath = os.path.join(f"/users/{ARGS.ssh_user}", bin_dir, ARGS.exp_result)
+                filepath = os.path.join(f"/users/{ARGS.ssh_user}", bin_dir, exp_result[ARGS.structure])
                 folder = "results"
                 if ARGS.devmode:
                     folder = "dev"
-                local_dir = os.path.join(f"./{folder}", ARGS.experiment_name + "-stats", nodename + "-" + ARGS.exp_result)
+                local_dir = os.path.join(f"./{folder}", ARGS.experiment_name + "-stats", nodename + "-" + exp_result[ARGS.structure])
                 copy = f"scp {ssh_login[4:]}:{filepath} {local_dir}"
                 commands_copy.append((copy, nodename))
                 continue # do for all nodes

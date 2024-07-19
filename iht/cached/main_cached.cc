@@ -9,6 +9,8 @@
 
 #include "../experiment.h"
 #include "iht_bench.h"
+#include "btree_bench.h"
+#include "rdmask_bench.h"
 
 #include <dcache/cache_store.h>
 
@@ -28,7 +30,8 @@ auto ARGS = {
     I64_ARG("--remove", "Percentage of operations are removes, (contains + insert + remove = 100)"),
     I64_ARG("--key_lb", "The lower limit of the key range for operations"),
     I64_ARG("--key_ub", "The upper limit of the key range for operations"),
-    I64_ARG_OPT("--cache_depth", "The depth of the cache for the IHT", 0),
+    I64_ARG_OPT("--cache_depth", "The depth of the cache for the data structure", 0),
+    STR_ARG("--structure", "The type of data structure to benchmark"), // rdmask, btree, iht
 };
 
 #define PATH_MAX 4096
@@ -59,7 +62,7 @@ int main(int argc, char **argv) {
 
     // Extract the args to variables
     BenchmarkParams params = BenchmarkParams(args);
-    REMUS_INFO("Running IHT with cache depth {}", params.cache_depth);
+    REMUS_INFO("Running {} with cache depth {}", params.structure, params.cache_depth);
 
     // Check node count
     if (params.node_count <= 0 || params.thread_count <= 0){
@@ -99,7 +102,15 @@ int main(int argc, char **argv) {
     auto pool = capability->RegisterThread();
     RemoteCache* cache = new RemoteCache(pool, 1000);
 
-    iht_run(params, capability, cache, host, self);
+    if (params.structure == "iht"){
+        iht_run(params, capability, cache, host, self);
+    } else if (params.structure == "btree"){
+        btree_run(params, capability, cache, host, self);
+    } else if (params.structure == "skiplist"){
+        REMUS_ERROR("Unimplemented skiplist call");
+    } else {
+        REMUS_ERROR("Cannot identify structure");
+    }
     
     REMUS_INFO("[EXPERIMENT] -- End of execution; -- ");
     // todo: deleting cache/pools needs to work

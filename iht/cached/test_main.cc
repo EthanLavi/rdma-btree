@@ -13,7 +13,7 @@ int main(int argc, char* argv[]){
     Peer peer = Peer();
     BenchmarkParams params = BenchmarkParams();
     if (structure == "btree" || structure == "b")
-        btree_run(params, nullptr, nullptr, peer, peer);
+        btree_run_local(params, nullptr, nullptr, peer, peer);
     else if (structure == "rdmask" || structure == "sk")
         rdmask_run(params, nullptr, nullptr, peer, peer);
     else

@@ -19,8 +19,6 @@
 
 using namespace remus::rdma;
 
-typedef CountingPool capability;
-
 /// Configuration information
 template <class K, int MAX_HEIGHT>
 struct alignas(64) node {
@@ -83,6 +81,7 @@ private:
 
     typedef node<K, MAX_HEIGHT> Node;
     typedef rdma_ptr<Node> nodeptr;
+    typedef CountingPool capability;
 
     template <typename T> inline bool is_local(rdma_ptr<T> ptr) {
         return ptr.id() == self_.id;
@@ -98,12 +97,12 @@ private:
 
     inline rdma_ptr<uint64_t> get_value_ptr(nodeptr node) {
         Node* tmp = (Node*) 0x0;
-        return rdma_ptr<uint64_t>(node.id(), node.address() + (uint64_t) &tmp->value);
+        return rdma_ptr<uint64_t>(unmark_ptr(node).id(), unmark_ptr(node).address() + (uint64_t) &tmp->value);
     }
 
     inline rdma_ptr<uint64_t> get_level_ptr(nodeptr node, int level) {          
         Node* tmp = (Node*) 0x0;
-        return rdma_ptr<uint64_t>(node.id(), node.address() + (uint64_t) &tmp->next[level]);
+        return rdma_ptr<uint64_t>(unmark_ptr(node).id(), unmark_ptr(node).address() + (uint64_t) &tmp->next[level]);
     }
 
     /// Calculate the height of a node by how many levels can reach the current

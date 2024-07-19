@@ -15,13 +15,13 @@ namespace CacheDepth {
 /// @brief a type used for templating remote pointers as anonymous (for exchanging over the network where the types are "lost")
 struct anon_ptr {};
 
-/// @brief  IHT_Op is used by the Client Adaptor to pass in operations to Apply,
-///         by forming a stream of IHT_Ops.
-template <typename K, typename V> struct IHT_Op {
+/// @brief  Map_Op is used by the Client Adaptor to pass in operations to Apply,
+///         by forming a stream of Map_Ops.
+template <typename K, typename V> struct Map_Op {
   int op_type;
   K key;
   V value;
-  IHT_Op(int op_type_, K key_, V value_)
+  Map_Op(int op_type_, K key_, V value_)
       : op_type(op_type_), key(key_), value(value_){};
 };
 

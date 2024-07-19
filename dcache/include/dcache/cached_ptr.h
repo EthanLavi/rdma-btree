@@ -9,12 +9,11 @@
 using namespace remus::rdma;
 using namespace std;
 
-typedef atomic<int> ref_t;
-
 /// Cached object is given responsibility for decrementing the reference when it goes out of scope
 /// It can also only be moved so it will only ever decrease the value
 template <typename T>
 class CachedObject {
+    typedef atomic<int> ref_t;
 private:
     ref_t* ref_count;
     rdma_ptr<T> parent;

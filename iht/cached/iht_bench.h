@@ -1,4 +1,5 @@
 #include <barrier>
+#include <cstdint>
 #include <protos/workloaddriver.pb.h>
 #include <remus/logging/logging.h>
 #include <remus/util/cli.h>
@@ -7,6 +8,7 @@
 #include <remus/rdma/rdma.h>
 
 // #include "map_cache.h"
+#include "bench_helper.h"
 #include "ds/iht_ds_cached.h"
 
 #include "../common.h"
@@ -17,9 +19,8 @@
 #include <dcache/cache_store.h>
 
 using namespace remus::util;
+using namespace remus::rdma;
 
-#define PORT_NUM_TCP 19000
-// typedef RDMALinearProbingMap<int, int, MAXKEY> KVStore;
 typedef RdmaIHT<int, int, CNF_ELIST_SIZE, CNF_PLIST_SIZE> KVStore;
 
 inline void iht_run(BenchmarkParams& params, rdma_capability* capability, RemoteCache* cache, Peer& host, Peer& self){
@@ -30,19 +31,10 @@ inline void iht_run(BenchmarkParams& params, rdma_capability* capability, Remote
         threads.emplace_back(std::thread([&](){
             auto pool = capability->RegisterThread();
             // Initialize X connections
-            tcp::SocketManager* socket_handle = new tcp::SocketManager(PORT_NUM_TCP);
-            for(int i = 0; i < params.thread_count * params.node_count; i++){
-                // TODO: Can we have a per-node connection?
-                // I haven't gotten around to coming up with a clean way to reduce the number of sockets connected to the server
-                socket_handle->accept_conn();
-            }
+            tcp::SocketManager* socket_handle = init_handle(params);
 
             // Collect and redistribute the CacheStore pointers
-            tcp::message root_ptrs[params.node_count * params.thread_count];
-            socket_handle->recv_from_all(root_ptrs);
-            for(int i = 0; i < params.node_count * params.thread_count; i++){
-                socket_handle->send_to_all(&root_ptrs[i]);
-            }
+            collect_distribute(socket_handle, params);
 
             // Create a root ptr to the IHT
             Peer p = Peer();
@@ -59,11 +51,7 @@ inline void iht_run(BenchmarkParams& params, rdma_capability* capability, Remote
             ExperimentManager::ServerStopBarrier(socket_handle, params.runtime); // after operations
 
             // Collect and redistribute the size deltas
-            tcp::message deltas[params.node_count * params.thread_count];
-            socket_handle->recv_from_all(deltas);
-            for(int i = 0; i < params.node_count * params.thread_count; i++){
-                socket_handle->send_to_all(&deltas[i]);
-            }
+            collect_distribute(socket_handle, params);
 
             // Wait until clients are done with correctness exchange (they all run count afterwards)
             ExperimentManager::ServerStopBarrier(socket_handle, 0);
@@ -74,9 +62,8 @@ inline void iht_run(BenchmarkParams& params, rdma_capability* capability, Remote
 
     // Initialize T endpoints, one for each thread
     tcp::EndpointManager* endpoint_managers[params.thread_count];
-    for(uint16_t i = 0; i < params.thread_count; i++){
-        endpoint_managers[i] = new tcp::EndpointManager(PORT_NUM_TCP, host.address.c_str());
-    }
+    init_endpoints(endpoint_managers, params, host);
+
     // sleep for a short while to ensure the receiving end (SocketManager) is up and running
     // If the endpoint cant connect, it will just wait and retry later
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -93,13 +80,10 @@ inline void iht_run(BenchmarkParams& params, rdma_capability* capability, Remote
             // initialize thread's thread_local pool
             RemoteCache::pool = pool; 
             // Exchange the root pointer of the other cache stores via TCP module
-            tcp::message data(cache->root());
             vector<uint64_t> peer_roots;
-            endpoint->send_server(&data);
-            for(int i = 0; i < params.node_count * params.thread_count; i++){
-                endpoint->recv_server(&data);
-                peer_roots.push_back(data.get_first());
-            }
+            map_reduce(endpoint, params, cache->root(), std::function<void(uint64_t)>([&](uint64_t data){
+                peer_roots.push_back(data);
+            }));
             cache->init(peer_roots);
 
             std::shared_ptr<KVStore> iht = std::make_shared<KVStore>(self, params.cache_depth, cache, pool);
@@ -137,7 +121,7 @@ inline void iht_run(BenchmarkParams& params, rdma_capability* capability, Remote
                 }
             );
             // todo: for LinearProbingMap only REMUS_ASSERT(params.key_lb >= 2 && params.key_ub - params.key_lb <= 1000, "Keyspace is valid?");
-            using client_t = Client<IHT_Op<int, int>>;
+            using client_t = Client<Map_Op<int, int>>;
             std::unique_ptr<client_t> client = client_t::Create(host, endpoint, params, &client_sync, iht_as_map);
             double populate_frac = 0.5 / (double) (params.node_count * params.thread_count);
 
@@ -147,12 +131,10 @@ inline void iht_run(BenchmarkParams& params, rdma_capability* capability, Remote
 
             // Check expected size
             int all_delta = 0;
-            tcp::message d(delta);
-            endpoint->send_server(&d);
-            for(int i = 0; i < params.node_count * params.thread_count; i++){
-                endpoint->recv_server(&d);
-                all_delta += d.get_first();
-            }
+            map_reduce(endpoint, params, delta, std::function<void(uint64_t)>([&](uint64_t d){
+                all_delta += d;
+            }));
+
             // add count after syncing via endpoint exchange
             int final_size = iht->count(pool);
             REMUS_DEBUG("Size (after populate) [{}]", populate_amount);
@@ -174,19 +156,7 @@ inline void iht_run(BenchmarkParams& params, rdma_capability* capability, Remote
         auto t = it;
         t->join();
     }
-    for(uint16_t i = 0; i < params.thread_count; i++){
-        delete endpoint_managers[i];
-    }
-    Result result[params.thread_count];
-    for (int i = 0; i < params.thread_count; i++) {
-        result[i] = Result(params, workload_results[i]);
-        REMUS_INFO("Protobuf Result {}\n{}", i, result[i].result_as_debug_string());
-    }
+    delete_endpoints(endpoint_managers, params);
 
-    std::ofstream filestream("iht_result.csv");
-    filestream << Result::result_as_string_header();
-    for (int i = 0; i < params.thread_count; i++) {
-        filestream << result[i].result_as_string();
-    }
-    filestream.close();
+    save_result("iht_result.csv", workload_results, params);
 }

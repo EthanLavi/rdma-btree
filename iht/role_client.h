@@ -36,7 +36,7 @@ inline bool test_output(bool show_passing, optional<int> actual, optional<int> e
 }
 
 /// Capture the API for a map
-/// This is to standardize the map api to allow for different ihts (two sided and one sided) to be passed
+/// This is to standardize the map api to allow for different maps to be passed
 class MapAPI {
   public:
     function<optional<int>(int, int)> insert;
@@ -136,10 +136,19 @@ public:
     // timed stream)
     unique_ptr<remus::Stream<Operation>> workload_stream;
     if (client->params_.unlimited_stream) {
-      workload_stream = make_unique<remus::TimedStream<Operation>>(generator, client->params_.runtime);
-    } else {
+      std::vector<Operation> stream_content;
+      for(int i = 0; i < client->params_.runtime * 1000000; i++){
+        stream_content.push_back(generator());
+      }
       // Deliver a workload
-      workload_stream = make_unique<remus::FixedLengthStream<Operation>>(generator, client->params_.op_count);
+      workload_stream = make_unique<remus::PrefilledStream<Operation>>(stream_content, stream_content.size());
+    } else {
+      std::vector<Operation> stream_content;
+      for(int i = 0; i < client->params_.op_count; i++){
+        stream_content.push_back(generator());
+      }
+      // Deliver a workload
+      workload_stream = make_unique<remus::PrefilledStream<Operation>>(stream_content, stream_content.size());
     }
 
     // Create and start the workload driver (also starts client and lets it
@@ -237,7 +246,6 @@ private:
   /// @param endpoint a EndpointManager instance that can be owned by the client.
   /// @param params the experiment parameters
   /// @param barrier a barrier to synchonize local clients
-  /// @param iht a pointer to an IHT
   /// @return a unique ptr
   Client(const Peer &host, tcp::EndpointManager* ep, BenchmarkParams &params, barrier<> *barr, MapAPI* map)
     : host_(host), endpoint_(ep), params_(params), barrier_(barr), map_(map){
@@ -255,7 +263,7 @@ private:
   const BenchmarkParams params_;
   /// @brief a barrier for syncing amount clients locally
   barrier<> *barrier_;
-  /// @brief an IHT instance to use
+  /// @brief a map instance to use
   MapAPI* map_;
 
   /// @brief The number of operations to do before debug-printing the number of completed operations

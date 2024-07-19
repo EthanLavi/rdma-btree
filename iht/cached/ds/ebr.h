@@ -12,8 +12,6 @@
 using namespace remus::rdma;
 using namespace std;
 
-typedef CountingPool capability;
-
 template <class T>
 struct LimboLists {
     atomic<queue<rdma_ptr<T>>*> free_lists[3];
@@ -23,6 +21,8 @@ struct LimboLists {
 /// An object pool that can reallocate objects as well
 template <class T, int OPS_PER_EPOCH>
 class EBRObjectPool {
+    typedef CountingPool capability;
+
     /// version that the node can wait on. Once it sees it increments, in can rotate its free lists and increment the next node
     struct alignas(64) ebr_ref {
         long version;

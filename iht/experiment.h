@@ -51,7 +51,10 @@ public:
     int key_lb;
     /// The upper limit of the key range for operations
     int key_ub;
-    /// The cache depth of the IHT
+    /// The structure type
+    std::string structure;
+
+    /// The cache depth of the data structure
     CacheDepth::CacheDepth cache_depth;
 
     BenchmarkParams() = default;
@@ -70,6 +73,7 @@ public:
         remove = args.iget("--remove");
         key_lb = args.iget("--key_lb");
         key_ub = args.iget("--key_ub");
+        structure = args.sget("--structure");
         int depth = args.iget("--cache_depth");
         switch (depth) {
             case CacheDepth::None:
@@ -101,12 +105,13 @@ public:
     Result(BenchmarkParams params_, WorkloadDriverResult result_) : params(params_), result(std::move(result_)) {}
 
     static const std::string result_as_string_header() {
-        return "node_id,runtime,unlimited_stream,op_count,region_size,thread_count,node_count,qp_per_conn,contains,insert,remove,lb,ub,cache_depth,count,runtime_ns,units,mean,stdev,min,p50,p90,p95,p99,p999,max,units_2,mean_2,stdev_2,min_2,p50_2,p90_2,p95_2,p99_2,p999_2,max_2\n";
+        return "node_id,structure,runtime,unlimited_stream,op_count,region_size,thread_count,node_count,qp_per_conn,contains,insert,remove,lb,ub,cache_depth,count,runtime_ns,units,mean,stdev,min,p50,p90,p95,p99,p999,max,units_2,mean_2,stdev_2,min_2,p50_2,p90_2,p95_2,p99_2,p999_2,max_2,\n";
     }
 
     std::string result_as_string(){
         std::string builder = "";
         builder += std::to_string(params.node_id) + ",";
+        builder += params.structure + ",";
         builder += std::to_string(params.runtime) + ",";
         builder += std::to_string(params.unlimited_stream) + ",";
         builder += std::to_string(params.op_count) + ",";
@@ -149,6 +154,7 @@ public:
         if (REMUS_LOG_LEVEL != INFO){
             std::string builder = "Experimental Result {\n";
             builder += "\tParams {\n";
+            builder += "\t\tstructure: " + params.structure + "\n";
             builder += "\t\tnode_id: " + std::to_string(params.node_id) + "\n";
             builder += "\t\truntime: " + std::to_string(params.runtime) + "\n";
             builder += "\t\tunlimited_stream: " + std::to_string(params.unlimited_stream) + "\n";

@@ -393,6 +393,7 @@ public:
       // todo: remove these lines if they can be removed (we want our cached object to have read-only semantics)
       // curr->buckets[bucket].base = static_cast<remote_baseptr>(p);
       // curr->buckets[bucket].lock = P_UNLOCKED;
+      // technically these writes can be combined (since they are adjacent), but rehashing is rare enough that it won't realistically affect latency
       change_bucket_pointer(pool, parent_ptr, bucket, static_cast<remote_baseptr>(p));
       unlock(pool, get_lock(parent_ptr, bucket), P_UNLOCKED);
       // Prevent invalidate occuring before unlock
