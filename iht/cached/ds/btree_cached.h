@@ -3,7 +3,6 @@
 #include <atomic>
 #include <climits>
 #include <cstdint>
-#include <cstdlib>
 #include <ostream>
 #include <random>
 #include <remus/logging/logging.h>
@@ -23,6 +22,8 @@ using namespace remus::rdma;
 
 typedef int32_t K;
 static const K SENTINEL = INT_MAX;
+
+static const bool ADDR = false;
 
 template <class V, int DEGREE, class capability> class RdmaBPTree {
   /// SIZE is DEGREE * 2
@@ -468,7 +469,6 @@ private:
     // todo: prealloc?
     cache->template Write<BNode>(parent_p.remote_origin(), parent);
     // leave the leaf unmodified and locked for further use
-    // cache->Write<BLeaf>(node_p.remote_origin(), node); ! don't uncomment !
     return node;
   }
 
@@ -479,11 +479,10 @@ private:
     return next_level;
   }
 
-  void breakpoint(){}
-
-  // todo: doesn't work in release mode!!!!
   // compiling with optimizations turned on breaks correctness
-  CachedObject<BLeaf> traverse(capability* pool, K key, bool modifiable, function<void(BLeaf*, int)> effect){
+  CachedObject<BLeaf> traverse(capability* pool, K key, bool modifiable, function<void(BLeaf*, int)> effect, int it_counter = 0){
+    REMUS_ASSERT(it_counter < 500, "Infinite recursion detected");
+  
     // read root first
     CachedObject<BRoot> curr_root = cache->template Read<BRoot>(root);
     int height = curr_root->height;
@@ -492,24 +491,25 @@ private:
 
     if (height == 0){
       CachedObject<BLeaf> next_leaf = reliable_read<BLeaf>(static_cast<bleaf_ptr>(next_level));
-      if (modifiable && next_leaf->key_at(SIZE - 1) != SENTINEL){
+      if (modifiable){
         // failed to get locks, retraverse
         if (!try_acquire<BRoot>(pool, curr_root.remote_origin(), 0)) return traverse(pool, key, modifiable, effect);
         if (!try_acquire<BLeaf>(pool, next_leaf.remote_origin(), next_leaf->version())) {
           release<BRoot>(pool, curr_root.remote_origin(), 0);
           return traverse(pool, key, modifiable, effect);
         }
-        split_node(pool, curr_root, next_leaf);
-        // Just restart
-        return traverse(pool, key, modifiable, effect);
-      }
-
-      // If modifiable, I need to modify the leaf before writing back
-      if (modifiable){
-        BLeaf leaf_updated = *next_leaf;
-        effect(&leaf_updated, search_node<BLeaf>(&leaf_updated, key));
-        leaf_updated.increment_version();
-        cache->template Write<BLeaf>(next_leaf.remote_origin(), leaf_updated);
+        if (next_leaf->key_at(SIZE - 1) != SENTINEL){
+          split_node(pool, curr_root, next_leaf);
+          // Just restart
+          return traverse(pool, key, modifiable, effect);
+        } else {
+          // Acquire both locks if room to spare in leaf, then write back
+          BLeaf leaf_updated = *next_leaf;
+          effect(&leaf_updated, search_node<BLeaf>(&leaf_updated, key));
+          leaf_updated.increment_version();
+          release<BRoot>(pool, curr_root.remote_origin(), 0);
+          cache->template Write<BLeaf>(next_leaf.remote_origin(), leaf_updated);
+        }
       }
 
       // Made it to the leaf
@@ -528,7 +528,7 @@ private:
       }
       split_node(pool, curr_root, curr);
       return traverse(pool, key, modifiable, effect);
-    } 
+    }
 
     int bucket = search_node<BNode>(curr, key);
     while(height != 1){
@@ -562,22 +562,30 @@ private:
 
     // Read it as a BLeaf
     bleaf_ptr next_leaf = static_cast<bleaf_ptr>(next_level);
-    CachedObject<BLeaf> leaf;
-    while (true){ // traverse to the right until we find the correct node
-      leaf = reliable_read<BLeaf>(next_leaf);
-      bucket = search_node<BLeaf>(leaf, key);
+    CachedObject<BLeaf> leaf = reliable_read<BLeaf>(next_leaf);
+    bucket = search_node<BLeaf>(leaf, key);
+    if (leaf->key_at(bucket) == SENTINEL){
+      // our key is greater than all the keys in the leaf, check if we need to retry
       next_leaf = leaf->get_next();
-      if ((bucket == -1 || leaf->key_at(bucket) == SENTINEL) && next_leaf != nullptr) continue;
-      if (modifiable && leaf->key_at(SIZE - 1) != SENTINEL){
-        // should split
-        bool is_valid_parent = false; // test to make sure parent is still correct
-        for(int i = 0; i < SIZE + 1; i++){
-          if (curr->ptr_at(i).raw() == leaf.remote_origin().raw()) is_valid_parent = true;
-        }
-        if (!is_valid_parent) return traverse(pool, key, modifiable, effect);
-        
-        if (try_acquire<BNode>(pool, curr.remote_origin(), curr->version())){
-          if (try_acquire<BLeaf>(pool, leaf.remote_origin(), leaf->version())){
+      // find the next key, if it's greater or equal, we need to retry
+      // todo: if the next node is empty, remove it?
+      while(true){
+        if (next_leaf == nullptr) break;
+        CachedObject<BLeaf> leaf_after = reliable_read<BLeaf>(next_leaf);
+        if (leaf_after->key_at(0) != SENTINEL && key >= leaf_after->key_at(0)) return traverse(pool, key, modifiable, effect, it_counter + 1);
+        else if (leaf_after->key_at(0) != SENTINEL && key < leaf_after->key_at(0)) break;
+        else next_leaf = leaf_after->get_next();
+      }
+    }
+    // At this point, we are sure of the leaf node
+
+    // Handle updates to the leaf
+    if (modifiable){
+      // acquire parent and current leaf
+      if (try_acquire<BNode>(pool, curr.remote_origin(), curr->version())){
+        if (try_acquire<BLeaf>(pool, leaf.remote_origin(), leaf->version())){
+          if (leaf->key_at(SIZE - 1) != SENTINEL){
+            // should split
             BLeaf leaf_updated = split_node(pool, curr, leaf);
             next_leaf = leaf_updated.get_next(); // next_leaf is local and readonly since we left it locked
             bucket = search_node<BLeaf>(&leaf_updated, key);
@@ -596,40 +604,34 @@ private:
               return leaf;
             }
           } else {
-            // cant acquire leaf
-            release<BNode>(pool, curr.remote_origin(), curr->version());
-            next_leaf = leaf.remote_origin(); // reset next_leaf to be the current leaf to cause a retry
+            // modifiable so lock, update, write back
+            BLeaf leaf_updated = *leaf;
+            effect(&leaf_updated, search_node<BLeaf>(&leaf_updated, key));
+            leaf_updated.increment_version();
+            cache->template Write<BLeaf>(leaf.remote_origin(), leaf_updated);
+            release<BNode>(pool, curr.remote_origin(), curr->version()); // release parent
+            return leaf;
           }
         } else {
-          // cannot acquire parent (it's changed), retry by retraversing?
-          // todo: can I recover by rereading the parent?
-          return traverse(pool, key, modifiable, effect);
+          // release parent and try again
+          release<BNode>(pool, curr.remote_origin(), curr->version());
         }
-      } else if (modifiable){
-        // no split but still modifiable
-        if (try_acquire<BLeaf>(pool, leaf.remote_origin(), leaf->version())){
-          // modifiable so lock, update, write back
-          BLeaf leaf_updated = *leaf;
-          effect(&leaf_updated, search_node<BLeaf>(&leaf_updated, key));
-          leaf_updated.increment_version();
-          cache->template Write<BLeaf>(leaf.remote_origin(), leaf_updated);
-          return leaf;
-        } else {
-          next_leaf = leaf.remote_origin(); // reset next_leaf to be the current leaf to cause a retry
-        }
-      } else {
-        // not modifiable and no split needed
-        return leaf;
-      }
+      } // else nothing was acquired, try again
+    } else {
+      // not modifiable and no split needed
+      return leaf;
     }
+    return traverse(pool, key, modifiable, effect, it_counter + 1); // retry by retraversing
   }
 
 public:
-  RdmaBPTree(Peer& self, CacheDepth::CacheDepth depth, RemoteCacheImpl<capability>* cache, capability* pool) 
+  RdmaBPTree(Peer& self, CacheDepth::CacheDepth depth, RemoteCacheImpl<capability>* cache, capability* pool, int print_info) 
   : self_(std::move(self)), cache_depth_(depth), cache(cache) {
-    REMUS_INFO("Sentinel = {}", SENTINEL);
-    REMUS_INFO("Struct Memory (BNode): {} % 64 = {}", sizeof(BNode), sizeof(BNode) % 64);
-    REMUS_INFO("Struct Memory (BLeaf): {} % 64 = {}", sizeof(BLeaf), sizeof(BLeaf) % 64);
+    if (print_info){
+      REMUS_INFO("Sentinel = {}", SENTINEL);
+      REMUS_INFO("Struct Memory (BNode): {} % 64 = {}", sizeof(BNode), sizeof(BNode) % 64);
+      REMUS_INFO("Struct Memory (BLeaf): {} % 64 = {}", sizeof(BLeaf), sizeof(BLeaf) % 64);
+    }
     temp_lock = pool->template Allocate<uint64_t>(8); // todo: undo 8
   };
 
@@ -647,16 +649,16 @@ public:
     broot->lock = 0; // initialize lock
     this->root = broot;
     this->root->start = static_cast<bnode_ptr>(allocate_bleaf(pool));
-    if (cache_depth_ >= 1)
-        this->root = mark_ptr(this->root);
+    // if (cache_depth_ >= 1)
+    //     this->root = mark_ptr(this->root);
     return static_cast<rdma_ptr<anon_ptr>>(this->root);
   }
 
   /// @brief Initialize an IHT from the pointer of another IHT
   /// @param root_ptr the root pointer of the other iht from InitAsFirst();
   void InitFromPointer(rdma_ptr<anon_ptr> root_ptr){
-      if (cache_depth_ >= 1)
-        root_ptr = mark_ptr(root_ptr);
+      // if (cache_depth_ >= 1)
+      //   root_ptr = mark_ptr(root_ptr);
     this->root = static_cast<rdma_ptr<BRoot>>(root_ptr);
   }
 
@@ -743,7 +745,11 @@ public:
     for(int i = 0; i < indent; i++){
       std::cout << "\t";
     }
-    std::cout << "Leaf<next=" << (leaf.get_next() != nullptr) << "> ";
+
+    if (ADDR)
+      std::cout << "Leaf<next=" << std::hex << leaf.get_next().address() << std::dec << "> ";
+    else
+      std::cout << "Leaf<> ";
     for(int i = 0; i < SIZE; i++){
       if (leaf.key_at(i) == SENTINEL)
         std::cout << "(SENT) ";
@@ -753,7 +759,7 @@ public:
     std::cout << std::endl;
   }
 
-  void debug(int height, bnode_ptr node, int indent){
+  void debug(int height, bnode_ptr node, int indent, int index){
     if (height == 0){
       debug(static_cast<bleaf_ptr>(node), indent + 1);
       return;
@@ -762,27 +768,78 @@ public:
     for(int i = 0; i < indent; i++){
       std::cout << "\t";
     }
-    std::cout << (n.is_valid() ? "valid " : "invalid ") << n.version();
+    std::cout << (n.is_valid() ? "valid " : "invalid ") << "(" << n.version() << ", " << height << ", " << index << ")";
     std::cout << " => ";
-    std::cout << (n.ptr_at(0) != nullptr);
+    if (ADDR)
+      std::cout << std::hex << n.ptr_at(0).address() << std::dec;
     for(int i = 0; i < SIZE; i++){
-      if (n.key_at(i) == SENTINEL)
-        std::cout << " (SENT) " << (n.ptr_at(i+1) != nullptr);
-      else
-        std::cout << " (" << n.key_at(i) << ") " << (n.ptr_at(i+1) != nullptr);
+      if (ADDR){
+        if (n.key_at(i) == SENTINEL)
+          std::cout << " (SENT) " << std::hex << n.ptr_at(i+1).address() << std::dec;
+        else
+          std::cout << " (" << n.key_at(i) << ") " << std::hex << n.ptr_at(i+1).address() << std::dec;
+      } else {
+            if (n.key_at(i) == SENTINEL)
+              std::cout << " (SENT) ";
+            else
+              std::cout << " (" << n.key_at(i) << ") ";
+      }
     }
     std::cout << std::endl;
     for(int i = 0; i <= SIZE; i++){
       if (n.ptr_at(i) != nullptr)
-        debug(height - 1, n.ptr_at(i), indent + 1);
+        debug(height - 1, n.ptr_at(i), indent + 1, i + 1);
     }
+  }
+
+  string is_valid(int height, bnode_ptr node, K lower, K upper){
+    if (height == 0){
+      BLeaf l = *static_cast<bleaf_ptr>(node);
+      for(int i = 0; i < SIZE; i++){
+        if (l.key_at(i) == SENTINEL) continue;
+        if (l.key_at(i) <= lower || l.key_at(i) > upper) return "key are not in bounds, bleaf; " + to_string(l.key_at(i));
+      }
+      for(int i = 1; i < SIZE; i++){
+        if (l.key_at(i) < l.key_at(i - 1)) return "keys are not sorted in bleaf; [i]=" + to_string(l.key_at(i)) + " [i-1]=" + to_string(l.key_at(i - 1));
+        if (l.key_at(i) == l.key_at(i - 1) && l.key_at(i) != SENTINEL) return "duplicate keys in bnode; " + to_string(l.key_at(i));
+      }
+      return "";
+    } else {
+      BNode n = *node;
+      for(int i = 0; i < SIZE; i++){
+        if (n.key_at(i) == SENTINEL) continue;
+        if (n.key_at(i) <= lower || n.key_at(i) >= upper) return "keys are not in bounds, bnode; " + to_string(n.key_at(i));
+      }
+      for(int i = 1; i < SIZE; i++){
+        if (n.key_at(i) < n.key_at(i - 1)) return "keys are not sorted in bnode; [i]=" + to_string(n.key_at(i)) + " [i-1]=" + to_string(n.key_at(i - 1));
+        if (n.key_at(i) == n.key_at(i - 1) && n.key_at(i) != SENTINEL) return "duplicate keys in bnode; " + to_string(n.key_at(i));
+      }
+
+      // Handle children
+      for(int i = 0; i <= SIZE; i++){
+        if (n.ptr_at(i) == nullptr) continue;
+        K low_key = i == 0 ? lower : n.key_at(i - 1);
+        K high_key = i == SIZE ? upper : n.key_at(i);
+        if (high_key == SENTINEL) high_key = upper; // make sure we are using upper
+        string reason = is_valid(height - 1, n.ptr_at(i), low_key, high_key);
+        if (reason != "") return reason;
+      }
+      return "";
+    }
+  }
+
+  string valid(){
+    BRoot r = *root;
+    string reason = is_valid(r.height, r.start, INT_MIN, INT_MAX);
+    if (reason == "") reason = "yes";
+    return reason;
   }
 
   /// Single threaded print
   void debug(){
     BRoot r = *root;
     std::cout << "Root(height=" << r.height << ")" << std::endl;
-    debug(r.height, r.start, 0);
+    debug(r.height, r.start, 0, 0);
     std::cout << std::endl;
   }
 
