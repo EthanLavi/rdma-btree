@@ -1,5 +1,6 @@
 #pragma once
 
+#include <climits>
 #include <ostream>
 #include <random>
 #include <remus/logging/logging.h>
@@ -44,11 +45,13 @@ private:
 public:
     uint64_t value;
     K key;
-    int height;
+    int height; // [0, MAX HEIGHT - 1]
+    uint64_t link_level; // [0, MAX HEIGHT] (a lock for helper threads to raise a node)
     rdma_ptr<node> next[MAX_HEIGHT];
 
     node(K key, uint64_t value) : key(key), value(value) {
         height = get_rand_level();
+        link_level = 1;
         for(int i = 0; i < MAX_HEIGHT; i++){
             next[i] = nullptr;
         }
@@ -99,68 +102,113 @@ private:
         return rdma_ptr<uint64_t>(unmark_ptr(node).id(), unmark_ptr(node).address() + (uint64_t) &tmp->value);
     }
 
+    inline rdma_ptr<uint64_t> get_link_height_ptr(nodeptr node) {
+        Node* tmp = (Node*) 0x0;
+        return rdma_ptr<uint64_t>(unmark_ptr(node).id(), unmark_ptr(node).address() + (uint64_t) &tmp->link_level);
+    }
+
     inline rdma_ptr<uint64_t> get_level_ptr(nodeptr node, int level) {          
         Node* tmp = (Node*) 0x0;
         return rdma_ptr<uint64_t>(unmark_ptr(node).id(), unmark_ptr(node).address() + (uint64_t) &tmp->next[level]);
     }
 
-    /// Calculate the height of a node by how many levels can reach the current
-    /// Returns 0 if completely unlinked
-    int height(CachedObject<Node>& node, rdma_ptr<Node> nexts[MAX_HEIGHT]) const {
-        for(int i = 0; i < MAX_HEIGHT; i++){
-            if (sans(nexts[i]).raw() != sans(node.remote_origin()).raw()) return i;
-        }
-        return MAX_HEIGHT;
-    }
-
-    /// Unlink a node (lower height to 0)
-    /// Return true if we can deallocate the node
-    bool unlink_node(capability* pool, CachedObject<Node>& node, rdma_ptr<Node> prevs[MAX_HEIGHT], rdma_ptr<Node> nexts[MAX_HEIGHT]){
-        int h = height(node, nexts);
-        for(int i = h - 1; i != -1; i--){
-            rdma_ptr<uint64_t> node_ptr = get_level_ptr(node.remote_origin(), i);
-            if (!is_marked_del(node->next[i])){
-                if (pool->template CompareAndSwap<uint64_t>(node_ptr, node->next[i].raw(), marked_del(node->next[i]).raw()) == node->next[i].raw()){
-                    cache->template Invalidate<Node>(node.remote_origin());
+    CachedObject<Node> fill(K key, rdma_ptr<Node> preds[MAX_HEIGHT], rdma_ptr<Node> succs[MAX_HEIGHT], bool found[MAX_HEIGHT]){
+        // first node is a sentinel, it will always be linked in the data structure
+        CachedObject<Node> curr = cache->template Read<Node>(root); // root is never deleted, let's say curr is never a deleted node
+        CachedObject<Node> next_curr;
+        for(int height = MAX_HEIGHT - 1; height != -1; height--){
+            // iterate on this level until we find the last node that <= the key
+            while(true){
+                if (sans(curr->next[height]) == nullptr) {
+                    preds[height] = curr.remote_origin();
+                    succs[height] = nullptr;
+                    found[height] = false;
+                    // if next is the END, descend a level
+                    break;
+                } 
+                next_curr = cache->template Read<Node>(sans(curr->next[height]));
+                if (next_curr->key < key) {
+                    curr = std::move(next_curr);
+                    continue; // move right
+                } else if (next_curr->key == key){
+                    preds[height] = curr.remote_origin();
+                    succs[height] = next_curr->next[height];
+                    found[height] = true;
                 } else {
-                    return false; // failed on the level, retry on the next go around
+                    preds[height] = curr.remote_origin();
+                    succs[height] = next_curr.remote_origin();
+                    found[height] = false;
                 }
-            }
-            rdma_ptr<uint64_t> prev_ptr = get_level_ptr(prevs[i], i);
-            if (pool->template CompareAndSwap<uint64_t>(prev_ptr, node.remote_origin().raw(), sans(node->next[i]).raw()) == node.remote_origin().raw()){
-                // Unlink was successful
-                cache->template Invalidate<Node>(prevs[i]);
-                nexts[i] = sans(node->next[i]); // update next to be accurate
-            } else {
-                // failed on the level, retry on the next go-around
-                return false;
+                // descend a level
+                break;
             }
         }
-        return true;
+        REMUS_ASSERT(next_curr->key == key, "Fill cannot find the key {}", key);
+        return next_curr;
     }
 
-    /// Returns new height
-    /// Raise a node to a random new height
-    void raise_node(capability* pool, CachedObject<Node>& node, rdma_ptr<Node> prevs[MAX_HEIGHT], rdma_ptr<Node> nexts[MAX_HEIGHT]){
-        int curr_height = height(node, nexts);
-        REMUS_ASSERT(curr_height != 0, "somehow made it to an unlinked node")
-        int desired_height = node->height;
-        for(int i = curr_height; i < desired_height; i++){
-            rdma_ptr<uint64_t> node_ptr = get_level_ptr(node.remote_origin(), i);
-            REMUS_ASSERT(nexts[i].raw() != node.remote_origin().raw(), "error with the next pointing to the self {} {}", i, curr_height);
-            uint64_t old_ptr_curr = pool->template CompareAndSwap<uint64_t>(node_ptr, node->next[i].raw(), nexts[i].raw());
-            if (old_ptr_curr == node->next[i].raw()) cache->template Invalidate<Node>(node.remote_origin()); // successful cas, invalidate the node
-            else return; // couldn't set curr, only raised to height i
+    /// Try to physically unlink a node that we know exists and we have the responsibility of unlinking
+    void unlink_node(capability* pool, K key){
+        rdma_ptr<Node> preds[MAX_HEIGHT];
+        rdma_ptr<Node> succs[MAX_HEIGHT];
+        bool found[MAX_HEIGHT];
+        CachedObject<Node> node = fill(key, preds, succs, found);
+        bool had_update = false;
+        for(int height = MAX_HEIGHT - 1; height != -1; height--){
+            if (!found[height]) continue;
+            if (is_marked_del(succs[height])) continue; // if marked, skip
 
-            rdma_ptr<uint64_t> prev_ptr = get_level_ptr(prevs[i], i);
-            REMUS_ASSERT(prevs[i].raw() != node.remote_origin().raw(), "error with the next pointing to the self {} {}", i, curr_height);
-            uint64_t old_ptr_prev = pool->template CompareAndSwap<uint64_t>(prev_ptr, nexts[i].raw(), node.remote_origin().raw());
-            if (old_ptr_prev == nexts[i].raw()) {
-                // insert on this level was successful
-                cache->template Invalidate<Node>(prevs[i]);
-                nexts[i] = node.remote_origin(); // update nexts to the correct value
-            } else return; // couldn't set prev, only raised to height i
+            rdma_ptr<uint64_t> level_ptr = get_level_ptr(node.remote_origin(), height);
+            uint64_t old_ptr = pool->template CompareAndSwap<uint64_t>(level_ptr, succs[height].raw(), marked_del(succs[height]).raw());
+            if (old_ptr != succs[height].raw()){
+                // cas failed, retry; also if we had an update, invalidate
+                if (had_update) cache->Invalidate(succs[height]);
+                return unlink_node(pool, key); // retry
+            }
+            had_update = true;
         }
+        if (had_update) cache->Invalidate(node.remote_origin()); // invalidate the node
+
+        // Physically unlink
+        for(int height = MAX_HEIGHT - 1; height != -1; height--){
+            if (!found[height]) continue;
+            rdma_ptr<uint64_t> level_ptr = get_level_ptr(preds[height], height);
+            uint64_t old_ptr = pool->template CompareAndSwap<uint64_t>(level_ptr, node.remote_origin().raw(), sans(succs[height]).raw());
+            if (old_ptr != node.remote_origin().raw())
+                return unlink_node(pool, key); // retry
+            else
+                cache->Invalidate(preds[height]);
+        }
+    }
+
+    /// Try to raise a node to the level
+    void raise_node(capability* pool, K key, int goal_height){
+        rdma_ptr<Node> preds[MAX_HEIGHT];
+        rdma_ptr<Node> succs[MAX_HEIGHT];
+        bool found[MAX_HEIGHT];
+        CachedObject<Node> node = fill(key, preds, succs, found);
+        bool had_update = false;
+        for(int height = 0; height < goal_height; height++){
+            if (found[height]) continue; // if reachable from a height, continue
+
+            rdma_ptr<uint64_t> level_ptr = get_level_ptr(node.remote_origin(), height);
+            uint64_t old_ptr = pool->template CompareAndSwap<uint64_t>(level_ptr, node->next[height].raw(), succs[height].raw());
+            if (old_ptr != node->next[height].raw()){
+                if (had_update) cache->Invalidate(node.remote_origin()); // invalidate the raising node
+                return raise_node(pool, key, goal_height); // retry b/c cas failed
+            }
+            had_update = true;
+
+            // Update previous node
+            level_ptr = get_level_ptr(preds[height], height);
+            old_ptr = pool->template CompareAndSwap<uint64_t>(level_ptr, sans(succs[height]).raw(), node.remote_origin().raw());
+            if (old_ptr != sans(succs[height]).raw()){
+                if (had_update) cache->Invalidate(node.remote_origin()); // invalidate the raising node
+                return raise_node(pool, key, goal_height); // retry
+            }
+            cache->Invalidate(preds[height]);
+        }
+        if (had_update) cache->Invalidate(node.remote_origin());
     }
 
 public:
@@ -169,50 +217,41 @@ public:
         REMUS_INFO("SENTINEL is MIN? {}", MINKEY);
         tmp_node = pool->template Allocate<Node>();
     }
-
+    
     void helper_thread(std::atomic<bool>* do_cont, capability* pool, EBRObjectPool<Node, 100, capability>* ebr_helper, vector<LimboLists<Node>*> qs){
-        rdma_ptr<Node> prevs[MAX_HEIGHT];
-        rdma_ptr<Node> nexts[MAX_HEIGHT];
         CachedObject<Node> curr;
         int i = 0;
         while(do_cont->load()){ // endlessly traverse and maintain the index
             curr = cache->template Read<Node>(root);
-            // init prevs and nexts
-            for(int i = 0; i < MAX_HEIGHT; i++){
-                prevs[i] = curr.remote_origin(); // root
-                nexts[i] = curr->next[i]; // root->next
-            }
             while(sans(curr->next[0]) != nullptr && do_cont->load()){
                 curr = cache->template Read<Node>(sans(curr->next[0]));
-                int curr_height = height(curr, nexts);
-                if (curr->value == DELETE_SENTINEL){
+                if (curr->value == DELETE_SENTINEL && curr->link_level == curr->height){
                     rdma_ptr<uint64_t> ptr = get_value_ptr(curr.remote_origin());
-                    if (pool->template CompareAndSwap<uint64_t>(ptr, DELETE_SENTINEL, UNLINK_SENTINEL) == DELETE_SENTINEL){
-                        if (unlink_node(pool, curr, prevs, nexts)){
-                            // if unlink was successful, deallocate
-                            LimboLists<Node>* q = qs.at(i);
-                            q->free_lists[2].load()->push(curr.remote_origin());
-                            // cycle the index
-                            i++;
-                            i %= qs.size();
+                    uint64_t last = pool->template CompareAndSwap<uint64_t>(ptr, DELETE_SENTINEL, UNLINK_SENTINEL);
+                    if (last != DELETE_SENTINEL) continue; // something changed, gonna skip this node
+                    cache->Invalidate(curr.remote_origin());
+                    unlink_node(pool, curr->key); // physically unlink (has guarantee of unlink)
+                    
+                    // deallocate unlinked node
+                    LimboLists<Node>* q = qs.at(i);
+                    q->free_lists[2].load()->push(curr.remote_origin());
+                    
+                    // cycle the index
+                    i++;
+                    i %= qs.size();
+                } else if (curr->value == UNLINK_SENTINEL){
+                    continue; // someone else is unlinking
+                } else {
+                    // Hasn't been raised yet or is in the process or raising (Test-Test-And-Set)
+                    if (curr->link_level != curr->height && curr->link_level != ULONG_MAX){
+                        // Raise the node
+                        int old_height = pool->template CompareAndSwap<uint64_t>(get_link_height_ptr(curr.remote_origin()), curr->link_level, ULONG_MAX);
+                        if (old_height == curr->link_level){
+                            raise_node(pool, curr->key, curr->height);
+                            old_height = pool->template CompareAndSwap<uint64_t>(get_link_height_ptr(curr.remote_origin()), ULONG_MAX, curr->height);
+                            REMUS_ASSERT(old_height == ULONG_MAX, "I should be the only one to leave the critical section of raising");
                         }
-                        curr = cache->template Read<Node>(curr.remote_origin()); // jump a node back to refresh nexts and prevs
-                        curr_height = height(curr, nexts);
                     }
-                } else if (curr->value != UNLINK_SENTINEL){
-                    // Have a value, check if it needs to be raised
-                    if (curr->height != curr_height){
-                        // The intended height isn't equal to the true height of curr
-                        raise_node(pool, curr, prevs, nexts);
-                        curr = cache->template Read<Node>(curr.remote_origin()); // jump a node back to refresh nexts and prevs
-                        curr_height = height(curr, nexts);
-                    }
-                } // else do nothing, someone else unlinking
-
-                // Then update prevs and next (prev was curr up to its height, next is the next node of the curr)
-                for(int i = 0; i < curr_height; i++){
-                    prevs[i] = curr.remote_origin();
-                    nexts[i] = curr->next[i];
                 }
             }
             ebr_helper->match_version(true); // indicate done with epoch
@@ -252,7 +291,14 @@ public:
         CachedObject<Node> next_curr;
         for(int height = MAX_HEIGHT - 1; height != -1; height--){
             // iterate on this level until we find the last node that <= the key
+            K last_key = MINKEY;
             while(true){
+                if (last_key >= curr->key && last_key != MINKEY){
+                    REMUS_ERROR("Infinite loop detected height={} prev={} curr={}", height, last_key, curr->key);
+                    abort();
+                }
+                last_key = curr->key;
+
                 if (curr->key == key) return curr; // stop early if we find the right key
                 if (sans(curr->next[height]) == nullptr) break; // if next is the END, descend a level
                 next_curr = cache->template Read<Node>(sans(curr->next[height]));
@@ -418,20 +464,6 @@ public:
             counter++;
         }
         std::cout << "END{" << counter << "}" << std::endl;
-    }
-
-    /// A simple check to determine if we caused a corruption of our list (used in single-threaded, local debugging)
-    bool is_infinite(){
-        for(int height = MAX_HEIGHT - 1; height != -1; height--){
-            Node curr = *root;
-            K last_key = curr.key;
-            while(sans(curr.next[height]) != nullptr){
-                curr = *sans(curr.next[height]);
-                if (curr.key == last_key) return true;
-                last_key = curr.key;
-            }
-        }
-        return false;
     }
 
     /// No concurrent or thread safe (if everyone is readonly, then its fine). Counts the number of elements in the IHT

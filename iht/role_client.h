@@ -74,8 +74,8 @@ public:
   /// @param map a map interface
   /// @return a unique ptr
   static unique_ptr<Client>
-  Create(const Peer &server, tcp::EndpointManager* ep, BenchmarkParams& params, barrier<> *barr, MapAPI* map) {
-    return unique_ptr<Client>(new Client(server, ep, params, barr, map));
+  Create(const Peer &server, tcp::EndpointManager* ep, BenchmarkParams& params, barrier<> *barr, MapAPI* map, function<void()> do_stop) {
+    return unique_ptr<Client>(new Client(server, ep, params, barr, map, do_stop));
   }
 
   /// @brief Run the client
@@ -236,6 +236,7 @@ public:
   //        a barrier, then why not just make a barrier?
   remus::util::Status Stop() {
     REMUS_DEBUG("CLIENT :: Stopping client...");
+    do_stop_();
     ExperimentManager::ClientArriveBarrier(endpoint_);
     return Status::Ok();
   }
@@ -247,8 +248,8 @@ private:
   /// @param params the experiment parameters
   /// @param barrier a barrier to synchonize local clients
   /// @return a unique ptr
-  Client(const Peer &host, tcp::EndpointManager* ep, BenchmarkParams &params, barrier<> *barr, MapAPI* map)
-    : host_(host), endpoint_(ep), params_(params), barrier_(barr), map_(map){
+  Client(const Peer &host, tcp::EndpointManager* ep, BenchmarkParams &params, barrier<> *barr, MapAPI* map, function<void()> do_stop)
+    : host_(host), endpoint_(ep), params_(params), barrier_(barr), map_(map), do_stop_(do_stop){
       if (params.unlimited_stream) progression = 100000;
       else progression = max(20.0, params_.op_count * params_.thread_count * 0.01);
     }
@@ -265,6 +266,8 @@ private:
   barrier<> *barrier_;
   /// @brief a map instance to use
   MapAPI* map_;
+  /// @brief a function to run before ending
+  function<void()> do_stop_;
 
   /// @brief The number of operations to do before debug-printing the number of completed operations
   /// This is useful in debugging since I can see around how many operations have been done (if at all) before crashing

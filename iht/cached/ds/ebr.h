@@ -3,11 +3,10 @@
 #include <queue>
 #include <remus/logging/logging.h>
 #include <remus/rdma/memory_pool.h>
+#include <remus/rdma/rdma.h>
 #include <vector>
 #include <atomic>
 #include <remus/rdma/peer.h>
-
-#include "../../../dcache/test/faux_mempool.h"
 
 using namespace remus::rdma;
 using namespace std;
@@ -19,10 +18,8 @@ struct LimboLists {
 };
 
 /// An object pool that can reallocate objects as well
-template <class T, int OPS_PER_EPOCH>
+template <class T, int OPS_PER_EPOCH, class capability>
 class EBRObjectPool {
-    typedef CountingPool capability;
-
     /// version that the node can wait on. Once it sees it increments, in can rotate its free lists and increment the next node
     struct alignas(64) ebr_ref {
         long version;
@@ -42,7 +39,7 @@ class EBRObjectPool {
 
 public:
     EBRObjectPool(capability* pool, int thread_count) : pool(pool), thread_count(thread_count) {
-        my_version = pool->Allocate<ebr_ref>();
+        my_version = pool->template Allocate<ebr_ref>();
         my_version->version = 0;
         id_gen.store(0);
         thread_slots = new ebr_ref[thread_count]();
@@ -79,11 +76,10 @@ public:
 
         int send_id = (node_id - 1) % peers.size();
         int recv_id = (node_id + 1) % peers.size();
-        Peer sender, recvr;
-        for(int i = 0; i < peers.size(); i++){
-            if (peers.at(i).id == send_id) sender = peers.at(i);
-            if (peers.at(i).id == recv_id) recvr = peers.at(i);
-        }
+        Peer sender = peers.at(send_id);
+        Peer recvr = peers.at(recv_id);
+        REMUS_ASSERT(sender.id == send_id, "Send id is a mismatch {} {}", sender.id, send_id);
+        REMUS_ASSERT(recvr.id == recv_id, "Recv id is a mismatch {} {}", recvr.id, recv_id);
 
         // If we are recv from the root, we recv first before sending
         if (recv_id == 0){
@@ -106,7 +102,7 @@ public:
     // Get an id for the thread...
     LimboLists<T>* RegisterThread(){
         id = id_gen.fetch_add(1);
-        EBRObjectPool<T, OPS_PER_EPOCH>::limbo = new LimboLists<T>();
+        EBRObjectPool<T, OPS_PER_EPOCH, capability>::limbo = new LimboLists<T>();
         limbo->free_lists[0] = new queue<rdma_ptr<T>>();
         limbo->free_lists[1] = new queue<rdma_ptr<T>>();
         limbo->free_lists[2] = new queue<rdma_ptr<T>>();
@@ -140,7 +136,7 @@ public:
             int v = at_version.exchange(new_version);
             if (v != new_version){ // actually I was the one that incremented the version
                 // write to the next async (we don't care when it completes, as long as it isn't lost)
-                pool->Write<ebr_ref>(next_node_version, (ebr_ref) new_version, my_version, remus::rdma::internal::RDMAWriteWithNoAck);
+                pool->template Write<ebr_ref>(next_node_version, (ebr_ref) new_version, my_version, remus::rdma::internal::RDMAWriteWithNoAck);
             }
         }
     }
@@ -159,7 +155,7 @@ public:
     /// Guaranteed via EBR to be exclusive
     rdma_ptr<T> allocate(){
         if (limbo->free_lists[0].load()->empty()){
-            return pool->Allocate<T>();
+            return pool->template Allocate<T>();
         } else {
             rdma_ptr<T> ret = limbo->free_lists[0].load()->back();
             limbo->free_lists[0].load()->pop();
@@ -168,11 +164,11 @@ public:
     }
 };
 
-template <class T, int WAIT>
-inline thread_local int EBRObjectPool<T, WAIT>::id = -1;
+template <class T, int WAIT, class capability>
+inline thread_local int EBRObjectPool<T, WAIT, capability>::id = -1;
 
-template <class T, int WAIT>
-inline thread_local int EBRObjectPool<T, WAIT>::counter = 0;
+template <class T, int WAIT, class capability>
+inline thread_local int EBRObjectPool<T, WAIT, capability>::counter = 0;
 
-template <class T, int WAIT>
-inline thread_local LimboLists<T>* EBRObjectPool<T, WAIT>::limbo = nullptr;
+template <class T, int WAIT, class capability>
+inline thread_local LimboLists<T>* EBRObjectPool<T, WAIT, capability>::limbo = nullptr;

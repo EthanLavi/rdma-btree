@@ -125,7 +125,7 @@ inline void btree_run(BenchmarkParams& params, rdma_capability* capability, Remo
             );
 
             using client_t = Client<Map_Op<int, int>>;
-            std::unique_ptr<client_t> client = client_t::Create(host, endpoint, params, &client_sync, btree_as_map);
+            std::unique_ptr<client_t> client = client_t::Create(host, endpoint, params, &client_sync, btree_as_map, std::function<void()>([=](){}));
             double populate_frac = 0.5 / (double) (params.node_count * params.thread_count);
 
             StatusVal<WorkloadDriverResult> output = client_t::Run(std::move(client), thread_index, populate_frac);
@@ -165,7 +165,8 @@ inline void btree_run(BenchmarkParams& params, rdma_capability* capability, Remo
     }
     delete_endpoints(endpoint_managers, params);
 
-    save_result("btree_result.csv", workload_results, params);
+    save_result("btree_result.csv", workload_results, params, params.thread_count);
+    // todo: optimize using a built-in flag into cachedobject so that we can skip verification
 }
 
 inline void btree_run_local(BenchmarkParams& params, rdma_capability* capability, RemoteCache* cache, Peer& host, Peer& self){

@@ -107,7 +107,7 @@ int main(int argc, char **argv) {
     } else if (params.structure == "btree"){
         btree_run(params, capability, cache, host, self);
     } else if (params.structure == "skiplist"){
-        REMUS_ERROR("Unimplemented skiplist call");
+        rdmask_run(params, capability, cache, host, self, peers);
     } else {
         REMUS_ERROR("Cannot identify structure");
     }

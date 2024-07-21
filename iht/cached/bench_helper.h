@@ -55,16 +55,16 @@ inline void map_reduce(tcp::EndpointManager* endpoint, BenchmarkParams& params, 
     }
 }
 
-inline void save_result(std::string filename, WorkloadDriverResult workload_results[], BenchmarkParams& params){
-    Result result[params.thread_count];
-    for (int i = 0; i < params.thread_count; i++) {
+inline void save_result(std::string filename, WorkloadDriverResult workload_results[], BenchmarkParams& params, int thread_count){
+    Result result[thread_count];
+    for (int i = 0; i < thread_count; i++) {
         result[i] = Result(params, workload_results[i]);
         REMUS_INFO("Protobuf Result {}\n{}", i, result[i].result_as_debug_string());
     }
 
     std::ofstream filestream(filename);
     filestream << Result::result_as_string_header();
-    for (int i = 0; i < params.thread_count; i++) {
+    for (int i = 0; i < thread_count; i++) {
         filestream << result[i].result_as_string();
     }
     filestream.close();
