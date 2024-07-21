@@ -23,7 +23,7 @@
 using namespace remus::util;
 using namespace remus::rdma;
 
-typedef RdmaBPTree<int, 3, rdma_capability_thread> BTree;
+typedef RdmaBPTree<int, 3, rdma_capability_thread> BTree; // todo : increment size
 typedef RdmaBPTree<int, 3, CountingPool> BTreeLocal;
 
 inline void btree_run(BenchmarkParams& params, rdma_capability* capability, RemoteCache* cache, Peer& host, Peer& self){
@@ -41,7 +41,7 @@ inline void btree_run(BenchmarkParams& params, rdma_capability* capability, Remo
 
             // Create a root ptr to the IHT
             Peer p = Peer();
-            BTree btree = BTree(p, CacheDepth::None, cache, pool);
+            BTree btree = BTree(p, CacheDepth::None, cache, pool, true);
             rdma_ptr<anon_ptr> root_ptr = btree.InitAsFirst(pool);
             // Send the root pointer over
             tcp::message ptr_message = tcp::message(root_ptr.raw());
@@ -89,7 +89,7 @@ inline void btree_run(BenchmarkParams& params, rdma_capability* capability, Remo
             }));
             cache->init(peer_roots);
 
-            std::shared_ptr<BTree> btree = std::make_shared<BTree>(self, params.cache_depth, cache, pool);
+            std::shared_ptr<BTree> btree = std::make_shared<BTree>(self, params.cache_depth, cache, pool, false);
             // Get the data from the server to init the btree
             tcp::message ptr_message;
             endpoint->recv_server(&ptr_message);
@@ -140,10 +140,14 @@ inline void btree_run(BenchmarkParams& params, rdma_capability* capability, Remo
 
             // add count after syncing via endpoint exchange
             int final_size = btree->count(pool);
-            REMUS_DEBUG("Size (after populate) [{}]", populate_amount);
-            REMUS_DEBUG("Size (final) [{}]", final_size);
-            REMUS_DEBUG("Delta = {}", all_delta);
-            REMUS_ASSERT(final_size - all_delta == 0, "Initial size + delta ==? Final size");
+            if (thread_index == 0){
+                REMUS_DEBUG("Size (after populate) [{}]", populate_amount);
+                REMUS_DEBUG("Size (final) [{}]", final_size);
+                REMUS_DEBUG("Delta = {}", all_delta);
+                // REMUS_INFO("BTree is valid? {}", btree->valid());
+                // btree->debug();
+                REMUS_ASSERT(final_size - all_delta == 0, "Initial size + delta ==? Final size");
+            }
 
             ExperimentManager::ClientArriveBarrier(endpoint);
             REMUS_INFO("[CLIENT THREAD] -- End of execution; -- ");
@@ -169,7 +173,7 @@ inline void btree_run_local(BenchmarkParams& params, rdma_capability* capability
     RemoteCacheImpl<CountingPool>* cach = new RemoteCacheImpl<CountingPool>(pool);
     RemoteCacheImpl<CountingPool>::pool = pool; // set pool to other pool so we acccept our own cacheline
 
-    BTreeLocal tree = BTreeLocal(self, CacheDepth::RootOnly, cach, pool);
+    BTreeLocal tree = BTreeLocal(self, CacheDepth::RootOnly, cach, pool, true);
     rdma_ptr<anon_ptr> ptr = tree.InitAsFirst(pool);
     REMUS_INFO("DONE INIT");
 
@@ -183,7 +187,7 @@ inline void btree_run_local(BenchmarkParams& params, rdma_capability* capability
     //     }
     // }
 
-    // tree.populate(pool, 100, 0, 5000, std::function([=](int x){ return x; }));
+    // tree.populate(pool, 20, 0, 50, std::function([=](int x){ return x; }));
     // tree.debug();
     // REMUS_INFO("Count = {}", tree.count(pool));
 
@@ -192,24 +196,24 @@ inline void btree_run_local(BenchmarkParams& params, rdma_capability* capability
     //     if (tree.contains(pool, i).value_or(-1) == i) second_cnt++;
     // }
     // REMUS_INFO("Contain = {}", second_cnt);
-
+    
+    const int THREAD_COUNT = 40;
     std::vector<std::thread> threads;
-    for(int tid = 0; tid != 7; tid++){
+    std::barrier<> barr(THREAD_COUNT);
+    for(int tid = 0; tid != THREAD_COUNT; tid++){
         threads.push_back(std::thread([&](int start){
+            barr.arrive_and_wait();
             RemoteCacheImpl<CountingPool>::pool = pool;
-            BTreeLocal tree_tlocal = BTreeLocal(self, CacheDepth::RootOnly, cach, pool);
+            BTreeLocal tree_tlocal = BTreeLocal(self, CacheDepth::RootOnly, cach, pool, false);
             tree_tlocal.InitFromPointer(ptr);
-            for(int times = 0; times < 100; times++){
-                for(int i = start; i < 1000; i += 7){
-                    tree_tlocal.insert(pool, i, i);
-                    tree_tlocal.remove(pool, (i * 3 + start) % 1000);
-                }
-            }
+            tree_tlocal.populate(pool, 250, 0, 20000, std::function([=](int x){ return x; }));
         }, tid));
     }
-    for(int tid = 0; tid != 7; tid++){
+    for(int tid = 0; tid != THREAD_COUNT; tid++){
         threads.at(tid).join();
     }
+    tree.debug();
+    REMUS_INFO("Tree is valid? {}", tree.valid());
 
     cach->free_all_tmp_objects();
     tree.destroy(pool);
