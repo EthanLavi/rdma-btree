@@ -3,16 +3,15 @@
     "max_qps_second": -1,
     "runtime": 5,
     "unlimited_stream": false,
-    "op_count": 1000000,
+    "op_count": 500000,
     "contains": 80,
     "insert": 10,
     "remove": 10,
     "key_lb": 0,
     "key_ub": 10000,
     "region_size": 28,
-    "thread_count": 4,
+    "thread_count": 8,
     "node_count": 2,
-    "qp_per_conn": 8,
-    "cache_depth": 0,
-    "structure": "btree"
+    "qp_per_conn": 16,
+    "cache_depth": 0
 }
