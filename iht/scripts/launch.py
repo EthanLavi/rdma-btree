@@ -48,7 +48,7 @@ parser.add_argument('--thread_count', type=int, default=1, help="The number of t
 parser.add_argument('--node_count', type=int, default=1, help="The number of nodes to use in the experiment. Will use node0-nodeN")
 parser.add_argument('--qp_per_conn', type=int, default=30, help="The number of queue pairs to use in the experiment MAX")
 parser.add_argument('--cache_depth', type=int, default=0, help="The depth of which to cache layers in the IHT")
-parser.add_argument('--structure', type=str, default="iht", help="The data structure")
+parser.add_argument('--structure', choices=['iht', 'btree', 'skiplist'], required=True, help="The data structure")
 exp_result = {
     "iht": "iht_result.csv", 
     "btree": "btree_result.csv", 
@@ -78,11 +78,12 @@ def process_exp_flags(node_id):
             # Load the json into the proto
             json_data = f.read()
             mapper = json.loads(json_data)
-            one_to_ones = ["runtime", "op_count", "contains", "insert", "remove", "key_lb", "key_ub", "region_size", "thread_count", "node_count", "qp_per_conn", "cache_depth", "structure"]
+            one_to_ones = ["runtime", "op_count", "contains", "insert", "remove", "key_lb", "key_ub", "region_size", "thread_count", "node_count", "qp_per_conn", "cache_depth"]
             for param in one_to_ones:
                 params += f" --{param} " + str(mapper[param]).lower()
             if mapper['unlimited_stream']:
                 params += f" --unlimited_stream "
+        params += " --structure " + str(ARGS.structure)
     else:
         one_to_ones = ["runtime", "op_count", "region_size", "thread_count", "node_count", "qp_per_conn", "cache_depth", "structure"]
         for param in one_to_ones:
