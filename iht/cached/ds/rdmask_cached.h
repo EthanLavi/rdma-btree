@@ -106,9 +106,9 @@ private:
 
     /// Calculate the height of a node by how many levels can reach the current
     /// Returns 0 if completely unlinked
-    int height(CachedObject<Node>& node, rdma_ptr<Node> nexts[MAX_HEIGHT]){
+    int height(CachedObject<Node>& node, rdma_ptr<Node> nexts[MAX_HEIGHT]) const {
         for(int i = 0; i < MAX_HEIGHT; i++){
-            if (nexts[i].raw() != node.remote_origin().raw()) return i;
+            if (sans(nexts[i]).raw() != sans(node.remote_origin()).raw()) return i;
         }
         return MAX_HEIGHT;
     }
@@ -141,30 +141,26 @@ private:
 
     /// Returns new height
     /// Raise a node to a random new height
-    int raise_node(capability* pool, CachedObject<Node>& node, rdma_ptr<Node> prevs[MAX_HEIGHT], rdma_ptr<Node> nexts[MAX_HEIGHT]){
+    void raise_node(capability* pool, CachedObject<Node>& node, rdma_ptr<Node> prevs[MAX_HEIGHT], rdma_ptr<Node> nexts[MAX_HEIGHT]){
+        int curr_height = height(node, nexts);
+        REMUS_ASSERT(curr_height != 0, "somehow made it to an unlinked node")
         int desired_height = node->height;
-        for(int i = height(node, nexts); i < desired_height; i++){
+        for(int i = curr_height; i < desired_height; i++){
             rdma_ptr<uint64_t> node_ptr = get_level_ptr(node.remote_origin(), i);
+            REMUS_ASSERT(nexts[i].raw() != node.remote_origin().raw(), "error with the next pointing to the self {} {}", i, curr_height);
             uint64_t old_ptr_curr = pool->template CompareAndSwap<uint64_t>(node_ptr, node->next[i].raw(), nexts[i].raw());
-            if (old_ptr_curr == node->next[i].raw()) {
-                // successful cas, invalidate the node
-                cache->template Invalidate<Node>(node.remote_origin());
-            } else {
-                // couldn't set curr, only raised to height i
-                return i;
-            }
+            if (old_ptr_curr == node->next[i].raw()) cache->template Invalidate<Node>(node.remote_origin()); // successful cas, invalidate the node
+            else return; // couldn't set curr, only raised to height i
+
             rdma_ptr<uint64_t> prev_ptr = get_level_ptr(prevs[i], i);
+            REMUS_ASSERT(prevs[i].raw() != node.remote_origin().raw(), "error with the next pointing to the self {} {}", i, curr_height);
             uint64_t old_ptr_prev = pool->template CompareAndSwap<uint64_t>(prev_ptr, nexts[i].raw(), node.remote_origin().raw());
             if (old_ptr_prev == nexts[i].raw()) {
                 // insert on this level was successful
                 cache->template Invalidate<Node>(prevs[i]);
                 nexts[i] = node.remote_origin(); // update nexts to the correct value
-            } else {
-                // couldn't set prev, only raised to height i
-                return i;
-            }
+            } else return; // couldn't set prev, only raised to height i
         }
-        return desired_height;
     }
 
 public:
@@ -186,7 +182,7 @@ public:
                 prevs[i] = curr.remote_origin(); // root
                 nexts[i] = curr->next[i]; // root->next
             }
-            while(sans(curr->next[0]) != nullptr){
+            while(sans(curr->next[0]) != nullptr && do_cont->load()){
                 curr = cache->template Read<Node>(sans(curr->next[0]));
                 int curr_height = height(curr, nexts);
                 if (curr->value == DELETE_SENTINEL){
@@ -257,6 +253,7 @@ public:
         for(int height = MAX_HEIGHT - 1; height != -1; height--){
             // iterate on this level until we find the last node that <= the key
             while(true){
+                if (curr->key == key) return curr; // stop early if we find the right key
                 if (sans(curr->next[height]) == nullptr) break; // if next is the END, descend a level
                 next_curr = cache->template Read<Node>(sans(curr->next[height]));
                 if (next_curr->key <= key) curr = std::move(next_curr); // next_curr is eligible, continue with it
@@ -414,7 +411,6 @@ public:
         Node curr = *root;
         std::cout << 0 << " SENT -> ";
         while(sans(curr.next[0]) != nullptr){
-            std::cout << sans(curr.next[0]) << " ";
             curr = *sans(curr.next[0]);
             if (curr.value == DELETE_SENTINEL) std::cout << "DELETED(" << curr.key << ") -> ";
             else if (curr.value == UNLINK_SENTINEL) std::cout << "UNLINKED(" << curr.key << ") -> ";
