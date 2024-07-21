@@ -194,9 +194,9 @@ public:
     }
 
     /// Technically not thread safe
-    void print_metrics(){
+    void print_metrics(std::string indication = ""){
         count_empty_lines();
-        REMUS_INFO("{}", metrics.as_string());
+        REMUS_INFO("{}{}", indication, metrics.as_string());
     }
 
     /// Technically not thread safe
