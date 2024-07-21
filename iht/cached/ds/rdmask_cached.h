@@ -9,8 +9,6 @@
 #include <dcache/cache_store.h>
 #include <dcache/cached_ptr.h>
 
-#include "../../dcache/test/faux_mempool.h"
-
 #include "ebr.h"
 
 #include "../../common.h"
@@ -74,26 +72,27 @@ inline rdma_ptr<T> sans(rdma_ptr<T> ptr){
 }
 
 /// SIZE is DEGREE * 2
-template <class K, int MAX_HEIGHT, K MINKEY, uint64_t DELETE_SENTINEL, uint64_t UNLINK_SENTINEL> class RdmaSkipList {
+template <class K, int MAX_HEIGHT, K MINKEY, uint64_t DELETE_SENTINEL, uint64_t UNLINK_SENTINEL, class capability> class RdmaSkipList {
 private:
+    using RemoteCache = RemoteCacheImpl<capability>;
+
     Peer self_;
     CacheDepth::CacheDepth cache_depth_;
 
     typedef node<K, MAX_HEIGHT> Node;
     typedef rdma_ptr<Node> nodeptr;
-    typedef CountingPool capability;
 
     template <typename T> inline bool is_local(rdma_ptr<T> ptr) {
         return ptr.id() == self_.id;
     }
 
     nodeptr root;
-    RemoteCacheImpl<capability>* cache;
+    RemoteCache* cache;
   
     // preallocated memory for RDMA operations (avoiding frequent allocations)
     rdma_ptr<Node> tmp_node;
     // shared EBRObjectPool has thread_local internals so its all thread safe
-    EBRObjectPool<Node, 100>* ebr;
+    EBRObjectPool<Node, 100, capability>* ebr;
 
     inline rdma_ptr<uint64_t> get_value_ptr(nodeptr node) {
         Node* tmp = (Node*) 0x0;
@@ -121,16 +120,16 @@ private:
         for(int i = h - 1; i != -1; i--){
             rdma_ptr<uint64_t> node_ptr = get_level_ptr(node.remote_origin(), i);
             if (!is_marked_del(node->next[i])){
-                if (pool->CompareAndSwap<uint64_t>(node_ptr, node->next[i].raw(), marked_del(node->next[i]).raw()) == node->next[i].raw()){
-                    cache->Invalidate<Node>(node.remote_origin());
+                if (pool->template CompareAndSwap<uint64_t>(node_ptr, node->next[i].raw(), marked_del(node->next[i]).raw()) == node->next[i].raw()){
+                    cache->template Invalidate<Node>(node.remote_origin());
                 } else {
                     return false; // failed on the level, retry on the next go around
                 }
             }
             rdma_ptr<uint64_t> prev_ptr = get_level_ptr(prevs[i], i);
-            if (pool->CompareAndSwap<uint64_t>(prev_ptr, node.remote_origin().raw(), sans(node->next[i]).raw()) == node.remote_origin().raw()){
+            if (pool->template CompareAndSwap<uint64_t>(prev_ptr, node.remote_origin().raw(), sans(node->next[i]).raw()) == node.remote_origin().raw()){
                 // Unlink was successful
-                cache->Invalidate<Node>(prevs[i]);
+                cache->template Invalidate<Node>(prevs[i]);
                 nexts[i] = sans(node->next[i]); // update next to be accurate
             } else {
                 // failed on the level, retry on the next go-around
@@ -146,19 +145,19 @@ private:
         int desired_height = node->height;
         for(int i = height(node, nexts); i < desired_height; i++){
             rdma_ptr<uint64_t> node_ptr = get_level_ptr(node.remote_origin(), i);
-            uint64_t old_ptr_curr = pool->CompareAndSwap<uint64_t>(node_ptr, node->next[i].raw(), nexts[i].raw());
+            uint64_t old_ptr_curr = pool->template CompareAndSwap<uint64_t>(node_ptr, node->next[i].raw(), nexts[i].raw());
             if (old_ptr_curr == node->next[i].raw()) {
                 // successful cas, invalidate the node
-                cache->Invalidate<Node>(node.remote_origin());
+                cache->template Invalidate<Node>(node.remote_origin());
             } else {
                 // couldn't set curr, only raised to height i
                 return i;
             }
             rdma_ptr<uint64_t> prev_ptr = get_level_ptr(prevs[i], i);
-            uint64_t old_ptr_prev = pool->CompareAndSwap<uint64_t>(prev_ptr, nexts[i].raw(), node.remote_origin().raw());
+            uint64_t old_ptr_prev = pool->template CompareAndSwap<uint64_t>(prev_ptr, nexts[i].raw(), node.remote_origin().raw());
             if (old_ptr_prev == nexts[i].raw()) {
                 // insert on this level was successful
-                cache->Invalidate<Node>(prevs[i]);
+                cache->template Invalidate<Node>(prevs[i]);
                 nexts[i] = node.remote_origin(); // update nexts to the correct value
             } else {
                 // couldn't set prev, only raised to height i
@@ -169,31 +168,30 @@ private:
     }
 
 public:
-    RdmaSkipList(Peer& self, CacheDepth::CacheDepth depth, RemoteCacheImpl<capability>* cache, capability* pool, int thread_count, vector<Peer> peers, EBRObjectPool<Node, 100>* ebr) 
+    RdmaSkipList(Peer& self, CacheDepth::CacheDepth depth, RemoteCache* cache, capability* pool, vector<Peer> peers, EBRObjectPool<Node, 100, capability>* ebr) 
     : self_(std::move(self)), cache_depth_(depth), cache(cache), ebr(ebr) {
         REMUS_INFO("SENTINEL is MIN? {}", MINKEY);
-        tmp_node = pool->Allocate<Node>();
-        // todo: uncomment ebr->Init((rdma_capability*) pool, self.id, peers);
+        tmp_node = pool->template Allocate<Node>();
     }
 
-    void helper_thread(std::atomic<bool>* do_cont, capability* pool, EBRObjectPool<Node, 100>* ebr_helper, vector<LimboLists<Node>*> qs){
+    void helper_thread(std::atomic<bool>* do_cont, capability* pool, EBRObjectPool<Node, 100, capability>* ebr_helper, vector<LimboLists<Node>*> qs){
         rdma_ptr<Node> prevs[MAX_HEIGHT];
         rdma_ptr<Node> nexts[MAX_HEIGHT];
         CachedObject<Node> curr;
         int i = 0;
         while(do_cont->load()){ // endlessly traverse and maintain the index
-            curr = cache->Read<Node>(root);
+            curr = cache->template Read<Node>(root);
             // init prevs and nexts
             for(int i = 0; i < MAX_HEIGHT; i++){
                 prevs[i] = curr.remote_origin(); // root
                 nexts[i] = curr->next[i]; // root->next
             }
             while(sans(curr->next[0]) != nullptr){
-                curr = cache->Read<Node>(sans(curr->next[0]));
+                curr = cache->template Read<Node>(sans(curr->next[0]));
                 int curr_height = height(curr, nexts);
                 if (curr->value == DELETE_SENTINEL){
                     rdma_ptr<uint64_t> ptr = get_value_ptr(curr.remote_origin());
-                    if (pool->CompareAndSwap<uint64_t>(ptr, DELETE_SENTINEL, UNLINK_SENTINEL) == DELETE_SENTINEL){
+                    if (pool->template CompareAndSwap<uint64_t>(ptr, DELETE_SENTINEL, UNLINK_SENTINEL) == DELETE_SENTINEL){
                         if (unlink_node(pool, curr, prevs, nexts)){
                             // if unlink was successful, deallocate
                             LimboLists<Node>* q = qs.at(i);
@@ -202,7 +200,7 @@ public:
                             i++;
                             i %= qs.size();
                         }
-                        curr = cache->Read<Node>(curr.remote_origin()); // jump a node back to refresh nexts and prevs
+                        curr = cache->template Read<Node>(curr.remote_origin()); // jump a node back to refresh nexts and prevs
                         curr_height = height(curr, nexts);
                     }
                 } else if (curr->value != UNLINK_SENTINEL){
@@ -210,7 +208,7 @@ public:
                     if (curr->height != curr_height){
                         // The intended height isn't equal to the true height of curr
                         raise_node(pool, curr, prevs, nexts);
-                        curr = cache->Read<Node>(curr.remote_origin()); // jump a node back to refresh nexts and prevs
+                        curr = cache->template Read<Node>(curr.remote_origin()); // jump a node back to refresh nexts and prevs
                         curr_height = height(curr, nexts);
                     }
                 } // else do nothing, someone else unlinking
@@ -227,15 +225,15 @@ public:
 
     /// Free all the resources associated with the data structure
     void destroy(capability* pool, bool delete_as_first = true) {
-        pool->Deallocate<Node>(tmp_node);
-        if (delete_as_first) pool->Deallocate<Node>(root);
+        pool->template Deallocate<Node>(tmp_node);
+        if (delete_as_first) pool->template Deallocate<Node>(root);
     }
 
     /// @brief Create a fresh iht
     /// @param pool the capability to init the IHT with
     /// @return the iht root pointer
     rdma_ptr<anon_ptr> InitAsFirst(capability* pool){
-        this->root = pool->Allocate<Node>();
+        this->root = pool->template Allocate<Node>();
         this->root->key = MINKEY;
         this->root->value = 0;
         for(int i = 0; i < MAX_HEIGHT; i++)
@@ -246,7 +244,7 @@ public:
 
     /// @brief Initialize an IHT from the pointer of another IHT
     /// @param root_ptr the root pointer of the other iht from InitAsFirst();
-    void InitFromPointer(capability* pool, rdma_ptr<anon_ptr> root_ptr){
+    void InitFromPointer(rdma_ptr<anon_ptr> root_ptr){
         this->root = static_cast<nodeptr>(root_ptr);
     }
 
@@ -254,13 +252,13 @@ public:
     /// Will unlink nodes only at the data level leaving them indexable
     private: CachedObject<Node> find(capability* pool, K key){
         // first node is a sentinel, it will always be linked in the data structure
-        CachedObject<Node> curr = cache->Read<Node>(root); // root is never deleted, let's say curr is never a deleted node
+        CachedObject<Node> curr = cache->template Read<Node>(root); // root is never deleted, let's say curr is never a deleted node
         CachedObject<Node> next_curr;
         for(int height = MAX_HEIGHT - 1; height != -1; height--){
             // iterate on this level until we find the last node that <= the key
             while(true){
                 if (sans(curr->next[height]) == nullptr) break; // if next is the END, descend a level
-                next_curr = cache->Read<Node>(sans(curr->next[height]));
+                next_curr = cache->template Read<Node>(sans(curr->next[height]));
                 if (next_curr->key <= key) curr = std::move(next_curr); // next_curr is eligible, continue with it
                 else break; // otherwise descend a level since next_curr is past the limit
             }
@@ -294,7 +292,7 @@ public:
                 if (curr->value == UNLINK_SENTINEL) continue; // it is being unlinked, retry
                 if (curr->value == DELETE_SENTINEL){
                     rdma_ptr<uint64_t> curr_remote_value = get_value_ptr(curr.remote_origin());
-                    uint64_t old_value = pool->CompareAndSwap<uint64_t>(curr_remote_value, DELETE_SENTINEL, value);
+                    uint64_t old_value = pool->template CompareAndSwap<uint64_t>(curr_remote_value, DELETE_SENTINEL, value);
                     if (old_value == DELETE_SENTINEL){
                         // cas succeeded, reinstantiated the node
                         cache->Invalidate(curr.remote_origin());
@@ -323,13 +321,13 @@ public:
             } else {
                 Node new_node = Node(key, value);
                 new_node.next[0] = curr->next[0];
-                pool->Write<Node>(new_node_ptr, new_node, tmp_node);
+                pool->template Write<Node>(new_node_ptr, new_node, tmp_node);
             }
 
             // if the next is a deleted node, we need to physically delete
             rdma_ptr<uint64_t> dest = get_level_ptr(curr.remote_origin(), 0);
             // will fail if the ptr is marked for unlinking
-            uint64_t old = pool->CompareAndSwap<uint64_t>(dest, sans(curr->next[0]).raw(), new_node_ptr.raw());
+            uint64_t old = pool->template CompareAndSwap<uint64_t>(dest, sans(curr->next[0]).raw(), new_node_ptr.raw());
             if (old == curr->next[0].raw()){ // if our CAS was successful, invalidate the object we modified
                 cache->Invalidate(curr.remote_origin());
                 ebr->match_version();
@@ -362,7 +360,7 @@ public:
 
         // if the next is a deleted node, we need to physically delete
         rdma_ptr<uint64_t> dest = get_value_ptr(curr.remote_origin());
-        uint64_t old = pool->CompareAndSwap<uint64_t>(dest, curr->value, DELETE_SENTINEL); // mark for deletion
+        uint64_t old = pool->template CompareAndSwap<uint64_t>(dest, curr->value, DELETE_SENTINEL); // mark for deletion
         if (old == curr->value){ // if our CAS was successful, invalidate the object we modified
             cache->Invalidate(curr.remote_origin());
             ebr->match_version();
@@ -444,9 +442,9 @@ public:
     int count(capability* pool){
         // Get leftmost leaf by wrapping SENTINEL
         int count = 0;
-        Node curr = *cache->Read<Node>(root);
+        Node curr = *cache->template Read<Node>(root);
         while(curr.next[0] != nullptr){
-            curr = *cache->Read<Node>(curr.next[0]);
+            curr = *cache->template Read<Node>(curr.next[0]);
             if (curr.value != DELETE_SENTINEL && curr.value != UNLINK_SENTINEL)
                 count++;
         }
