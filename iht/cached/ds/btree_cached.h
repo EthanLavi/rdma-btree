@@ -37,7 +37,7 @@ private:
   CacheDepth::CacheDepth cache_depth_;
 
   static const int VLINE_SIZE = 56 / sizeof(V);
-  static const int HLINE_SIZE = 48 / sizeof(V);
+  static const int HLINE_SIZE = 40 / sizeof(V);
   #define KLINE_SIZE 14
   #define PLINE_SIZE 7
 
@@ -45,6 +45,8 @@ private:
   struct hline {
     long version;
     V values[HLINE_SIZE];
+    K key_low; // lower bound (cannot be eq)
+    K key_high; // upper bound (can be eq)
     rdma_ptr<hline> next;
   };
 
@@ -163,6 +165,8 @@ private:
         value_lines[i].version = 0;
       }
       last_line.version = 0;
+      last_line.key_low = INT_MIN; // neither INT_MIN nor INT_MAX are valid keys!
+      last_line.key_high = SENTINEL;
       for(int i = 0; i < SIZE; i++){
         set_key(i, SENTINEL);
         set_value(i, 0); // set just for debugging
@@ -171,7 +175,7 @@ private:
     }
 
     /// Checks if the version is valid
-    bool is_valid() const {
+    bool is_valid() const { // todo: lockfree traversal shouldn't wait while a node is locked! (have to ignore lock bit)
       long base = last_line.version;
       for(int i = 0; i < KLINES; i++){
         if (key_lines[i].version != base) return false;
@@ -180,6 +184,27 @@ private:
         if (value_lines[i].version != base) return false;
       }
       return true;
+    }
+
+    /// Test if a key is in the range
+    bool key_in_range(K key) const {
+      return last_line.key_low < key && key <= last_line.key_high;
+    }
+
+    /// Get the lower bound for the leaf (exclusive)
+    K key_low() const {
+      return last_line.key_low;
+    }
+
+    /// Get the upper bound for the leaf (inclusive)
+    K key_high() const {
+      return last_line.key_high;
+    }
+
+    /// Set the range of the leaf
+    void set_range(K key_low, K key_high){
+      last_line.key_low = key_low;
+      last_line.key_high = key_high;
     }
 
     /// Get version of the node without the lock bit
@@ -209,6 +234,7 @@ private:
     const rdma_ptr<BLeaf> get_next() const {
       return static_cast<rdma_ptr<BLeaf>>(last_line.next);
     }
+
     /// Set the next ptr
     void set_next(rdma_ptr<BLeaf> next_leaf){
       last_line.next = static_cast<rdma_ptr<hline>>(next_leaf);
@@ -368,6 +394,21 @@ private:
     }
   }
 
+  /// Shift everything from index down, overwriting the key at index and the ptr at index + 1
+  /// Returns the key it overwrote
+  inline K shift_down(BNode* bnode, int index){
+    K original_key = bnode->key_at(index);
+    for(int i = index; i < SIZE - 2; i++){
+      bnode->set_key(i, bnode->key_at(i + 1));
+    }
+    bnode->set_key(SIZE - 1, SENTINEL); // reset last key slot
+    for(int i = index + 1; i < SIZE - 1; i++){
+      bnode->set_ptr(i, bnode->ptr_at(i + 1));
+    }
+    bnode->set_ptr(SIZE, nullptr);
+    return original_key;
+  }
+
   // todo; mark ptr
   /// At root
   void split_node(capability* pool, CachedObject<BRoot>& parent_p, CachedObject<BNode>& node_p){
@@ -403,10 +444,13 @@ private:
     parent.set_start_and_inc(new_parent);
 
     bleaf_ptr new_neighbor = allocate_bleaf(pool);
-    
+
     K to_parent = split_keys<BLeaf*, bleaf_ptr>(&node, new_neighbor, false);
     split_values(&node, (BLeaf*) new_neighbor);
     node.set_next(new_neighbor);
+    K key_low = node.key_low(), key_high = node.key_high();
+    node.set_range(key_low, to_parent);
+    new_neighbor->set_range(to_parent, key_high);
 
     new_parent->set_key(0, to_parent);
     new_parent->set_ptr(0, static_cast<bnode_ptr>(node_p.remote_origin()));
@@ -454,6 +498,11 @@ private:
     split_values(&node, (BLeaf*) new_neighbor);
     new_neighbor->set_next(node.get_next());
     node.set_next(new_neighbor);
+    
+    K key_low = node.key_low(), key_high = node.key_high();
+    node.set_range(key_low, to_parent);
+    new_neighbor->set_range(to_parent, key_high);
+  
     new_neighbor->lock(); // start locked
 
     int bucket = search_node<BNode>(parent_p, to_parent);
@@ -472,6 +521,51 @@ private:
     return node;
   }
 
+  void merge_node(BNode* node_one, int bucket_one, BNode* node_two, int bucket_two, BNode* parent){
+    // todo: REMUS_ASSERT_DEBUG? for performance
+    REMUS_ASSERT(node_one->key_at(1) == SENTINEL && node_two->key_at(SIZE - 1) == SENTINEL, "Space is assured");
+    if (bucket_one != 0){
+      REMUS_ASSERT(bucket_two == bucket_one - 1, "Sanity check");
+      std::swap(node_one, node_two);
+      std::swap(bucket_one, bucket_two);
+    }
+    // then (leaf_one <- leaf_two) and leaf_two is removed
+    K lower_key = shift_down(parent, bucket_one);
+    int size_one = 0;
+    while(node_one->key_at(size_one) != SENTINEL) size_one++;
+    node_one->set_key(size_one, lower_key);
+    node_one->set_ptr(size_one + 1, node_two->ptr_at(0)); // get the merged ptr
+
+    for(int i = 0; i < SIZE; i++){
+      if (node_two->key_at(i) == SENTINEL) break;
+      node_one->set_key(size_one, node_two->key_at(i));
+      node_one->set_ptr(size_one + 1, node_two->ptr_at(i + 1));
+      size_one++;
+    }
+  }
+
+  /// Combine two neighboring leafs in either order. Also modify the parent
+  void merge_leaf(BLeaf* leaf_one, int bucket_one, BLeaf* leaf_two, int bucket_two, BNode* parent){
+    // todo: REMUS_ASSERT_DEBUG? for performance
+    REMUS_ASSERT(leaf_one->key_at(1) == SENTINEL && leaf_two->key_at(SIZE - 1) == SENTINEL, "Space is assured");
+    if (bucket_one != 0){
+      REMUS_ASSERT(bucket_two == bucket_one - 1, "Sanity check");
+      std::swap(leaf_one, leaf_two);
+      std::swap(bucket_one, bucket_two);
+    }
+    // then (leaf_one <- leaf_two) and leaf_two is removed
+    leaf_one->set_next(leaf_two->get_next());
+    leaf_one->set_range(leaf_one->key_low(), leaf_two->key_high());
+    int size_one = 0;
+    for(int i = 0; i < SIZE; i++){
+      if (leaf_two->key_at(i) == SENTINEL) break;
+      while(leaf_one->key_at(size_one) != SENTINEL) size_one++;
+      leaf_one->set_key(size_one, leaf_two->key_at(i));
+      leaf_one->set_value(size_one, leaf_two->value_at(i));
+    }
+    shift_down(parent, bucket_one);
+  }
+
   inline bnode_ptr read_level(BNode* curr, int bucket){
     bnode_ptr next_level = curr->ptr_at(SIZE);
     if (bucket != -1) next_level = curr->ptr_at(bucket);
@@ -481,7 +575,7 @@ private:
 
   // compiling with optimizations turned on breaks correctness
   CachedObject<BLeaf> traverse(capability* pool, K key, bool modifiable, function<void(BLeaf*, int)> effect, int it_counter = 0){
-    REMUS_ASSERT(it_counter < 500, "Infinite recursion detected");
+    REMUS_ASSERT(it_counter < 10, "Infinite recursion detected");
   
     // read root first
     CachedObject<BRoot> curr_root = cache->template Read<BRoot>(root);
@@ -552,6 +646,45 @@ private:
         curr = reliable_read(parent.remote_origin());
         bucket = search_node<BNode>(curr, key);
         continue;
+      } else if (modifiable && curr->key_at(0) == SENTINEL && parent->key_at(0) != SENTINEL){
+        // Empty node with a neighbor, try to remove it
+        int bucket_neighbor;
+        rdma_ptr<BNode> merge_node_ptr;
+        if (bucket == 0) {
+          merge_node_ptr = read_level((BNode*) parent.get(), 1);
+          bucket_neighbor = 1;
+        } else {
+          merge_node_ptr = read_level((BNode*) parent.get(), bucket - 1);
+          bucket_neighbor = bucket - 1;
+        }
+        CachedObject<BNode> merging_node = reliable_read<BNode>(merge_node_ptr);
+        if (merging_node->key_at(SIZE - 1) == SENTINEL){ // there is room in neighbor for the ptr
+          if (try_acquire<BNode>(pool, parent.remote_origin(), parent->version())) {
+            if (try_acquire<BNode>(pool, curr.remote_origin(), curr->version())) {
+              if (try_acquire<BNode>(pool, merging_node.remote_origin(), merging_node->version())){
+                // cannot acquire child so release parent and self and give up
+                BNode empty_node = *curr;
+                BNode merged_node = *merging_node;
+                BNode parent_of_merge = *parent;
+                merge_node(&empty_node, bucket, &merged_node, bucket_neighbor, &parent_of_merge);
+                empty_node.increment_version();
+                merged_node.increment_version();
+                parent_of_merge.increment_version();
+                cache->template Write<BNode>(curr.remote_origin(), empty_node);
+                cache->template Write<BNode>(merging_node.remote_origin(), merged_node);
+                cache->template Write<BNode>(parent.remote_origin(), parent_of_merge);
+              } else {
+                // cannot acquire child so release parent and self and give up
+                release<BNode>(pool, parent.remote_origin(), parent->version());
+                release<BNode>(pool, curr.remote_origin(), curr->version());
+              }
+            } else {
+              // cannot acquire child so release parent and try again
+              release<BNode>(pool, parent.remote_origin(), parent->version());
+            }
+          }
+        }
+        // give-up b/c failed somewhere
       }
       bucket = search_node<BNode>(curr, key);
       height--;
@@ -563,21 +696,10 @@ private:
     // Read it as a BLeaf
     bleaf_ptr next_leaf = static_cast<bleaf_ptr>(next_level);
     CachedObject<BLeaf> leaf = reliable_read<BLeaf>(next_leaf);
-    bucket = search_node<BLeaf>(leaf, key);
-    if (leaf->key_at(bucket) == SENTINEL){
-      // our key is greater than all the keys in the leaf, check if we need to retry
-      next_leaf = leaf->get_next();
-      // find the next key, if it's greater or equal, we need to retry
-      // todo: if the next node is empty, remove it?
-      while(true){
-        if (next_leaf == nullptr) break;
-        CachedObject<BLeaf> leaf_after = reliable_read<BLeaf>(next_leaf);
-        if (leaf_after->key_at(0) != SENTINEL && key >= leaf_after->key_at(0)) return traverse(pool, key, modifiable, effect, it_counter + 1);
-        else if (leaf_after->key_at(0) != SENTINEL && key < leaf_after->key_at(0)) break;
-        else next_leaf = leaf_after->get_next();
-      }
+    if (!leaf->key_in_range(key)){
+      // key is out of the range, we traversed wrong
+      return traverse(pool, key, modifiable, effect, it_counter + 1);
     }
-    // At this point, we are sure of the leaf node
 
     // Handle updates to the leaf
     if (modifiable){
@@ -603,6 +725,51 @@ private:
               cache->template Write<BLeaf>(leaf.remote_origin(), leaf_updated);
               return leaf;
             }
+          } else if (leaf->key_at(0) == SENTINEL && curr->key_at(0) != SENTINEL){
+            // Empty node with a neighbor, try to remove it
+            int bucket_neighbor;
+            rdma_ptr<BLeaf> merge_leaf_ptr;
+            if (bucket == 0) {
+              merge_leaf_ptr = static_cast<bleaf_ptr>(read_level((BNode*) curr.get(), 1));
+              bucket_neighbor = 1;
+            } else {
+              merge_leaf_ptr = static_cast<bleaf_ptr>(read_level((BNode*) curr.get(), bucket - 1));
+              bucket_neighbor = bucket - 1;
+            }
+
+            CachedObject<BLeaf> merging_leaf;
+            bool do_merge = true;
+            while(true){ // aggressively acquire the node since we only compete with simple insert/remove
+              merging_leaf = reliable_read<BLeaf>(merge_leaf_ptr);
+              if (merging_leaf->key_at(SIZE - 1) != SENTINEL) {
+                do_merge = false; // give up because merging will cause inserts to fail!
+                break;
+              }
+              if (try_acquire(pool, merging_leaf.remote_origin(), merging_leaf->version())) break;
+              // todo: if we have linearizable range queries, we prob need to re-traverse to prevent deadlock!
+            }
+
+            if (!do_merge){
+              // lock, update, write back
+              BLeaf leaf_updated = *leaf;
+              effect(&leaf_updated, search_node<BLeaf>(&leaf_updated, key));
+              leaf_updated.increment_version();
+              cache->template Write<BLeaf>(leaf.remote_origin(), leaf_updated);
+              release<BNode>(pool, curr.remote_origin(), curr->version()); // release parent
+              return leaf;
+            }
+            BLeaf empty_leaf = *leaf;
+            effect(&empty_leaf, 0);
+            BLeaf merged_leaf = *merging_leaf;
+            BNode parent_of_merge = *curr;
+            merge_leaf(&empty_leaf, bucket, &merged_leaf, bucket_neighbor, &parent_of_merge);
+            
+            empty_leaf.increment_version();
+            merged_leaf.increment_version();
+            parent_of_merge.increment_version();
+            cache->template Write<BLeaf>(leaf.remote_origin(), empty_leaf);
+            cache->template Write<BLeaf>(merging_leaf.remote_origin(), merged_leaf);
+            cache->template Write<BNode>(curr.remote_origin(), parent_of_merge);
           } else {
             // modifiable so lock, update, write back
             BLeaf leaf_updated = *leaf;
@@ -749,7 +916,7 @@ public:
     if (ADDR)
       std::cout << "Leaf<next=" << std::hex << leaf.get_next().address() << std::dec << "> ";
     else
-      std::cout << "Leaf<> ";
+      std::cout << "Leaf<low=" << leaf.key_low() << "  high=" << leaf.key_high() << "> ";
     for(int i = 0; i < SIZE; i++){
       if (leaf.key_at(i) == SENTINEL)
         std::cout << "(SENT) ";
@@ -792,9 +959,19 @@ public:
     }
   }
 
+  /// Single threaded print
+  void debug(){
+    BRoot r = *root;
+    std::cout << "Root(height=" << r.height << ")" << std::endl;
+    debug(r.height, r.start, 0, 0);
+    std::cout << std::endl;
+  }
+
   string is_valid(int height, bnode_ptr node, K lower, K upper){
     if (height == 0){
       BLeaf l = *static_cast<bleaf_ptr>(node);
+      if (l.get_next() != nullptr && l.key_high() != l.get_next()->key_low()) return "Key high is not next key low";
+      if (l.get_next() == nullptr && l.key_high() != SENTINEL) return "Key high is not SENTINEL";
       for(int i = 0; i < SIZE; i++){
         if (l.key_at(i) == SENTINEL) continue;
         if (l.key_at(i) <= lower || l.key_at(i) > upper) return "key are not in bounds, bleaf; " + to_string(l.key_at(i));
@@ -835,18 +1012,10 @@ public:
     return reason;
   }
 
-  /// Single threaded print
-  void debug(){
-    BRoot r = *root;
-    std::cout << "Root(height=" << r.height << ")" << std::endl;
-    debug(r.height, r.start, 0, 0);
-    std::cout << std::endl;
-  }
-
   /// No concurrent or thread safe (if everyone is readonly, then its fine). Counts the number of elements in the IHT
   int count(capability* pool){
     // Get leftmost leaf by wrapping SENTINEL
-    CachedObject<BLeaf> curr = traverse(pool, 0 - SENTINEL - 1, false, function([=](BLeaf*, int){}));
+    CachedObject<BLeaf> curr = traverse(pool, INT_MIN + 1, false, function([=](BLeaf*, int){}));
     int count = 0;
     while(true){
       // Add to count
