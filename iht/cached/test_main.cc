@@ -17,5 +17,5 @@ int main(int argc, char* argv[]){
     else if (structure == "rdmask" || structure == "sk")
         rdmask_run_local(params, nullptr, nullptr, peer, peer);
     else
-        REMUS_ERROR("No valid structure");
+        REMUS_ERROR("No valid structure [btree|b OR rdmask|sk]");
 }

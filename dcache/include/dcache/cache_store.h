@@ -20,8 +20,6 @@ typedef std::atomic<int> ref_t;
 
 class Object {};
 
-// todo: the object shouldn't be modifiable. It must be copied in order to modify (we need COW)
-
 struct DeallocTask {
     rdma_ptr<Object> local_ptr;
     int size;
