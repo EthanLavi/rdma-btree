@@ -13,6 +13,7 @@
 #include <dcache/cached_ptr.h>
 
 // #include "../../dcache/test/faux_mempool.h"
+#include "ebr.h"
 
 #include "../../common.h"
 #include <optional>
@@ -33,8 +34,6 @@ template <class V, int DEGREE, class capability> class RdmaBPTree {
 private:
   static const int SIZE = (DEGREE * 2) + 1;
   static const uint64_t LOCK_BIT = (uint64_t) 1 << 63;
-  Peer self_;
-  CacheDepth::CacheDepth cache_depth_;
 
   static const int VLINE_SIZE = 56 / sizeof(V);
   static const int HLINE_SIZE = 40 / sizeof(V);
@@ -68,6 +67,7 @@ private:
       rdma_ptr<pline> ptrs[PLINE_SIZE];
   };
 
+public:
   struct BNode;
 
   /// Configuration information
@@ -259,15 +259,25 @@ private:
     }
   };
 
+private:
+
   typedef rdma_ptr<BLeaf> bleaf_ptr;
   typedef rdma_ptr<BNode> bnode_ptr;
+  using EBRLeaf = EBRObjectPool<BLeaf, 100, capability>;
+  using EBRNode = EBRObjectPoolAccompany<BNode, BLeaf, 100, capability>;
+  using depth_t = CacheDepth::CacheDepth;
+  using Cache = RemoteCacheImpl<capability>;
+  
+  Peer self_;
+  depth_t cache_depth_;
+  rdma_ptr<BRoot> root;
+  Cache* cache;
+  EBRLeaf* ebr_leaf;
+  EBRNode* ebr_node;
 
   template <typename T> inline bool is_local(rdma_ptr<T> ptr) {
     return ptr.id() == self_.id;
   }
-
-  rdma_ptr<BRoot> root;
-  RemoteCacheImpl<capability>* cache;
   
   // preallocated memory for RDMA operations (avoiding frequent allocations)
   rdma_ptr<uint64_t> temp_lock;
@@ -300,15 +310,9 @@ private:
   static bnode_ptr allocate_bnode(capability* pool){
     REMUS_ASSERT(56 % sizeof(V) == 0, "V must be a multiple of 2,4,8,14,28,56");
     bnode_ptr bnode = pool->template Allocate<BNode>();
+    REMUS_INFO("BNode allocated = {}", bnode);
     *bnode = BNode();
     return bnode;
-  }
-
-  /// Allocate a leaf node with sentinel values and nullptr for next
-  static bleaf_ptr allocate_bleaf(capability* pool){
-    bleaf_ptr bleaf = pool->template Allocate<BLeaf>();
-    *bleaf = BLeaf();
-    return bleaf;
   }
 
   /// Return the first index where the provided key is less than the element at that index 
@@ -443,7 +447,8 @@ private:
     bnode_ptr new_parent = allocate_bnode(pool);
     parent.set_start_and_inc(new_parent);
 
-    bleaf_ptr new_neighbor = allocate_bleaf(pool);
+    bleaf_ptr new_neighbor = pool->template Allocate<BLeaf>();
+    *new_neighbor = BLeaf();
 
     K to_parent = split_keys<BLeaf*, bleaf_ptr>(&node, new_neighbor, false);
     split_values(&node, (BLeaf*) new_neighbor);
@@ -493,7 +498,9 @@ private:
     BLeaf node = *node_p;
 
     // Full node so split
-    bleaf_ptr new_neighbor = allocate_bleaf(pool);
+    bleaf_ptr new_neighbor = pool->template Allocate<BLeaf>();
+    *new_neighbor = BLeaf();
+
     K to_parent = split_keys<BLeaf*, bleaf_ptr>(&node, new_neighbor, false);
     split_values(&node, (BLeaf*) new_neighbor);
     new_neighbor->set_next(node.get_next());
@@ -521,9 +528,12 @@ private:
     return node;
   }
 
-  void merge_node(BNode* node_one, int bucket_one, BNode* node_two, int bucket_two, BNode* parent){
+  /// Combine two neighboring bnodes in either order. Also modify the parent
+  /// Returns true if deallocating one instead of two
+  bool merge_node(BNode* node_one, int bucket_one, BNode* node_two, int bucket_two, BNode* parent){
     // todo: REMUS_ASSERT_DEBUG? for performance
     REMUS_ASSERT(node_one->key_at(1) == SENTINEL && node_two->key_at(SIZE - 1) == SENTINEL, "Space is assured");
+    bool one_gone = bucket_one != 0;
     if (bucket_one != 0){
       REMUS_ASSERT(bucket_two == bucket_one - 1, "Sanity check");
       std::swap(node_one, node_two);
@@ -542,12 +552,15 @@ private:
       node_one->set_ptr(size_one + 1, node_two->ptr_at(i + 1));
       size_one++;
     }
+    return one_gone;
   }
 
   /// Combine two neighboring leafs in either order. Also modify the parent
-  void merge_leaf(BLeaf* leaf_one, int bucket_one, BLeaf* leaf_two, int bucket_two, BNode* parent){
+  /// Returns true if deallocating one instead of two
+  bool merge_leaf(BLeaf* leaf_one, int bucket_one, BLeaf* leaf_two, int bucket_two, BNode* parent){
     // todo: REMUS_ASSERT_DEBUG? for performance
     REMUS_ASSERT(leaf_one->key_at(1) == SENTINEL && leaf_two->key_at(SIZE - 1) == SENTINEL, "Space is assured");
+    bool one_gone = bucket_one != 0;
     if (bucket_one != 0){
       REMUS_ASSERT(bucket_two == bucket_one - 1, "Sanity check");
       std::swap(leaf_one, leaf_two);
@@ -564,6 +577,7 @@ private:
       leaf_one->set_value(size_one, leaf_two->value_at(i));
     }
     shift_down(parent, bucket_one);
+    return one_gone;
   }
 
   inline bnode_ptr read_level(BNode* curr, int bucket){
@@ -608,7 +622,7 @@ private:
 
       // Made it to the leaf
       return next_leaf;
-    }
+    } // if statement returns
 
     // Traverse bnode until bleaf
     CachedObject<BNode> curr = reliable_read<BNode>(next_level);
@@ -622,6 +636,24 @@ private:
       }
       split_node(pool, curr_root, curr);
       return traverse(pool, key, modifiable, effect);
+    } else if (modifiable && curr->key_at(0) == SENTINEL){
+      // Current is empty, remove a level
+      if (try_acquire<BRoot>(pool, curr_root.remote_origin(), 0)){
+        if (try_acquire<BNode>(pool, curr.remote_origin(), curr->version())){
+          // Update the root
+          BRoot new_root = *curr_root;
+          new_root.height--;
+          new_root.start = curr->ptr_at(0);
+          new_root.reset_lock();
+
+          cache->template Write<BRoot>(curr_root.remote_origin(), new_root);
+          release<BNode>(pool, curr.remote_origin(), curr->version());
+
+          ebr_node->deallocate(curr.remote_origin()); // deallocate the unlinked node
+        } else {
+          release<BRoot>(pool, curr_root.remote_origin(), 0); // continue traversing, we failed to lower a level
+        }
+      }
     }
 
     int bucket = search_node<BNode>(curr, key);
@@ -666,13 +698,18 @@ private:
                 BNode empty_node = *curr;
                 BNode merged_node = *merging_node;
                 BNode parent_of_merge = *parent;
-                merge_node(&empty_node, bucket, &merged_node, bucket_neighbor, &parent_of_merge);
+                if (merge_node(&empty_node, bucket, &merged_node, bucket_neighbor, &parent_of_merge)){
+                  ebr_node->deallocate(curr.remote_origin());
+                } else {
+                  ebr_node->deallocate(merging_node.remote_origin()); 
+                }
                 empty_node.increment_version();
                 merged_node.increment_version();
                 parent_of_merge.increment_version();
                 cache->template Write<BNode>(curr.remote_origin(), empty_node);
                 cache->template Write<BNode>(merging_node.remote_origin(), merged_node);
                 cache->template Write<BNode>(parent.remote_origin(), parent_of_merge);
+                // continue traversing as if no update happened
               } else {
                 // cannot acquire child so release parent and self and give up
                 release<BNode>(pool, parent.remote_origin(), parent->version());
@@ -746,7 +783,7 @@ private:
                 break;
               }
               if (try_acquire(pool, merging_leaf.remote_origin(), merging_leaf->version())) break;
-              // todo: if we have linearizable range queries, we prob need to re-traverse to prevent deadlock!
+              // todo: if we add linearizable range queries, we prob need to re-traverse to prevent deadlock!
             }
 
             if (!do_merge){
@@ -762,8 +799,12 @@ private:
             effect(&empty_leaf, 0);
             BLeaf merged_leaf = *merging_leaf;
             BNode parent_of_merge = *curr;
-            merge_leaf(&empty_leaf, bucket, &merged_leaf, bucket_neighbor, &parent_of_merge);
-            
+            if (merge_leaf(&empty_leaf, bucket, &merged_leaf, bucket_neighbor, &parent_of_merge)){
+              ebr_leaf->deallocate(leaf.remote_origin());
+            } else {
+              ebr_leaf->deallocate(merging_leaf.remote_origin());
+            }
+
             empty_leaf.increment_version();
             merged_leaf.increment_version();
             parent_of_merge.increment_version();
@@ -792,8 +833,8 @@ private:
   }
 
 public:
-  RdmaBPTree(Peer& self, CacheDepth::CacheDepth depth, RemoteCacheImpl<capability>* cache, capability* pool, int print_info) 
-  : self_(std::move(self)), cache_depth_(depth), cache(cache) {
+  RdmaBPTree(Peer& self, depth_t depth, Cache* cache, capability* pool, EBRLeaf* leaf, EBRNode* node, bool print_info = false) 
+  : self_(std::move(self)), cache_depth_(depth), cache(cache), ebr_leaf(leaf), ebr_node(node) {
     if (print_info){
       REMUS_INFO("Sentinel = {}", SENTINEL);
       REMUS_INFO("Struct Memory (BNode): {} % 64 = {}", sizeof(BNode), sizeof(BNode) % 64);
@@ -805,6 +846,13 @@ public:
   /// Free all the resources associated with the IHT
   void destroy(capability* pool) {
     pool->template Deallocate<uint64_t>(temp_lock, 8);
+    if (pool->template is_local(root)){
+      BRoot tmp_root = *root;
+      pool->template Deallocate<BRoot>(root);
+      if (tmp_root.height == 0 && pool->template is_local(tmp_root.start)){
+         pool->template Deallocate<BLeaf>(static_cast<bleaf_ptr>(tmp_root.start));
+      }
+    }
   }
 
   /// @brief Create a fresh iht
@@ -815,7 +863,9 @@ public:
     broot->height = 0; // set height to 1
     broot->lock = 0; // initialize lock
     this->root = broot;
-    this->root->start = static_cast<bnode_ptr>(allocate_bleaf(pool));
+    bleaf_ptr bleaf = pool->template Allocate<BLeaf>();
+    *bleaf = BLeaf();
+    this->root->start = static_cast<bnode_ptr>(bleaf);
     // if (cache_depth_ >= 1)
     //     this->root = mark_ptr(this->root);
     return static_cast<rdma_ptr<anon_ptr>>(this->root);
@@ -836,6 +886,7 @@ public:
   std::optional<V> contains(capability* pool, K key) {
     CachedObject<BLeaf> leaf = traverse(pool, key, false, function([=](BLeaf*, int){}));
     int bucket = search_node<BLeaf>(leaf, key);
+    ebr_leaf->match_version();
     if (leaf->key_at(bucket) == key) return make_optional(leaf->value_at(bucket));
     return nullopt;
   }
@@ -860,6 +911,7 @@ public:
         prev_value = optional(new_leaf->value_at(bucket));
       }
     }));
+    ebr_leaf->match_version();
     return prev_value; // found a match
   }
 
@@ -880,6 +932,7 @@ public:
         }
       }
     }));
+    ebr_leaf->match_version();
     return prev_value;
   }
 
