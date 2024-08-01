@@ -112,15 +112,17 @@ private:
         return rdma_ptr<uint64_t>(unmark_ptr(node).id(), unmark_ptr(node).address() + (uint64_t) &tmp->next[level]);
     }
 
-    CachedObject<Node> fill(K key, rdma_ptr<Node> preds[MAX_HEIGHT], rdma_ptr<Node> succs[MAX_HEIGHT], bool found[MAX_HEIGHT]){
+    CachedObject<Node> fill(K key, rdma_ptr<Node> preds[MAX_HEIGHT], rdma_ptr<Node> succs[MAX_HEIGHT], bool found[MAX_HEIGHT], K* prev_key = nullptr){
         // first node is a sentinel, it will always be linked in the data structure
         CachedObject<Node> curr = cache->template Read<Node>(root); // root is never deleted, let's say curr is never a deleted node
         CachedObject<Node> next_curr;
+        K previous_key = MINKEY;
         for(int height = MAX_HEIGHT - 1; height != -1; height--){
             // iterate on this level until we find the last node that <= the key
             while(true){
                 if (sans(curr->next[height]) == nullptr) {
                     preds[height] = curr.remote_origin();
+                    previous_key = curr->key;
                     succs[height] = nullptr;
                     found[height] = false;
                     // if next is the END, descend a level
@@ -132,10 +134,12 @@ private:
                     continue; // move right
                 } else if (next_curr->key == key){
                     preds[height] = curr.remote_origin();
+                    previous_key = curr->key;
                     succs[height] = next_curr->next[height];
                     found[height] = true;
                 } else {
                     preds[height] = curr.remote_origin();
+                    previous_key = curr->key;
                     succs[height] = next_curr.remote_origin();
                     found[height] = false;
                 }
@@ -143,6 +147,7 @@ private:
                 break;
             }
         }
+        if (prev_key != nullptr) *prev_key = previous_key;
         REMUS_ASSERT(next_curr->key == key, "Fill cannot find the key {}", key);
         return next_curr;
     }
@@ -156,29 +161,30 @@ private:
         bool had_update = false;
         for(int height = MAX_HEIGHT - 1; height != -1; height--){
             if (!found[height]) continue;
-            if (is_marked_del(succs[height])) continue; // if marked, skip
-
-            rdma_ptr<uint64_t> level_ptr = get_level_ptr(node.remote_origin(), height);
-            uint64_t old_ptr = pool->template CompareAndSwap<uint64_t>(level_ptr, succs[height].raw(), marked_del(succs[height]).raw());
-            if (old_ptr != succs[height].raw()){
-                // cas failed, retry; also if we had an update, invalidate
-                if (had_update) cache->Invalidate(succs[height]);
-                return unlink_node(pool, key); // retry
+            // if not marked, try to mark
+            if (!is_marked_del(succs[height])) {
+                rdma_ptr<uint64_t> level_ptr = get_level_ptr(node.remote_origin(), height);
+                // mark for deletion to prevent inserts after and also delete issues?
+                uint64_t old_ptr = pool->template CompareAndSwap<uint64_t>(level_ptr, succs[height].raw(), marked_del(succs[height]).raw());
+                if (old_ptr != succs[height].raw()){
+                    // cas failed, retry; also if we had an update, invalidate
+                    if (had_update) cache->Invalidate(succs[height]);
+                    return unlink_node(pool, key); // retry
+                }
+                had_update = true;
             }
-            had_update = true;
-        }
-        if (had_update) cache->Invalidate(node.remote_origin()); // invalidate the node
-
-        // Physically unlink
-        for(int height = MAX_HEIGHT - 1; height != -1; height--){
-            if (!found[height]) continue;
+            
+            // physically unlink
             rdma_ptr<uint64_t> level_ptr = get_level_ptr(preds[height], height);
-            uint64_t old_ptr = pool->template CompareAndSwap<uint64_t>(level_ptr, node.remote_origin().raw(), sans(succs[height]).raw());
-            if (old_ptr != node.remote_origin().raw())
+            // only remove the level if prev is not marked
+            uint64_t old_ptr = pool->template CompareAndSwap<uint64_t>(level_ptr, sans(node.remote_origin()).raw(), sans(succs[height]).raw());
+            if (old_ptr != node.remote_origin().raw()){
+                if (had_update) cache->Invalidate(node.remote_origin()); // invalidate the node
                 return unlink_node(pool, key); // retry
-            else
+            } else
                 cache->Invalidate(preds[height]);
         }
+        if (had_update) cache->Invalidate(node.remote_origin()); // invalidate the node
     }
 
     /// Try to raise a node to the level
@@ -217,7 +223,7 @@ public:
         REMUS_INFO("SENTINEL is MIN? {}", MINKEY);
         tmp_node = pool->template Allocate<Node>();
     }
-    
+
     void helper_thread(std::atomic<bool>* do_cont, capability* pool, EBRObjectPool<Node, 100, capability>* ebr_helper, vector<LimboLists<Node>*> qs){
         CachedObject<Node> curr;
         int i = 0;
@@ -231,7 +237,7 @@ public:
                     if (last != DELETE_SENTINEL) continue; // something changed, gonna skip this node
                     cache->Invalidate(curr.remote_origin());
                     unlink_node(pool, curr->key); // physically unlink (has guarantee of unlink)
-                    
+
                     // deallocate unlinked node
                     LimboLists<Node>* q = qs.at(i);
                     q->free_lists[2].load()->push(curr.remote_origin());
@@ -242,7 +248,7 @@ public:
                 } else if (curr->value == UNLINK_SENTINEL){
                     continue; // someone else is unlinking
                 } else {
-                    // Hasn't been raised yet or is in the process or raising (Test-Test-And-Set)
+                    // Hasn't been raised yet and isn't in the process or raising (Test-Test-And-Set)
                     if (curr->link_level != curr->height && curr->link_level != ULONG_MAX){
                         // Raise the node
                         int old_height = pool->template CompareAndSwap<uint64_t>(get_link_height_ptr(curr.remote_origin()), curr->link_level, ULONG_MAX);
@@ -283,9 +289,29 @@ public:
         this->root = static_cast<nodeptr>(root_ptr);
     }
 
+    private: void nonblock_unlink_node(capability* pool, K key){
+        rdma_ptr<Node> preds[MAX_HEIGHT];
+        rdma_ptr<Node> succs[MAX_HEIGHT];
+        bool found[MAX_HEIGHT];
+        K prev_key;
+        CachedObject<Node> node = fill(key, preds, succs, found, &prev_key);
+        if (!found[1] && found[0] && node->value == UNLINK_SENTINEL) {
+            // physically unlink
+            rdma_ptr<uint64_t> level_ptr = get_level_ptr(preds[0], 0);
+            // only remove the level if prev is not marked
+            uint64_t old_ptr = pool->template CompareAndSwap<uint64_t>(level_ptr, sans(node.remote_origin()).raw(), sans(succs[0]).raw());
+            if (old_ptr == sans(node.remote_origin()).raw()) {
+                cache->Invalidate(preds[0]);
+            } else if (old_ptr == marked_del(node.remote_origin()).raw()) {
+                // unlink failed because previous was not deleted yet
+                nonblock_unlink_node(pool, prev_key);
+            }
+        }
+    } public:
+
     /// Search for a node where it's result->key is <= key
     /// Will unlink nodes only at the data level leaving them indexable
-    private: CachedObject<Node> find(capability* pool, K key){
+    private: CachedObject<Node> find(capability* pool, K key, bool is_insert){
         // first node is a sentinel, it will always be linked in the data structure
         CachedObject<Node> curr = cache->template Read<Node>(root); // root is never deleted, let's say curr is never a deleted node
         CachedObject<Node> next_curr;
@@ -302,6 +328,11 @@ public:
                 if (curr->key == key) return curr; // stop early if we find the right key
                 if (sans(curr->next[height]) == nullptr) break; // if next is the END, descend a level
                 next_curr = cache->template Read<Node>(sans(curr->next[height]));
+                if (is_insert && height == 0 && is_marked_del(curr->next[height]) && next_curr->key >= key){
+                    // we found a node that we are inserting directly after. Lets help unlink
+                    nonblock_unlink_node(pool, curr->key);
+                    return find(pool, key, is_insert); // recursively retry
+                }
                 if (next_curr->key <= key) curr = std::move(next_curr); // next_curr is eligible, continue with it
                 else break; // otherwise descend a level since next_curr is past the limit
             }
@@ -314,7 +345,7 @@ public:
     /// @param key the key to search on
     /// @return an optional containing the value, if the key exists
     std::optional<uint64_t> contains(capability* pool, K key) {
-        CachedObject<Node> node = find(pool, key);
+        CachedObject<Node> node = find(pool, key, false);
         ebr->match_version();
         if (key == node->key && node->value != DELETE_SENTINEL && node->value != UNLINK_SENTINEL) {
             return make_optional(node->value);
@@ -330,7 +361,7 @@ public:
     /// @return an empty optional if the insert was successful. Otherwise it's the value at the key.
     std::optional<uint64_t> insert(capability* pool, K key, uint64_t value) {
         while(true){
-            CachedObject<Node> curr = find(pool, key);
+            CachedObject<Node> curr = find(pool, key, true);
             if (curr->key == key) {
                 if (curr->value == UNLINK_SENTINEL) continue; // it is being unlinked, retry
                 if (curr->value == DELETE_SENTINEL){
@@ -389,7 +420,7 @@ public:
     /// @param key the key to remove at
     /// @return an optional containing the old value if the remove was successful. Otherwise an empty optional.
     std::optional<uint64_t> remove(capability* pool, K key) {
-        CachedObject<Node> curr = find(pool, key);
+        CachedObject<Node> curr = find(pool, key, false);
         if (curr->key != key) {
             // Couldn't find the key, return
             ebr->match_version();
