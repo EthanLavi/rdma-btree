@@ -15,8 +15,28 @@
 #include "../../common.h"
 #include <optional>
 #include <thread>
+#include <random>
 
 using namespace remus::rdma;
+
+/* 
+todo
+
+Run btree and skiplist on RDMA since they underwent significant changes!
+1) Optimize write behaviors
+2) Caching
+3) Prealloc?
+*/
+
+/// Random seeds with around half of the bits set. 
+/// Output space is at least 2x the number of threads to prevent overlaps
+static uint32_t seed(){
+    std::random_device dev;
+    std::mt19937 rng(dev());
+    std::uniform_int_distribution<std::mt19937::result_type> dist(0, 39);
+    uint32_t arr[40] = {2463534242, 2318261108, 2689770536, 4186217900, 2639618674, 4135555716, 1896594581, 4177280317, 2478510474, 3602047420, 3882214040, 154032322, 2797879757, 4165739712, 4105014704, 1752638874, 2838708547, 2531708157, 530608692, 2974239974, 4069141101, 2010153904, 1329470636, 2088033866, 2866862742, 2185350033, 3082432825, 2932971466, 1348648012, 3457442513, 3905963781, 3877125244, 1453965676, 83881019, 1280748377, 3148969384, 3231393822, 470576835, 3388582210, 2740827379};
+    return arr[dist(rng)];
+}
 
 /// Configuration information
 template <class K, int MAX_HEIGHT>
@@ -24,8 +44,7 @@ struct alignas(64) node {
 private:
     /// Got from synchrobench (p=0.5)
     int get_rand_level() {
-        // todo: initialize it with a seed?
-        static uint32_t y = 2463534242UL;
+        static thread_local uint32_t y = seed();
         y^=(y<<13);
         y^=(y>>17);
         y^=(y<<5);
@@ -148,7 +167,6 @@ private:
             }
         }
         if (prev_key != nullptr) *prev_key = previous_key;
-        REMUS_ASSERT(next_curr->key == key, "Fill cannot find the key {}", key);
         return next_curr;
     }
 
@@ -255,7 +273,7 @@ public:
                         if (old_height == curr->link_level){
                             raise_node(pool, curr->key, curr->height);
                             old_height = pool->template CompareAndSwap<uint64_t>(get_link_height_ptr(curr.remote_origin()), ULONG_MAX, curr->height);
-                            REMUS_ASSERT(old_height == ULONG_MAX, "I should be the only one to leave the critical section of raising");
+                            REMUS_ASSERT_DEBUG(old_height == ULONG_MAX, "I should be the only one to leave the critical section of raising");
                         }
                     }
                 }
