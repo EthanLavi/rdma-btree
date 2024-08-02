@@ -10,7 +10,13 @@ using namespace remus::rdma;
 using namespace std;
 
 class CountingPool {
+    struct AsyncJob {
+        rdma_ptr<uint64_t> org;
+        uint64_t new_val;
+        AsyncJob(rdma_ptr<uint64_t> org, uint64_t new_val) : org(org), new_val(new_val){}
+    };
     unordered_map<void*, int> allocat; // ptr to size
+    unordered_map<int, std::vector<AsyncJob>*> async_jobs;
     int total_allocations;
     int total_deallocations;
     bool locality;
@@ -92,6 +98,30 @@ public:
         }
         mu.unlock();
         return prev;
+    }
+
+    void CompareAndSwapAsync(rdma_ptr<uint64_t> ptr, rdma_ptr<uint64_t> result, uint64_t expected, uint64_t swap){
+        mu.lock();
+        if (async_jobs.find(ptr.id()) == async_jobs.end()){
+            async_jobs[ptr.id()] = new std::vector<AsyncJob>();
+        }        
+        uint64_t prev = *ptr;
+        async_jobs[ptr.id()]->push_back(AsyncJob(result, prev));
+        if (prev == expected){
+            *ptr = swap;
+        }
+        mu.unlock();
+    }
+
+    void Await(uint64_t id){
+        mu.lock();
+        // update the ptrs for sake of catching bugs if I try to use prealloc result immediately
+        if (async_jobs.find(id) != async_jobs.end()){
+            AsyncJob job = async_jobs[id]->back();
+            *job.org = job.new_val;
+            async_jobs[id]->pop_back();
+        }        
+        mu.unlock();
     }
 
     template <typename T>

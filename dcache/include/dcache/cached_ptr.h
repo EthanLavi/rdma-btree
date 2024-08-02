@@ -99,7 +99,7 @@ public:
 
     /// The pointer returned by this object lives as long as the object is alive
     /// If it returns from the cache, we might let the pointer live longer as it is readonly
-    rdma_ptr<T> get(){
+    const rdma_ptr<T> get(){
         return obj;
     }
 
