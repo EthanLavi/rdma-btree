@@ -85,8 +85,12 @@ public:
     int height;
     rdma_ptr<BNode> start;
 
-    void reset_lock(){
-      lock &= ~LOCK_BIT;
+    long version() const {
+      return lock & ~LOCK_BIT;
+    }
+
+    void increment_version(){
+      lock = (lock & ~LOCK_BIT) + 1;
     }
 
     void set_start_and_inc(rdma_ptr<BNode> new_start){
@@ -186,14 +190,15 @@ public:
 
     /// Checks if the version is valid
     bool is_valid(bool ignore_lock = false) const {
-      long base = last_line.version;
+      long base = key_lines[0].version;
       if (ignore_lock) base = base & ~LOCK_BIT;
-      for(int i = 0; i < KLINES; i++){
+      for(int i = 1; i < KLINES; i++){
         if (key_lines[i].version != base) return false;
       }
       for(int i = 0; i < VLINES; i++){
         if (value_lines[i].version != base) return false;
       }
+      if (last_line.version != base) return false;
       return true;
     }
 
@@ -423,11 +428,11 @@ private:
   /// Returns the key it overwrote
   inline K shift_down(BNode* bnode, int index){
     K original_key = bnode->key_at(index);
-    for(int i = index; i < SIZE - 2; i++){
+    for(int i = index; i < SIZE - 1; i++){
       bnode->set_key(i, bnode->key_at(i + 1));
     }
     bnode->set_key(SIZE - 1, SENTINEL); // reset last key slot
-    for(int i = index + 1; i < SIZE - 1; i++){
+    for(int i = index + 1; i < SIZE; i++){
       bnode->set_ptr(i, bnode->ptr_at(i + 1));
     }
     bnode->set_ptr(SIZE, nullptr);
@@ -470,7 +475,7 @@ private:
       cache->template Write<BNode>(new_parent, new_parent_local);
     }
 
-    parent.reset_lock();
+    parent.increment_version();
     node.increment_version(); // increment version before writing
 
     cache->template Write<BRoot>(parent_p.remote_origin(), parent);      
@@ -517,9 +522,8 @@ private:
       cache->template Write<BNode>(new_parent, new_parent_local);
     }
   
-    parent.reset_lock();
+    parent.increment_version();
     node.increment_version();
-
     cache->template Write<BRoot>(parent_p.remote_origin(), parent);
     cache->template Write<BLeaf>(node_p.remote_origin(), node);
   }
@@ -592,7 +596,6 @@ private:
     shift_up(&parent, bucket);
     parent.set_key(bucket, to_parent);
     parent.set_ptr(bucket + 1, static_cast<bnode_ptr>(new_neighbor));
-
     parent.increment_version();
     node.increment_version();
 
@@ -673,7 +676,7 @@ private:
       CachedObject<BLeaf> next_leaf = reliable_read<BLeaf>(static_cast<bleaf_ptr>(next_level), modifiable ? WILL_NEED_ACQUIRE : IGNORE_LOCK);
       if (modifiable){
         // failed to get locks, retraverse
-        if (!try_acquire<BRoot>(pool, curr_root.remote_origin(), 0)) return traverse(pool, key, modifiable, effect);
+        if (!try_acquire<BRoot>(pool, curr_root.remote_origin(), curr_root->version())) return traverse(pool, key, modifiable, effect);
         if (!try_acquire<BLeaf>(pool, next_leaf.remote_origin(), next_leaf->version())) {
           release<BRoot>(pool, curr_root.remote_origin(), 0);
           return traverse(pool, key, modifiable, effect);
@@ -701,7 +704,7 @@ private:
     CachedObject<BNode> parent;
     // if split, we updated the root and we need to retraverse
     if (modifiable && curr->key_at(SIZE - 1) != SENTINEL){
-      if (!try_acquire<BRoot>(pool, curr_root.remote_origin(), 0)) return traverse(pool, key, modifiable, effect);
+      if (!try_acquire<BRoot>(pool, curr_root.remote_origin(), curr_root->version())) return traverse(pool, key, modifiable, effect);
       if (!try_acquire<BNode>(pool, curr.remote_origin(), curr->version())) {
         release<BRoot>(pool, curr_root.remote_origin(), 0);
         return traverse(pool, key, modifiable, effect);
@@ -710,13 +713,13 @@ private:
       return traverse(pool, key, modifiable, effect);
     } else if (modifiable && curr->key_at(0) == SENTINEL){
       // Current is empty, remove a level
-      if (try_acquire<BRoot>(pool, curr_root.remote_origin(), 0)){
+      if (try_acquire<BRoot>(pool, curr_root.remote_origin(), curr_root->version())){
         if (try_acquire<BNode>(pool, curr.remote_origin(), curr->version())){
           // Update the root
           BRoot new_root = *curr_root;
           new_root.height--;
           new_root.start = curr->ptr_at(0);
-          new_root.reset_lock();
+          new_root.increment_version();
 
           cache->template Write<BRoot>(curr_root.remote_origin(), new_root);
           release<BNode>(pool, curr.remote_origin(), curr->version());
@@ -885,6 +888,7 @@ private:
             cache->template Write<BLeaf>(leaf.remote_origin(), empty_leaf);
             cache->template Write<BLeaf>(merging_leaf.remote_origin(), merged_leaf);
             cache->template Write<BNode>(curr.remote_origin(), parent_of_merge);
+            return leaf;
           } else {
             // modifiable so lock, update, write back
             BLeaf leaf_updated = *leaf;
@@ -1005,6 +1009,8 @@ public:
           new_leaf->set_key(i - 1, new_leaf->key_at(i));
           new_leaf->set_value(i - 1, new_leaf->value_at(i));
         }
+        // remove the old
+        new_leaf->set_key(SIZE - 1, SENTINEL);
       }
     }));
     ebr_leaf->match_version();

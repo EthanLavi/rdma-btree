@@ -207,6 +207,7 @@ public:
         return ExtendedRead(ptr, 1);
     }
 
+    // todo: add a prealloc that is for non-marked pointers!
     template <typename T>
     CachedObject<T> ExtendedRead(rdma_ptr<T> ptr, int size){
         // Periodically call try_free_some to cleanup limbo lists

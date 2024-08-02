@@ -196,7 +196,7 @@ inline void rdmask_run(BenchmarkParams& params, rdma_capability* capability, Rem
                 REMUS_DEBUG("Size (final) [{}]", final_size);
                 REMUS_DEBUG("Delta = {}", all_delta);
                 // debug print if everything is local for inspection? and is small enough
-                if (params.node_count == 1 && (params.key_ub - params.key_lb) < 1000) sk->debug();
+                if (params.node_count == 1 && (params.key_ub - params.key_lb) < 2000) sk->debug();
                 REMUS_ASSERT(final_size - all_delta == 0, "Initial size + delta ==? Final size");
             }
 

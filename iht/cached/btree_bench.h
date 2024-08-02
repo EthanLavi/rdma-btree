@@ -91,6 +91,8 @@ inline void btree_run(BenchmarkParams& params, rdma_capability* capability, Remo
             // Get pool
             rdma_capability_thread* pool = capability->RegisterThread();
             tcp::EndpointManager* endpoint = endpoint_managers[thread_index];
+            ebr_leaf->RegisterThread();
+            ebr_node->RegisterThread();
 
              // initialize thread's thread_local pool
             RemoteCache::pool = pool; 
@@ -155,8 +157,10 @@ inline void btree_run(BenchmarkParams& params, rdma_capability* capability, Remo
                 REMUS_DEBUG("Size (after populate) [{}]", populate_amount);
                 REMUS_DEBUG("Size (final) [{}]", final_size);
                 REMUS_DEBUG("Delta = {}", all_delta);
-                // REMUS_INFO("BTree is valid? {}", btree->valid());
-                // btree->debug();
+                if (params.node_count == 1 && (params.key_ub - params.key_lb) < 2000) {
+                    btree->debug();
+                    REMUS_INFO("BTree is valid? {}", btree->valid());
+                }
                 REMUS_ASSERT(final_size - all_delta == 0, "Initial size + delta ==? Final size");
             }
 

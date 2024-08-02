@@ -52,6 +52,7 @@ public:
         }
         at_version.store(0);
         cycles = 0;
+        // leaving my_version to be next_node_version at the start (looped to itself)
         next_node_version = my_version;
     }
 
@@ -141,12 +142,14 @@ public:
             if (v != new_version){ // actually I was the one that incremented the version
                 cycles = cycles + 1;
                 // write to the next async (we don't care when it completes, as long as it isn't lost)
-                pool->template Write<ebr_ref>(next_node_version, (ebr_ref) new_version, my_version, remus::rdma::internal::RDMAWriteWithNoAck);
+                // also don't write if we are linked to ourselves
+                if (next_node_version != my_version)
+                    pool->template Write<ebr_ref>(next_node_version, (ebr_ref) new_version, my_version, remus::rdma::internal::RDMAWriteWithNoAck);
             }
         }
     }
 
-    /// Requeue something that was pushed but wasn't used
+    /// Requeue something that was popped but wasn't used
     void requeue(rdma_ptr<T> obj){
         limbo->free_lists[0].load()->push(obj);
     }
@@ -199,6 +202,7 @@ public:
     }
 
     void destroy(capability* pool){
+        REMUS_ASSERT_DEBUG(limbo != nullptr, "Forgot to call RegisterThread");
         for(int i = 0; i < 3; i++){
             while(!limbo->free_lists[i].load()->empty()){
                 rdma_ptr<T> to_free = limbo->free_lists[i].load()->front();
@@ -212,12 +216,14 @@ public:
 
     /// Requeue something that was pushed but wasn't used
     void requeue(rdma_ptr<T> obj){
+        REMUS_ASSERT_DEBUG(limbo != nullptr, "Forgot to call RegisterThread");
         int first_index = ebr->cycles % 3;
         limbo->free_lists[0].load()->push(obj);
     }
 
     /// Technically, this method shouldn't be used since the queues being rotated enable it to be single producer, single consumer
     void deallocate(rdma_ptr<T> obj){
+        REMUS_ASSERT_DEBUG(limbo != nullptr, "Forgot to call RegisterThread");
         int last_index = (ebr->cycles + 2) % 3;
         limbo->free_lists[last_index].load()->push(obj); // add to the free list
     }
@@ -225,6 +231,7 @@ public:
     /// Allocate from the pool. Might allocate locally using the pool but not guaranteed (could be a remote!)
     /// Guaranteed via EBR to be exclusive
     rdma_ptr<T> allocate(){
+        REMUS_ASSERT_DEBUG(limbo != nullptr, "Forgot to call RegisterThread");
         int first_index = ebr->cycles % 3;
         if (limbo->free_lists[first_index].load()->empty()){
             return pool->template Allocate<T>();

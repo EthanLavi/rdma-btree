@@ -59,6 +59,11 @@ public:
     rdma_ptr<T> ExtendedRead(rdma_ptr<T> p, int size, rdma_ptr<T> prealloc = nullptr){
         if (p == nullptr) {
             REMUS_ERROR("p is a nullptr");
+            abort();
+        }
+        if (prealloc == p){
+            REMUS_ERROR("prealloc == p (read)");
+            abort();
         }
         if (prealloc == nullptr){
             rdma_ptr<T> p_new = Allocate<T>(size);
@@ -77,6 +82,10 @@ public:
 
     template <typename T>
     void Write(rdma_ptr<T> ptr, const T& val, rdma_ptr<T> prealloc = nullptr, internal::RDMAWriteBehavior write_behavior = internal::RDMAWriteWithAck){
+        if (prealloc == ptr){
+            REMUS_ERROR("prealloc == p (write)");
+            abort();
+        }
         mu.lock();
         if (prealloc == nullptr){
             // removed the un-necessary allocate and deallocate step...

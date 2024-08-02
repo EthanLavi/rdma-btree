@@ -105,7 +105,7 @@ int main(int argc, char **argv) {
     if (params.structure == "iht"){
         iht_run(params, capability, cache, host, self);
     } else if (params.structure == "btree"){
-        btree_run(params, capability, cache, host, self);
+        btree_run(params, capability, cache, host, self, peers);
     } else if (params.structure == "skiplist"){
         rdmask_run(params, capability, cache, host, self, peers);
     } else {
