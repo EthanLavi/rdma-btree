@@ -11,11 +11,10 @@ int main(int argc, char* argv[]){
     }
     std::string structure(argv[1]);
     Peer peer = Peer();
-    BenchmarkParams params = BenchmarkParams();
     if (structure == "btree" || structure == "b")
-        btree_run_local(params, nullptr, nullptr, peer, peer);
+        btree_run_local(peer);
     else if (structure == "rdmask" || structure == "sk")
-        rdmask_run_local(params, nullptr, nullptr, peer, peer);
+        rdmask_run_local(peer);
     else
         REMUS_ERROR("No valid structure [btree|b OR rdmask|sk]");
 }

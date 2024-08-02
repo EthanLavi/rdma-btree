@@ -52,7 +52,6 @@ public:
         }
         at_version.store(0);
         cycles = 0;
-        // todo: delete? (until init is called, it's self-ebr)
         next_node_version = my_version;
     }
 
@@ -154,7 +153,6 @@ public:
 
     /// Technically, this method shouldn't be used since the queues being rotated enable it to be single producer, single consumer
     void deallocate(rdma_ptr<T> obj){
-        REMUS_INFO("Deallocating {}", obj);
         limbo->free_lists[2].load()->push(obj); // add to the free list
     }
 
@@ -220,7 +218,6 @@ public:
 
     /// Technically, this method shouldn't be used since the queues being rotated enable it to be single producer, single consumer
     void deallocate(rdma_ptr<T> obj){
-        REMUS_INFO("Deallocating (inner) {}", obj);
         int last_index = (ebr->cycles + 2) % 3;
         limbo->free_lists[last_index].load()->push(obj); // add to the free list
     }

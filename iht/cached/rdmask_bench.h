@@ -24,6 +24,7 @@
 using namespace remus::util;
 using namespace remus::rdma;
 
+// todo: increment size here! log2(keyspace)
 typedef RdmaSkipList<int, 7, INT_MIN, ULONG_MAX, ULONG_MAX - 1, rdma_capability_thread> RDMASK;
 typedef RdmaSkipList<int, 7, INT_MIN, ULONG_MAX, ULONG_MAX - 1, CountingPool> RDMASKLocal;
 typedef node<int, 7> Node;
@@ -194,7 +195,8 @@ inline void rdmask_run(BenchmarkParams& params, rdma_capability* capability, Rem
                 REMUS_DEBUG("Size (after populate) [{}]", populate_amount);
                 REMUS_DEBUG("Size (final) [{}]", final_size);
                 REMUS_DEBUG("Delta = {}", all_delta);
-                // sk->debug(); // todo: REMOVE WHEN NODE COUNT IS LARGER THAN 1
+                // debug print if everything is local for inspection? and is small enough
+                if (params.node_count == 1 && (params.key_ub - params.key_lb) < 1000) sk->debug();
                 REMUS_ASSERT(final_size - all_delta == 0, "Initial size + delta ==? Final size");
             }
 
@@ -217,8 +219,7 @@ inline void rdmask_run(BenchmarkParams& params, rdma_capability* capability, Rem
     save_result("skiplist_result.csv", workload_results, params, params.thread_count - 1);
 }
 
-// todo: clean local arguments
-inline void rdmask_run_local(BenchmarkParams& params, rdma_capability* capability, RemoteCache* cache, Peer& host, Peer& self){
+inline void rdmask_run_local(Peer& self){
     CountingPool* pool = new CountingPool(true);
     RemoteCacheImpl<CountingPool>* cach = new RemoteCacheImpl<CountingPool>(pool);
     RemoteCacheImpl<CountingPool>::pool = pool; // set pool to other pool so we acccept our own cacheline

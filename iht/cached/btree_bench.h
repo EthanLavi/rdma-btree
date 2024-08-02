@@ -26,7 +26,7 @@ using namespace remus::rdma;
 typedef RdmaBPTree<int, 3, rdma_capability_thread> BTree; // todo : increment size
 typedef RdmaBPTree<int, 3, CountingPool> BTreeLocal;
 
-inline void btree_run(BenchmarkParams& params, rdma_capability* capability, RemoteCache* cache, Peer& host, Peer& self){
+inline void btree_run(BenchmarkParams& params, rdma_capability* capability, RemoteCache* cache, Peer& host, Peer& self, std::vector<Peer> peers){
     // Create a list of client and server  threads
     std::vector<std::thread> threads;
     if (params.node_id == 0){
@@ -41,7 +41,7 @@ inline void btree_run(BenchmarkParams& params, rdma_capability* capability, Remo
 
             // Create a root ptr to the IHT
             Peer p = Peer();
-            BTree btree = BTree(p, CacheDepth::None, cache, pool, true);
+            BTree btree = BTree(p, CacheDepth::None, cache, pool, nullptr, nullptr, true);
             rdma_ptr<anon_ptr> root_ptr = btree.InitAsFirst(pool);
             // Send the root pointer over
             tcp::message ptr_message = tcp::message(root_ptr.raw());
@@ -71,6 +71,18 @@ inline void btree_run(BenchmarkParams& params, rdma_capability* capability, Remo
     // If the endpoint cant connect, it will just wait and retry later
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
+    /// Create an ebr object
+    using EBRLeaf = EBRObjectPool<BTree::BLeaf, 100, rdma_capability_thread>;
+    using EBRNode = EBRObjectPoolAccompany<BTree::BNode, BTree::BLeaf, 100, rdma_capability_thread>;
+    auto ebr_pool = capability->RegisterThread();
+    EBRLeaf* ebr_leaf = new EBRLeaf(ebr_pool, params.thread_count);
+    for(int i = 0; i < peers.size(); i++){
+        REMUS_INFO("Peer({}, {}, {})", peers.at(i).id, peers.at(i).address, peers.at(i).port);
+    }
+    ebr_leaf->Init(capability, self.id, peers);
+    REMUS_INFO("Init ebr");
+    EBRNode* ebr_node = new EBRNode(ebr_pool, ebr_leaf);
+
     // Barrier to start all the clients at the same time
     std::barrier client_sync = std::barrier(params.thread_count);
     WorkloadDriverResult workload_results[params.thread_count];
@@ -89,7 +101,7 @@ inline void btree_run(BenchmarkParams& params, rdma_capability* capability, Remo
             }));
             cache->init(peer_roots);
 
-            std::shared_ptr<BTree> btree = std::make_shared<BTree>(self, params.cache_depth, cache, pool, false);
+            std::shared_ptr<BTree> btree = std::make_shared<BTree>(self, params.cache_depth, cache, pool, ebr_leaf, ebr_node);
             // Get the data from the server to init the btree
             tcp::message ptr_message;
             endpoint->recv_server(&ptr_message);
@@ -117,7 +129,6 @@ inline void btree_run(BenchmarkParams& params, rdma_capability* capability, Remo
                     delta += btree->populate(pool, op_count, key_lb, key_ub, [=](int key){ return key; });
                     ExperimentManager::ClientArriveBarrier(endpoint);
                     populate_amount = btree->count(pool);
-                    // todo: warm up the cache?
                     ExperimentManager::ClientArriveBarrier(endpoint);
                     cache->print_metrics();
                     cache->reset_metrics();
@@ -166,60 +177,69 @@ inline void btree_run(BenchmarkParams& params, rdma_capability* capability, Remo
     delete_endpoints(endpoint_managers, params);
 
     save_result("btree_result.csv", workload_results, params, params.thread_count);
-    // todo: optimize using a built-in flag into cachedobject so that we can skip verification
 }
 
-inline void btree_run_local(BenchmarkParams& params, rdma_capability* capability, RemoteCache* cache, Peer& host, Peer& self){
-    CountingPool* pool = new CountingPool(false);
+inline void btree_run_local(Peer& self){
+    CountingPool* pool = new CountingPool(true);
     RemoteCacheImpl<CountingPool>* cach = new RemoteCacheImpl<CountingPool>(pool);
     RemoteCacheImpl<CountingPool>::pool = pool; // set pool to other pool so we acccept our own cacheline
 
-    BTreeLocal tree = BTreeLocal(self, CacheDepth::RootOnly, cach, pool, true);
+    using EBRLeaf = EBRObjectPool<BTreeLocal::BLeaf, 100, CountingPool>;
+    using EBRNode = EBRObjectPoolAccompany<BTreeLocal::BNode, BTreeLocal::BLeaf, 100, CountingPool>;
+    EBRLeaf* ebr_leaf = new EBRLeaf(pool, 1);
+    EBRNode* ebr_node = new EBRNode(pool, ebr_leaf);
+    ebr_leaf->RegisterThread();
+    ebr_node->RegisterThread();
+
+    BTreeLocal tree = BTreeLocal(self, CacheDepth::RootOnly, cach, pool, ebr_leaf, ebr_node, true);
     rdma_ptr<anon_ptr> ptr = tree.InitAsFirst(pool);
     REMUS_INFO("DONE INIT");
 
-    // for(int i = 0; i < 1000; i++){
-    //     REMUS_INFO("Insert({}, {}) = {}", i, i, tree.insert(pool, i, i).value_or(-1));
-    //     for(int j = 0; j < i; j++){
-    //         int val = tree.contains(pool, j).value_or(-1);
-    //         if (val != j)
-    //             tree.debug();
-    //         REMUS_ASSERT(val == j, "Contains({}) is valid", j);
-    //     }
-    // }
-
-    // tree.populate(pool, 20, 0, 50, std::function([=](int x){ return x; }));
-    // tree.debug();
-    // REMUS_INFO("Count = {}", tree.count(pool));
-
-    // int second_cnt = 0;
-    // for(int i = 0; i <= 5000; i++){
-    //     if (tree.contains(pool, i).value_or(-1) == i) second_cnt++;
-    // }
-    // REMUS_INFO("Contain = {}", second_cnt);
-    
-    const int THREAD_COUNT = 40;
-    std::vector<std::thread> threads;
-    std::barrier<> barr(THREAD_COUNT);
-    for(int tid = 0; tid != THREAD_COUNT; tid++){
-        threads.push_back(std::thread([&](int start){
-            barr.arrive_and_wait();
-            RemoteCacheImpl<CountingPool>::pool = pool;
-            BTreeLocal tree_tlocal = BTreeLocal(self, CacheDepth::RootOnly, cach, pool, false);
-            tree_tlocal.InitFromPointer(ptr);
-            tree_tlocal.populate(pool, 250, 0, 20000, std::function([=](int x){ return x; }));
-        }, tid));
+    for(int i = 50; i >= 0; i--){
+        tree.insert(pool, i, i);
     }
-    for(int tid = 0; tid != THREAD_COUNT; tid++){
-        threads.at(tid).join();
+
+    REMUS_INFO("Count = {}", tree.count(pool));
+
+    int second_cnt = 0;
+    for(int i = 0; i <= 5000; i++){
+        if (tree.contains(pool, i).value_or(-1) == i) second_cnt++;
     }
+    REMUS_INFO("Contain = {}", second_cnt);
+
+    for(int i = 50; i >= 0; i--){
+        tree.remove(pool, i);
+        tree.remove(pool, i); // do twice to cause a removal
+    }
+
+    REMUS_INFO(tree.contains(pool, 0).value_or(-1));
+
+    // const int THREAD_COUNT = 1;
+    // std::vector<std::thread> threads;
+    // std::barrier<> barr(THREAD_COUNT);
+    // for(int tid = 0; tid != THREAD_COUNT; tid++){
+    //     threads.push_back(std::thread([&](int start){
+    //         barr.arrive_and_wait();
+    //         RemoteCacheImpl<CountingPool>::pool = pool;
+    //         BTreeLocal tree_tlocal = BTreeLocal(self, CacheDepth::RootOnly, cach, pool, false);
+    //         tree_tlocal.InitFromPointer(ptr);
+    //         tree_tlocal.populate(pool, 20, 0, 2000, std::function([=](int x){ return x; }));
+    //     }, tid));
+    // }
+    // for(int tid = 0; tid != THREAD_COUNT; tid++){
+    //     threads.at(tid).join();
+    // }
     tree.debug();
+    
     REMUS_INFO("Tree is valid? {}", tree.valid());
-
+    REMUS_INFO("Done!");
     cach->free_all_tmp_objects();
+    ebr_leaf->destroy(pool);
+    ebr_node->destroy(pool);
     tree.destroy(pool);
-    // if (!pool->HasNoLeaks()){
-    //     pool->debug();
-    //     REMUS_FATAL("Leaked memory");
-    // }
+    delete cach;
+    if (!pool->HasNoLeaks()){
+        pool->debug();
+        REMUS_FATAL("Leaked memory");
+    }
 }
