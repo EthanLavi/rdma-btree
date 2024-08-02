@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <climits>
 #include <cstdint>
 #include <ostream>
@@ -25,6 +24,16 @@ typedef int32_t K;
 static const K SENTINEL = INT_MAX;
 
 static const bool ADDR = false;
+
+/*
+todo
+
+Run btree and skiplist on RDMA since they underwent significant changes!
+1) Optimize using a built-in flag into cachedobject so that we can skip verification
+2) Optimize write behaviors
+3) Caching
+4) Prealloc?
+*/
 
 template <class V, int DEGREE, class capability> class RdmaBPTree {
   /// SIZE is DEGREE * 2
@@ -109,8 +118,9 @@ public:
     }
 
     /// Checks if the version is valid
-    bool is_valid() const {
+    bool is_valid(bool ignore_lock = false) const {
       long base = key_lines[0].version;
+      if (ignore_lock) base = base & ~LOCK_BIT;
       for(int i = 0; i < KLINES; i++){
         if (key_lines[i].version != base) return false;
       }
@@ -175,8 +185,9 @@ public:
     }
 
     /// Checks if the version is valid
-    bool is_valid() const { // todo: lockfree traversal shouldn't wait while a node is locked! (have to ignore lock bit)
+    bool is_valid(bool ignore_lock = false) const {
       long base = last_line.version;
+      if (ignore_lock) base = base & ~LOCK_BIT;
       for(int i = 0; i < KLINES; i++){
         if (key_lines[i].version != base) return false;
       }
@@ -297,22 +308,32 @@ private:
     pool->template Write<uint64_t>(static_cast<rdma_ptr<uint64_t>>(unmark_ptr(node)), version, temp_lock);
   }
 
+  enum ReadBehavior {
+    IGNORE_LOCK = 0,
+    LOOK_FOR_SPLIT_MERGE = 1,
+    WILL_NEED_ACQUIRE = 2,
+  };
+
+  // todo: mark cached obj as valid to avoid the check?
   template <class ptr_t>
-  inline CachedObject<ptr_t> reliable_read(rdma_ptr<ptr_t> node){
+  inline CachedObject<ptr_t> reliable_read(rdma_ptr<ptr_t> node, ReadBehavior behavior){
     CachedObject<ptr_t> obj = cache->template Read<ptr_t>(node);
-    while(!obj->is_valid()){
-      obj = cache->template Read<ptr_t>(node);
+    if (behavior == IGNORE_LOCK){
+      while(!obj->is_valid(true)){
+        obj = cache->template Read<ptr_t>(node);
+      }
+    } else if (behavior == LOOK_FOR_SPLIT_MERGE) {
+      bool should_ignore_lock = (obj->key_at(SIZE - 1) != SENTINEL) || (obj->key_at(0) == SENTINEL);
+      while(!obj->is_valid(should_ignore_lock)){
+        obj = cache->template Read<ptr_t>(node);
+        should_ignore_lock = (obj->key_at(SIZE - 1) != SENTINEL) || (obj->key_at(0) == SENTINEL);
+      }
+    } else { // WILL_NEED_ACQUIRE
+      while(!obj->is_valid(false)){
+        obj = cache->template Read<ptr_t>(node);
+      }
     }
     return obj;
-  }
-
-  /// Allocate a middle layer node
-  static bnode_ptr allocate_bnode(capability* pool){
-    REMUS_ASSERT(56 % sizeof(V) == 0, "V must be a multiple of 2,4,8,14,28,56");
-    bnode_ptr bnode = pool->template Allocate<BNode>();
-    REMUS_INFO("BNode allocated = {}", bnode);
-    *bnode = BNode();
-    return bnode;
   }
 
   /// Return the first index where the provided key is less than the element at that index 
@@ -413,23 +434,41 @@ private:
     return original_key;
   }
 
-  // todo; mark ptr
+  // todo: mark ptr
   /// At root
   void split_node(capability* pool, CachedObject<BRoot>& parent_p, CachedObject<BNode>& node_p){
     BRoot parent = *parent_p;
     BNode node = *node_p;
 
     // Full node so split
-    bnode_ptr new_parent = allocate_bnode(pool);
+    bnode_ptr new_parent = ebr_node->allocate();
     parent.set_start_and_inc(new_parent);
 
-    bnode_ptr new_neighbor = allocate_bnode(pool);
-    K to_parent = split_keys<BNode*, bnode_ptr>(&node, new_neighbor, true);
-    split_ptrs(&node, (BNode*) new_neighbor);
+    bnode_ptr new_neighbor = ebr_node->allocate();
+    K to_parent;
+    if (pool->template is_local(new_neighbor)){
+      *new_neighbor = BNode();
+      to_parent = split_keys<BNode*, bnode_ptr>(&node, new_neighbor, true);
+      split_ptrs(&node, (BNode*) new_neighbor);
+    } else {
+      BNode new_neighbor_local = BNode();
+      to_parent = split_keys<BNode*, BNode*>(&node, &new_neighbor_local, true);
+      split_ptrs(&node, &new_neighbor_local);
+      cache->template Write<BNode>(new_neighbor, new_neighbor_local);
+    }
 
-    new_parent->set_key(0, to_parent);
-    new_parent->set_ptr(0, node_p.remote_origin());
-    new_parent->set_ptr(1, new_neighbor);
+    if (pool->template is_local(new_parent)){
+      *new_parent = BNode();
+      new_parent->set_key(0, to_parent);
+      new_parent->set_ptr(0, node_p.remote_origin());
+      new_parent->set_ptr(1, new_neighbor);
+    } else {
+      BNode new_parent_local = BNode();
+      new_parent_local.set_key(0, to_parent);
+      new_parent_local.set_ptr(0, node_p.remote_origin());
+      new_parent_local.set_ptr(1, new_neighbor);
+      cache->template Write<BNode>(new_parent, new_parent_local);
+    }
 
     parent.reset_lock();
     node.increment_version(); // increment version before writing
@@ -444,23 +483,40 @@ private:
     BLeaf node = *node_p;
 
     // Full node so split
-    bnode_ptr new_parent = allocate_bnode(pool);
+    bnode_ptr new_parent = ebr_node->allocate();
     parent.set_start_and_inc(new_parent);
 
-    bleaf_ptr new_neighbor = pool->template Allocate<BLeaf>();
-    *new_neighbor = BLeaf();
-
-    K to_parent = split_keys<BLeaf*, bleaf_ptr>(&node, new_neighbor, false);
-    split_values(&node, (BLeaf*) new_neighbor);
-    node.set_next(new_neighbor);
+    bleaf_ptr new_neighbor = ebr_leaf->allocate();
+    K to_parent;
     K key_low = node.key_low(), key_high = node.key_high();
+    if (pool->template is_local(new_neighbor)){
+      *new_neighbor = BLeaf();
+      to_parent = split_keys<BLeaf*, bleaf_ptr>(&node, new_neighbor, false);
+      split_values(&node, (BLeaf*) new_neighbor);
+      new_neighbor->set_range(to_parent, key_high);
+    } else {
+      BLeaf new_leaf = BLeaf();
+      to_parent = split_keys<BLeaf*, BLeaf*>(&node, &new_leaf, false);
+      split_values(&node, &new_leaf);
+      new_leaf.set_range(to_parent, key_high);
+      cache->template Write<BLeaf>(new_neighbor, new_leaf); // todo: prealloc?
+    }
+    node.set_next(new_neighbor);
     node.set_range(key_low, to_parent);
-    new_neighbor->set_range(to_parent, key_high);
 
-    new_parent->set_key(0, to_parent);
-    new_parent->set_ptr(0, static_cast<bnode_ptr>(node_p.remote_origin()));
-    new_parent->set_ptr(1, static_cast<bnode_ptr>(new_neighbor));
-
+    if (pool->template is_local(new_parent)){
+      *new_parent = BNode();
+      new_parent->set_key(0, to_parent);
+      new_parent->set_ptr(0, static_cast<bnode_ptr>(node_p.remote_origin()));
+      new_parent->set_ptr(1, static_cast<bnode_ptr>(new_neighbor));
+    } else {
+      BNode new_parent_local = BNode();
+      new_parent_local.set_key(0, to_parent);
+      new_parent_local.set_ptr(0, static_cast<bnode_ptr>(node_p.remote_origin()));
+      new_parent_local.set_ptr(1, static_cast<bnode_ptr>(new_neighbor));
+      cache->template Write<BNode>(new_parent, new_parent_local);
+    }
+  
     parent.reset_lock();
     node.increment_version();
 
@@ -474,12 +530,21 @@ private:
     BNode node = *node_p;
     
     // Full node so split
-    bnode_ptr new_neighbor = allocate_bnode(pool);
-    K to_parent = split_keys<BNode*, bnode_ptr>(&node, new_neighbor, true);
-    split_ptrs(&node, (BNode*) new_neighbor);
+    bnode_ptr new_neighbor = ebr_node->allocate();
+    K to_parent;
+    if (pool->template is_local(new_neighbor)){
+      *new_neighbor = BNode();
+      to_parent = split_keys<BNode*, bnode_ptr>(&node, new_neighbor, true);
+      split_ptrs(&node, (BNode*) new_neighbor);
+    } else {
+      BNode new_neighbor_local = BNode();
+      to_parent = split_keys<BNode*, BNode*>(&node, &new_neighbor_local, true);
+      split_ptrs(&node, &new_neighbor_local);
+      cache->template Write<BNode>(new_neighbor, new_neighbor_local);
+    }
 
     int bucket = search_node<BNode>(parent_p, to_parent);
-    REMUS_ASSERT(bucket != -1, "Implies a full parent");
+    REMUS_ASSERT_DEBUG(bucket != -1, "Implies a full parent");
 
     shift_up(&parent, bucket);
     parent.set_key(bucket, to_parent);
@@ -498,19 +563,28 @@ private:
     BLeaf node = *node_p;
 
     // Full node so split
-    bleaf_ptr new_neighbor = pool->template Allocate<BLeaf>();
-    *new_neighbor = BLeaf();
-
-    K to_parent = split_keys<BLeaf*, bleaf_ptr>(&node, new_neighbor, false);
-    split_values(&node, (BLeaf*) new_neighbor);
-    new_neighbor->set_next(node.get_next());
-    node.set_next(new_neighbor);
-    
+    bleaf_ptr new_neighbor = ebr_leaf->allocate();
+    K to_parent;
     K key_low = node.key_low(), key_high = node.key_high();
+    
+    if (pool->template is_local(new_neighbor)){
+      *new_neighbor = BLeaf();
+      to_parent = split_keys<BLeaf*, bleaf_ptr>(&node, new_neighbor, false);
+      split_values(&node, (BLeaf*) new_neighbor);
+      new_neighbor->set_next(node.get_next());
+      new_neighbor->set_range(to_parent, key_high);
+      new_neighbor->lock(); // start locked
+    } else {
+      BLeaf new_leaf = BLeaf();
+      to_parent = split_keys<BLeaf*, BLeaf*>(&node, &new_leaf, false);
+      split_values(&node, &new_leaf);
+      new_leaf.set_next(node.get_next());
+      new_leaf.set_range(to_parent, key_high);
+      new_leaf.lock(); // start locked
+      cache->template Write<BLeaf>(new_neighbor, new_leaf); // todo: prealloc?
+    }
+    node.set_next(new_neighbor);
     node.set_range(key_low, to_parent);
-    new_neighbor->set_range(to_parent, key_high);
-  
-    new_neighbor->lock(); // start locked
 
     int bucket = search_node<BNode>(parent_p, to_parent);
     REMUS_ASSERT(bucket != -1, "Implies a full parent");
@@ -531,11 +605,10 @@ private:
   /// Combine two neighboring bnodes in either order. Also modify the parent
   /// Returns true if deallocating one instead of two
   bool merge_node(BNode* node_one, int bucket_one, BNode* node_two, int bucket_two, BNode* parent){
-    // todo: REMUS_ASSERT_DEBUG? for performance
-    REMUS_ASSERT(node_one->key_at(1) == SENTINEL && node_two->key_at(SIZE - 1) == SENTINEL, "Space is assured");
+    REMUS_ASSERT_DEBUG(node_one->key_at(1) == SENTINEL && node_two->key_at(SIZE - 1) == SENTINEL, "Space is assured");
     bool one_gone = bucket_one != 0;
     if (bucket_one != 0){
-      REMUS_ASSERT(bucket_two == bucket_one - 1, "Sanity check");
+      REMUS_ASSERT_DEBUG(bucket_two == bucket_one - 1, "Sanity check");
       std::swap(node_one, node_two);
       std::swap(bucket_one, bucket_two);
     }
@@ -558,11 +631,10 @@ private:
   /// Combine two neighboring leafs in either order. Also modify the parent
   /// Returns true if deallocating one instead of two
   bool merge_leaf(BLeaf* leaf_one, int bucket_one, BLeaf* leaf_two, int bucket_two, BNode* parent){
-    // todo: REMUS_ASSERT_DEBUG? for performance
-    REMUS_ASSERT(leaf_one->key_at(1) == SENTINEL && leaf_two->key_at(SIZE - 1) == SENTINEL, "Space is assured");
+    REMUS_ASSERT_DEBUG(leaf_one->key_at(1) == SENTINEL && leaf_two->key_at(SIZE - 1) == SENTINEL, "Space is assured");
     bool one_gone = bucket_one != 0;
     if (bucket_one != 0){
-      REMUS_ASSERT(bucket_two == bucket_one - 1, "Sanity check");
+      REMUS_ASSERT_DEBUG(bucket_two == bucket_one - 1, "Sanity check");
       std::swap(leaf_one, leaf_two);
       std::swap(bucket_one, bucket_two);
     }
@@ -583,22 +655,22 @@ private:
   inline bnode_ptr read_level(BNode* curr, int bucket){
     bnode_ptr next_level = curr->ptr_at(SIZE);
     if (bucket != -1) next_level = curr->ptr_at(bucket);
-    REMUS_ASSERT(next_level != nullptr, "Accessing SENTINEL's ptr");
+    REMUS_ASSERT_DEBUG(next_level != nullptr, "Accessing SENTINEL's ptr");
     return next_level;
   }
 
   // compiling with optimizations turned on breaks correctness
   CachedObject<BLeaf> traverse(capability* pool, K key, bool modifiable, function<void(BLeaf*, int)> effect, int it_counter = 0){
-    REMUS_ASSERT(it_counter < 10, "Infinite recursion detected");
+    REMUS_ASSERT(it_counter < 1000, "Too many retries! Infinite recursion detected?");
   
     // read root first
     CachedObject<BRoot> curr_root = cache->template Read<BRoot>(root);
     int height = curr_root->height;
     bnode_ptr next_level = curr_root->start;
-    REMUS_ASSERT(next_level != nullptr, "Accessing SENTINEL's ptr");
+    REMUS_ASSERT_DEBUG(next_level != nullptr, "Accessing SENTINEL's ptr");
 
     if (height == 0){
-      CachedObject<BLeaf> next_leaf = reliable_read<BLeaf>(static_cast<bleaf_ptr>(next_level));
+      CachedObject<BLeaf> next_leaf = reliable_read<BLeaf>(static_cast<bleaf_ptr>(next_level), modifiable ? WILL_NEED_ACQUIRE : IGNORE_LOCK);
       if (modifiable){
         // failed to get locks, retraverse
         if (!try_acquire<BRoot>(pool, curr_root.remote_origin(), 0)) return traverse(pool, key, modifiable, effect);
@@ -625,7 +697,7 @@ private:
     } // if statement returns
 
     // Traverse bnode until bleaf
-    CachedObject<BNode> curr = reliable_read<BNode>(next_level);
+    CachedObject<BNode> curr = reliable_read<BNode>(next_level, modifiable ? LOOK_FOR_SPLIT_MERGE : IGNORE_LOCK);
     CachedObject<BNode> parent;
     // if split, we updated the root and we need to retraverse
     if (modifiable && curr->key_at(SIZE - 1) != SENTINEL){
@@ -663,7 +735,7 @@ private:
 
       // Read it as a BNode
       parent = std::move(curr);
-      curr = reliable_read(next_level);
+      curr = reliable_read<BNode>(next_level, modifiable ? LOOK_FOR_SPLIT_MERGE : IGNORE_LOCK);
       if (modifiable && curr->key_at(SIZE - 1) != SENTINEL) {
         if (try_acquire<BNode>(pool, parent.remote_origin(), parent->version())) {
           if (try_acquire<BNode>(pool, curr.remote_origin(), curr->version())) {
@@ -675,7 +747,7 @@ private:
           }
         }
         // re-read the parent and continue
-        curr = reliable_read(parent.remote_origin());
+        curr = reliable_read<BNode>(parent.remote_origin(), modifiable ? LOOK_FOR_SPLIT_MERGE : IGNORE_LOCK);
         bucket = search_node<BNode>(curr, key);
         continue;
       } else if (modifiable && curr->key_at(0) == SENTINEL && parent->key_at(0) != SENTINEL){
@@ -689,7 +761,7 @@ private:
           merge_node_ptr = read_level((BNode*) parent.get(), bucket - 1);
           bucket_neighbor = bucket - 1;
         }
-        CachedObject<BNode> merging_node = reliable_read<BNode>(merge_node_ptr);
+        CachedObject<BNode> merging_node = reliable_read<BNode>(merge_node_ptr, WILL_NEED_ACQUIRE);
         if (merging_node->key_at(SIZE - 1) == SENTINEL){ // there is room in neighbor for the ptr
           if (try_acquire<BNode>(pool, parent.remote_origin(), parent->version())) {
             if (try_acquire<BNode>(pool, curr.remote_origin(), curr->version())) {
@@ -732,7 +804,7 @@ private:
 
     // Read it as a BLeaf
     bleaf_ptr next_leaf = static_cast<bleaf_ptr>(next_level);
-    CachedObject<BLeaf> leaf = reliable_read<BLeaf>(next_leaf);
+    CachedObject<BLeaf> leaf = reliable_read<BLeaf>(next_leaf, modifiable ? WILL_NEED_ACQUIRE : IGNORE_LOCK);
     if (!leaf->key_in_range(key)){
       // key is out of the range, we traversed wrong
       return traverse(pool, key, modifiable, effect, it_counter + 1);
@@ -746,18 +818,20 @@ private:
           if (leaf->key_at(SIZE - 1) != SENTINEL){
             // should split
             BLeaf leaf_updated = split_node(pool, curr, leaf);
-            next_leaf = leaf_updated.get_next(); // next_leaf is local and readonly since we left it locked
+            next_leaf = leaf_updated.get_next(); // next_leaf is readonly since we left it locked
             bucket = search_node<BLeaf>(&leaf_updated, key);
-            if (bucket == -1 || leaf_updated.key_at(bucket) == SENTINEL) {
+            if (!leaf_updated.key_in_range(key)) {
               // key goes into next
               cache->template Write<BLeaf>(leaf.remote_origin(), leaf_updated); // write and unlock the prev
-              effect(next_leaf.get(), search_node<BLeaf>(next_leaf.get(), key)); // modify the next
-              atomic_thread_fence(memory_order::seq_cst);
-              next_leaf->unlock();
+              CachedObject<BLeaf> next_leaf_local_const = reliable_read<BLeaf>(next_leaf, IGNORE_LOCK);
+              BLeaf next_leaf_local = *next_leaf_local_const;
+              effect(&next_leaf_local, search_node<BLeaf>(next_leaf_local_const, key)); // modify the next
+              next_leaf_local.increment_version();
+              cache->template Write<BLeaf>(next_leaf, next_leaf_local);
               return leaf;
             } else {
               // key goes into current, unlock next
-              next_leaf->unlock();
+              release<BLeaf>(pool, next_leaf, 0);
               effect(&leaf_updated, bucket);
               cache->template Write<BLeaf>(leaf.remote_origin(), leaf_updated);
               return leaf;
@@ -777,13 +851,13 @@ private:
             CachedObject<BLeaf> merging_leaf;
             bool do_merge = true;
             while(true){ // aggressively acquire the node since we only compete with simple insert/remove
-              merging_leaf = reliable_read<BLeaf>(merge_leaf_ptr);
+              merging_leaf = reliable_read<BLeaf>(merge_leaf_ptr, WILL_NEED_ACQUIRE);
               if (merging_leaf->key_at(SIZE - 1) != SENTINEL) {
                 do_merge = false; // give up because merging will cause inserts to fail!
                 break;
               }
+              // ? if we add linearizable range queries, we prob need to re-traverse instead to prevent deadlock!
               if (try_acquire(pool, merging_leaf.remote_origin(), merging_leaf->version())) break;
-              // todo: if we add linearizable range queries, we prob need to re-traverse to prevent deadlock!
             }
 
             if (!do_merge){
@@ -840,7 +914,7 @@ public:
       REMUS_INFO("Struct Memory (BNode): {} % 64 = {}", sizeof(BNode), sizeof(BNode) % 64);
       REMUS_INFO("Struct Memory (BLeaf): {} % 64 = {}", sizeof(BLeaf), sizeof(BLeaf) % 64);
     }
-    temp_lock = pool->template Allocate<uint64_t>(8); // todo: undo 8
+    temp_lock = pool->template Allocate<uint64_t>(8); // allocates 8 to ensure size of object=64
   };
 
   /// Free all the resources associated with the IHT
@@ -859,6 +933,7 @@ public:
   /// @param pool the capability to init the IHT with
   /// @return the iht root pointer
   rdma_ptr<anon_ptr> InitAsFirst(capability* pool){
+    REMUS_ASSERT(56 % sizeof(V) == 0, "V must be a multiple of 2,4,8,14,28,56");
     rdma_ptr<BRoot> broot = pool->template Allocate<BRoot>();
     broot->height = 0; // set height to 1
     broot->lock = 0; // initialize lock
@@ -901,7 +976,7 @@ public:
     optional<V> prev_value = nullopt;
     traverse(pool, key, true, function([&](BLeaf* new_leaf, int bucket){
       if (new_leaf->key_at(bucket) != key) { // N.B. this is an inverted condition. Action upon the key is absent
-        REMUS_ASSERT(new_leaf->key_at(SIZE - 1) == SENTINEL, "Splitting required!");
+        REMUS_ASSERT_DEBUG(new_leaf->key_at(SIZE - 1) == SENTINEL, "Splitting failed! Effect doesn't accept full node");
         // shift up to make room for the KV (if possible)
         for(int i = SIZE - 1; i > bucket; i--) new_leaf->set_value(i, new_leaf->value_at(i - 1));
         for(int i = SIZE - 1; i > bucket; i--) new_leaf->set_key(i, new_leaf->key_at(i - 1));
