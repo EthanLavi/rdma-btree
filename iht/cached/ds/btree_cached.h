@@ -446,10 +446,10 @@ private:
     BNode node = *node_p;
 
     // Full node so split
-    bnode_ptr new_parent = ebr_node->allocate();
+    bnode_ptr new_parent = ebr_node->allocate(pool);
     parent.set_start_and_inc(new_parent);
 
-    bnode_ptr new_neighbor = ebr_node->allocate();
+    bnode_ptr new_neighbor = ebr_node->allocate(pool);
     K to_parent;
     if (pool->template is_local(new_neighbor)){
       *new_neighbor = BNode();
@@ -488,10 +488,10 @@ private:
     BLeaf node = *node_p;
 
     // Full node so split
-    bnode_ptr new_parent = ebr_node->allocate();
+    bnode_ptr new_parent = ebr_node->allocate(pool);
     parent.set_start_and_inc(new_parent);
 
-    bleaf_ptr new_neighbor = ebr_leaf->allocate();
+    bleaf_ptr new_neighbor = ebr_leaf->allocate(pool);
     K to_parent;
     K key_low = node.key_low(), key_high = node.key_high();
     if (pool->template is_local(new_neighbor)){
@@ -534,7 +534,7 @@ private:
     BNode node = *node_p;
     
     // Full node so split
-    bnode_ptr new_neighbor = ebr_node->allocate();
+    bnode_ptr new_neighbor = ebr_node->allocate(pool);
     K to_parent;
     if (pool->template is_local(new_neighbor)){
       *new_neighbor = BNode();
@@ -567,7 +567,7 @@ private:
     BLeaf node = *node_p;
 
     // Full node so split
-    bleaf_ptr new_neighbor = ebr_leaf->allocate();
+    bleaf_ptr new_neighbor = ebr_leaf->allocate(pool);
     K to_parent;
     K key_low = node.key_low(), key_high = node.key_high();
     
@@ -965,7 +965,7 @@ public:
   std::optional<V> contains(capability* pool, K key) {
     CachedObject<BLeaf> leaf = traverse(pool, key, false, function([=](BLeaf*, int){}));
     int bucket = search_node<BLeaf>(leaf, key);
-    ebr_leaf->match_version();
+    ebr_leaf->match_version(pool);
     if (leaf->key_at(bucket) == key) return make_optional(leaf->value_at(bucket));
     return nullopt;
   }
@@ -990,7 +990,7 @@ public:
         prev_value = optional(new_leaf->value_at(bucket));
       }
     }));
-    ebr_leaf->match_version();
+    ebr_leaf->match_version(pool);
     return prev_value; // found a match
   }
 
@@ -1013,7 +1013,7 @@ public:
         new_leaf->set_key(SIZE - 1, SENTINEL);
       }
     }));
-    ebr_leaf->match_version();
+    ebr_leaf->match_version(pool);
     return prev_value;
   }
 

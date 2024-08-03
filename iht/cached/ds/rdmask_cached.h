@@ -278,7 +278,7 @@ public:
                     }
                 }
             }
-            ebr_helper->match_version(true); // indicate done with epoch
+            ebr_helper->match_version(pool, true); // indicate done with epoch
         }
     }
 
@@ -364,7 +364,7 @@ public:
     /// @return an optional containing the value, if the key exists
     std::optional<uint64_t> contains(capability* pool, K key) {
         CachedObject<Node> node = find(pool, key, false);
-        ebr->match_version();
+        ebr->match_version(pool);
         if (key == node->key && node->value != DELETE_SENTINEL && node->value != UNLINK_SENTINEL) {
             return make_optional(node->value);
         }
@@ -388,25 +388,25 @@ public:
                     if (old_value == DELETE_SENTINEL){
                         // cas succeeded, reinstantiated the node
                         cache->Invalidate(curr.remote_origin());
-                        ebr->match_version();
+                        ebr->match_version(pool);
                         return std::nullopt;
                     } else if (old_value == UNLINK_SENTINEL) {
                         // cas failed, either someone else inserted or is being unlinked
                         continue;
                     } else {
                         // Someone else re-inserted instead of us
-                        ebr->match_version();
+                        ebr->match_version(pool);
                         return make_optional(old_value);
                     }
                 } else {
                     // kv already exists
-                    ebr->match_version();
+                    ebr->match_version(pool);
                     return make_optional(curr->value);
                 }
             }
 
             // allocates a node
-            nodeptr new_node_ptr = ebr->allocate();
+            nodeptr new_node_ptr = ebr->allocate(pool);
             if (pool->is_local(new_node_ptr)){
                 *new_node_ptr = Node(key, value);
                 new_node_ptr->next[0] = curr->next[0];
@@ -422,7 +422,7 @@ public:
             uint64_t old = pool->template CompareAndSwap<uint64_t>(dest, sans(curr->next[0]).raw(), new_node_ptr.raw());
             if (old == curr->next[0].raw()){ // if our CAS was successful, invalidate the object we modified
                 cache->Invalidate(curr.remote_origin());
-                ebr->match_version();
+                ebr->match_version(pool);
                 return std::nullopt;
             } else {
                 // the insert failed (either an insert or unlink occured), retry the operation
@@ -441,12 +441,12 @@ public:
         CachedObject<Node> curr = find(pool, key, false);
         if (curr->key != key) {
             // Couldn't find the key, return
-            ebr->match_version();
+            ebr->match_version(pool);
             return std::nullopt;
         }
         if (curr->value == DELETE_SENTINEL || curr->value == UNLINK_SENTINEL) {
             // already removed
-            ebr->match_version();
+            ebr->match_version(pool);
             return std::nullopt;
         }
 
@@ -455,11 +455,11 @@ public:
         uint64_t old = pool->template CompareAndSwap<uint64_t>(dest, curr->value, DELETE_SENTINEL); // mark for deletion
         if (old == curr->value){ // if our CAS was successful, invalidate the object we modified
             cache->Invalidate(curr.remote_origin());
-            ebr->match_version();
+            ebr->match_version(pool);
             return make_optional(curr->value);
         } else {
             // the remove failed (a different delete occured), return nullopt
-            ebr->match_version();
+            ebr->match_version(pool);
             return std::nullopt;
         }
     }

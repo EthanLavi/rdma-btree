@@ -27,7 +27,6 @@ class EBRObjectPool {
         long version;
     };
 
-    capability* pool;
     rdma_ptr<ebr_ref> next_node_version; // a version for the next node in the chain
 
     int thread_count;
@@ -42,7 +41,7 @@ class EBRObjectPool {
 public:
     volatile int cycles; // protected by rights to update at_version, a counter for how many limbo lists cycles have been made
 
-    EBRObjectPool(capability* pool, int thread_count) : pool(pool), thread_count(thread_count) {
+    EBRObjectPool(capability* pool, int thread_count) : thread_count(thread_count) {
         my_version = pool->template Allocate<ebr_ref>();
         my_version->version = 0;
         id_gen.store(0);
@@ -107,6 +106,7 @@ public:
     // Get an id for the thread...
     LimboLists<T>* RegisterThread(){
         id = id_gen.fetch_add(1);
+        
         EBRObjectPool<T, OPS_PER_EPOCH, capability>::limbo = new LimboLists<T>();
         limbo->free_lists[0] = new queue<rdma_ptr<T>>();
         limbo->free_lists[1] = new queue<rdma_ptr<T>>();
@@ -115,7 +115,7 @@ public:
     }
 
     /// Called at the end of every operation to indicate a finish 
-    void match_version(bool override_epoch = false){
+    void match_version(capability* pool, bool override_epoch = false){
         REMUS_ASSERT(id != -1, "Forgot to call RegisterThread");
         counter++;
         if (override_epoch || counter % OPS_PER_EPOCH != 0) return; // wait before cycling iterations
@@ -161,7 +161,7 @@ public:
 
     /// Allocate from the pool. Might allocate locally using the pool but not guaranteed (could be a remote!)
     /// Guaranteed via EBR to be exclusive
-    rdma_ptr<T> allocate(){
+    rdma_ptr<T> allocate(capability* pool){
         if (limbo->free_lists[0].load()->empty()){
             return pool->template Allocate<T>();
         } else {
@@ -185,12 +185,10 @@ inline thread_local LimboLists<T>* EBRObjectPool<T, WAIT, capability>::limbo = n
 template <class T, class K, int OPS_PER_EPOCH, class capability>
 class EBRObjectPoolAccompany {
     static thread_local LimboLists<T>* limbo;
-    capability* pool;
     EBRObjectPool<K, OPS_PER_EPOCH, capability>* ebr;
 
 public:
-    EBRObjectPoolAccompany(capability* pool, EBRObjectPool<K, OPS_PER_EPOCH, capability>* ebr) {
-        this->pool = pool;
+    EBRObjectPoolAccompany(EBRObjectPool<K, OPS_PER_EPOCH, capability>* ebr) {
         this->ebr = ebr;
     }
 
@@ -230,7 +228,7 @@ public:
 
     /// Allocate from the pool. Might allocate locally using the pool but not guaranteed (could be a remote!)
     /// Guaranteed via EBR to be exclusive
-    rdma_ptr<T> allocate(){
+    rdma_ptr<T> allocate(capability* pool){
         REMUS_ASSERT_DEBUG(limbo != nullptr, "Forgot to call RegisterThread");
         int first_index = ebr->cycles % 3;
         if (limbo->free_lists[first_index].load()->empty()){

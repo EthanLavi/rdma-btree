@@ -81,7 +81,7 @@ inline void btree_run(BenchmarkParams& params, rdma_capability* capability, Remo
     }
     ebr_leaf->Init(capability, self.id, peers);
     REMUS_INFO("Init ebr");
-    EBRNode* ebr_node = new EBRNode(ebr_pool, ebr_leaf);
+    EBRNode* ebr_node = new EBRNode(ebr_leaf);
 
     // Barrier to start all the clients at the same time
     std::barrier client_sync = std::barrier(params.thread_count);
@@ -191,7 +191,7 @@ inline void btree_run_local(Peer& self){
     using EBRLeaf = EBRObjectPool<BTreeLocal::BLeaf, 100, CountingPool>;
     using EBRNode = EBRObjectPoolAccompany<BTreeLocal::BNode, BTreeLocal::BLeaf, 100, CountingPool>;
     EBRLeaf* ebr_leaf = new EBRLeaf(pool, 1);
-    EBRNode* ebr_node = new EBRNode(pool, ebr_leaf);
+    EBRNode* ebr_node = new EBRNode(ebr_leaf);
     ebr_leaf->RegisterThread();
     ebr_node->RegisterThread();
 
