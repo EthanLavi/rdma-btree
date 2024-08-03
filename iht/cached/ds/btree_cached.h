@@ -621,6 +621,7 @@ private:
     while(node_one->key_at(size_one) != SENTINEL) size_one++;
     node_one->set_key(size_one, lower_key);
     node_one->set_ptr(size_one + 1, node_two->ptr_at(0)); // get the merged ptr
+    size_one++;
 
     for(int i = 0; i < SIZE; i++){
       if (node_two->key_at(i) == SENTINEL) break;
@@ -784,7 +785,10 @@ private:
                 cache->template Write<BNode>(curr.remote_origin(), empty_node);
                 cache->template Write<BNode>(merging_node.remote_origin(), merged_node);
                 cache->template Write<BNode>(parent.remote_origin(), parent_of_merge);
-                // continue traversing as if no update happened
+                // re-read the parent and continue
+                curr = reliable_read<BNode>(parent.remote_origin(), LOOK_FOR_SPLIT_MERGE);
+                bucket = search_node<BNode>(curr, key);
+                continue;
               } else {
                 // cannot acquire child so release parent and self and give up
                 release<BNode>(pool, parent.remote_origin(), parent->version());
@@ -804,8 +808,6 @@ private:
 
     // Get the next level ptr
     next_level = read_level((BNode*) curr.get(), bucket);
-
-    // Read it as a BLeaf
     bleaf_ptr next_leaf = static_cast<bleaf_ptr>(next_level);
     CachedObject<BLeaf> leaf = reliable_read<BLeaf>(next_leaf, modifiable ? WILL_NEED_ACQUIRE : IGNORE_LOCK);
     if (!leaf->key_in_range(key)){
@@ -1099,6 +1101,36 @@ public:
     std::cout << "Root(height=" << r.height << ")" << std::endl;
     debug(r.height, r.start, 0, 0);
     std::cout << std::endl;
+  }
+
+  void check_bounds(BNode* bnode, int height){
+    if (height != 1) {
+      for(int i = 0; i < SIZE + 1; i++){
+        rdma_ptr<BNode> next = bnode->ptr_at(i);
+        if (next != nullptr){
+          check_bounds((BNode*) next, height - 1);
+        }
+      }
+    } else {
+      K last_upper_bound = INT_MIN;
+      for(int i = 0; i < SIZE + 1; i++){
+        BLeaf* leaf = (BLeaf*) bnode->ptr_at(i).raw();
+        if (leaf != nullptr){
+          if (last_upper_bound != leaf->key_low() && last_upper_bound != INT_MIN){
+            REMUS_ERROR("Error at " + std::to_string(last_upper_bound));
+            abort();
+          }
+          last_upper_bound = leaf->key_high();
+        }
+      }
+    }
+  }
+
+  void check_bounds(){
+    BRoot r = *root;
+    if (r.height != 0){
+      check_bounds((BNode*) r.start, r.height);
+    }
   }
 
   string is_valid(int height, bnode_ptr node, K lower, K upper){
