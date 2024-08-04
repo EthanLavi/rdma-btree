@@ -160,6 +160,7 @@ private:
   /// @param level the level in the iht
   /// @param count the number of buckets to hash into
   inline uint64_t level_hash(const K &key, size_t level, size_t count) {
+    // todo: use multiple hash functions?
     std::hash<K> to_num;
     size_t prehash = to_num(key) ^ level;
     // mix13 implementation, maintains divisibility so we still have to subtract 1 from the bucket count

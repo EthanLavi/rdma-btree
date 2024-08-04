@@ -663,7 +663,6 @@ private:
     return next_level;
   }
 
-  // compiling with optimizations turned on breaks correctness
   CachedObject<BLeaf> traverse(capability* pool, K key, bool modifiable, function<void(BLeaf*, int)> effect, int it_counter = 0){
     REMUS_ASSERT(it_counter < 1000, "Too many retries! Infinite recursion detected?");
   

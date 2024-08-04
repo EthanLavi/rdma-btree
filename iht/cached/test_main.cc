@@ -10,7 +10,7 @@ int main(int argc, char* argv[]){
         return 1;
     }
     std::string structure(argv[1]);
-    Peer peer = Peer();
+    Peer peer = Peer(0, "localhost", 1000);
     if (structure == "btree" || structure == "b")
         btree_run_local(peer);
     else if (structure == "rdmask" || structure == "sk")
