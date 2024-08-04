@@ -31,6 +31,7 @@ class EBRObjectPool {
 
     int thread_count;
     rdma_ptr<ebr_ref> my_version;
+    rdma_ptr<ebr_ref> prealloc_version;
     atomic<int> id_gen; // generator for the id
     ebr_ref* thread_slots; // each thread has a local version
     atomic<int> at_version;
@@ -43,6 +44,7 @@ public:
 
     EBRObjectPool(capability* pool, int thread_count) : thread_count(thread_count) {
         my_version = pool->template Allocate<ebr_ref>();
+        prealloc_version = pool->template Allocate<ebr_ref>();
         my_version->version = 0;
         id_gen.store(0);
         thread_slots = new ebr_ref[thread_count]();
@@ -106,7 +108,10 @@ public:
     // Get an id for the thread...
     LimboLists<T>* RegisterThread(){
         id = id_gen.fetch_add(1);
-        
+        if (id >= thread_count) {
+            REMUS_ERROR("Too many registered threads for EBR");
+            abort();
+        }
         EBRObjectPool<T, OPS_PER_EPOCH, capability>::limbo = new LimboLists<T>();
         limbo->free_lists[0] = new queue<rdma_ptr<T>>();
         limbo->free_lists[1] = new queue<rdma_ptr<T>>();
@@ -144,7 +149,9 @@ public:
                 // write to the next async (we don't care when it completes, as long as it isn't lost)
                 // also don't write if we are linked to ourselves
                 if (next_node_version != my_version)
-                    pool->template Write<ebr_ref>(next_node_version, (ebr_ref) new_version, my_version, remus::rdma::internal::RDMAWriteWithNoAck);
+                    pool->template Write<ebr_ref>(next_node_version, (ebr_ref) new_version, prealloc_version, remus::rdma::internal::RDMAWriteWithNoAck);
+                else
+                    *next_node_version = (ebr_ref) new_version;
             }
         }
     }
@@ -154,7 +161,7 @@ public:
         limbo->free_lists[0].load()->push(obj);
     }
 
-    /// Technically, this method shouldn't be used since the queues being rotated enable it to be single producer, single consumer
+    /// Add to the end of the free lists (unsynchronized)
     void deallocate(rdma_ptr<T> obj){
         limbo->free_lists[2].load()->push(obj); // add to the free list
     }
@@ -165,7 +172,7 @@ public:
         if (limbo->free_lists[0].load()->empty()){
             return pool->template Allocate<T>();
         } else {
-            rdma_ptr<T> ret = limbo->free_lists[0].load()->back();
+            rdma_ptr<T> ret = limbo->free_lists[0].load()->front();
             limbo->free_lists[0].load()->pop();
             return ret;
         }
@@ -234,7 +241,7 @@ public:
         if (limbo->free_lists[first_index].load()->empty()){
             return pool->template Allocate<T>();
         } else {
-            rdma_ptr<T> ret = limbo->free_lists[first_index].load()->back();
+            rdma_ptr<T> ret = limbo->free_lists[first_index].load()->front();
             limbo->free_lists[first_index].load()->pop();
             return ret;
         }
