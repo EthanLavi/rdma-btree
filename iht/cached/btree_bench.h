@@ -23,8 +23,8 @@
 using namespace remus::util;
 using namespace remus::rdma;
 
-typedef RdmaBPTree<int, 3, rdma_capability_thread> BTree; // todo : increment size
-typedef RdmaBPTree<int, 3, CountingPool> BTreeLocal;
+typedef RdmaBPTree<int, 12, rdma_capability_thread> BTree; // todo: increment size more?
+typedef RdmaBPTree<int, 12, CountingPool> BTreeLocal;
 
 inline void btree_run(BenchmarkParams& params, rdma_capability* capability, RemoteCache* cache, Peer& host, Peer& self, std::vector<Peer> peers){
     // Create a list of client and server  threads

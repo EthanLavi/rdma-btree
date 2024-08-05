@@ -306,7 +306,7 @@ public:
       // We locked an elist, we can read the baseptr and progress
       remote_elist bucket_base = static_cast<remote_elist>(curr->buckets[bucket].base);
       // Past this point we have recursed to an elist
-      remote_elist e = pool->Read<EList>(bucket_base, temp_elist);
+      CachedObject<EList> e = cache->Read<EList>(unmark_ptr(bucket_base), temp_elist); // shouldn't fetch via the cache, but register the number of reads!
 
       // Get elist and linear search
       for (size_t i = 0; i < e->count; i++) {

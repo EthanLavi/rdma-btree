@@ -159,3 +159,25 @@ inline void iht_run(BenchmarkParams& params, rdma_capability* capability, Remote
 
     save_result("iht_result.csv", workload_results, params, params.thread_count);
 }
+
+inline void bulk_time(BenchmarkParams& params, rdma_capability* capability, RemoteCache* cache, Peer& host, Peer& self){
+    // Get pool
+    rdma_capability_thread* pool = capability->RegisterThread();
+    // initialize thread's thread_local pool
+    RemoteCache::pool = pool; 
+    cache->init({}); // self-init
+    KVStore* iht = new KVStore(self, params.cache_depth, cache, pool);
+    iht->InitAsFirst(pool);
+    // 50% populated
+    iht->populate(pool, (params.key_ub - params.key_lb) / 2, params.key_lb, params.key_ub, [=](int key){ return key; });
+    using namespace std::chrono;
+
+    high_resolution_clock::time_point start = high_resolution_clock::now();
+    for(int i = 0; i < params.op_count; i++){
+        int res = iht->contains(pool, i).value_or(-1);
+        REMUS_ASSERT(res == -1 || res == i, "Result is valid");
+    }
+    high_resolution_clock::time_point end = high_resolution_clock::now();
+    duration<double> sec = duration_cast<duration<double>>(end - start);
+    REMUS_INFO("{} seconds for {} ops at {} ops/s", sec.count(), params.op_count, (double) params.op_count / sec.count());
+}

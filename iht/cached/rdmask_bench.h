@@ -24,10 +24,11 @@
 using namespace remus::util;
 using namespace remus::rdma;
 
-// todo: increment size here! log2(keyspace)
-typedef RdmaSkipList<int, 7, INT_MIN, ULONG_MAX, ULONG_MAX - 1, rdma_capability_thread> RDMASK;
-typedef RdmaSkipList<int, 7, INT_MIN, ULONG_MAX, ULONG_MAX - 1, CountingPool> RDMASKLocal;
-typedef node<int, 7> Node;
+// todo: increment size here! log2(keyspace)?
+#define MAX_HEIGHT 16
+typedef RdmaSkipList<int, MAX_HEIGHT, INT_MIN, ULONG_MAX, ULONG_MAX - 1, rdma_capability_thread> RDMASK;
+typedef RdmaSkipList<int, MAX_HEIGHT, INT_MIN, ULONG_MAX, ULONG_MAX - 1, CountingPool> RDMASKLocal;
+typedef node<int, MAX_HEIGHT> Node;
 
 inline void rdmask_run(BenchmarkParams& params, rdma_capability* capability, RemoteCache* cache, Peer& host, Peer& self, std::vector<Peer> peers){
     REMUS_ASSERT(params.thread_count >= 2, "Thread count should be at least 2 to account for the helper thread");
@@ -46,7 +47,7 @@ inline void rdmask_run(BenchmarkParams& params, rdma_capability* capability, Rem
 
             // Create a root ptr to the IHT
             Peer p = Peer();
-            RDMASK sk = RDMASK(self, CacheDepth::None, cache, pool, peers, nullptr);
+            RDMASK sk = RDMASK(self, MAX_HEIGHT + 1, cache, pool, peers, nullptr);
             rdma_ptr<anon_ptr> root_ptr = sk.InitAsFirst(pool);
             // Send the root pointer over
             tcp::message ptr_message = tcp::message(root_ptr.raw());
@@ -112,7 +113,7 @@ inline void rdmask_run(BenchmarkParams& params, rdma_capability* capability, Rem
             }));
             cache->init(peer_roots);
 
-            std::shared_ptr<RDMASK> sk = std::make_shared<RDMASK>(self, CacheDepth::None, cache, pool, peers, ebr);
+            std::shared_ptr<RDMASK> sk = std::make_shared<RDMASK>(self, MAX_HEIGHT + 1, cache, pool, peers, ebr);
             // Get the data from the server to init the btree
             tcp::message ptr_message;
             endpoint->recv_server(&ptr_message);
@@ -227,7 +228,7 @@ inline void rdmask_run_local(Peer& self){
     EBRObjectPool<Node, 100, CountingPool>* ebr = new EBRObjectPool<Node, 100, CountingPool>(pool, 3);
     // ebr->Init(rdma_capability *two_sided_pool, int node_id, vector<Peer> peers);
     // would use to connect to remote peers
-    RDMASKLocal sk = RDMASKLocal(self, CacheDepth::RootOnly, cach, pool, {self}, ebr);
+    RDMASKLocal sk = RDMASKLocal(self, MAX_HEIGHT + 1, cach, pool, {self}, ebr);
     sk.InitAsFirst(pool);
     vector<LimboLists<Node>*> qs;
     qs.push_back(ebr->RegisterThread());
@@ -249,17 +250,18 @@ inline void rdmask_run_local(Peer& self){
     //     cach->free_all_tmp_objects();
     // });
     REMUS_INFO("DONE INIT");
-    sk.populate(pool, 16, 0, 100, std::function([=](int x){ return x; }));
+    sk.populate(pool, 32, 0, 100, std::function([=](int x){ return x; }));
 
     int counter = 0;
-    for(int i = 0; i < 10000; i++){
+    for(int i = 0; i < 1000; i++){
         if (sk.contains(pool, i).has_value()) counter++;
     }
     REMUS_INFO("matched_keys = {}", counter);
     REMUS_INFO("Count() = {}", sk.count(pool));
+    sk.debug();
 
     /// Delete the data structure
-    for(int i = 0; i <= 10000; i++){
+    for(int i = 0; i <= 1000; i++){
         sk.remove(pool, i).value_or(-1);
     }
 
@@ -268,7 +270,7 @@ inline void rdmask_run_local(Peer& self){
     do_cont.store(false);
     t1.join();
     // t2.join();
-    sk.debug();
+    // sk.debug();
 
     cach->free_all_tmp_objects();
     ebr->destroy(pool);

@@ -99,7 +99,7 @@ private:
     using RemoteCache = RemoteCacheImpl<capability>;
 
     Peer self_;
-    CacheDepth::CacheDepth cache_depth_;
+    int cache_depth_;
 
     typedef node<K, MAX_HEIGHT> Node;
     typedef rdma_ptr<Node> nodeptr;
@@ -112,7 +112,13 @@ private:
     RemoteCache* cache;
   
     // preallocated memory for RDMA operations (avoiding frequent allocations)
-    rdma_ptr<Node> tmp_node;
+    rdma_ptr<Node> prealloc_node_w;
+    rdma_ptr<Node> prealloc_fill_node1;
+    rdma_ptr<Node> prealloc_fill_node2;
+    rdma_ptr<Node> prealloc_find_node1;
+    rdma_ptr<Node> prealloc_find_node2;
+    rdma_ptr<Node> prealloc_helper_node;
+    rdma_ptr<Node> prealloc_count_node;
     // shared EBRObjectPool has thread_local internals so its all thread safe
     EBRObjectPool<Node, 100, capability>* ebr;
 
@@ -133,8 +139,9 @@ private:
 
     CachedObject<Node> fill(K key, rdma_ptr<Node> preds[MAX_HEIGHT], rdma_ptr<Node> succs[MAX_HEIGHT], bool found[MAX_HEIGHT], K* prev_key = nullptr){
         // first node is a sentinel, it will always be linked in the data structure
-        CachedObject<Node> curr = cache->template Read<Node>(root); // root is never deleted, let's say curr is never a deleted node
+        CachedObject<Node> curr = cache->template Read<Node>(root, prealloc_fill_node1); // root is never deleted, let's say curr is never a deleted node
         CachedObject<Node> next_curr;
+        bool use_node1 = false;
         K previous_key = MINKEY;
         for(int height = MAX_HEIGHT - 1; height != -1; height--){
             // iterate on this level until we find the last node that <= the key
@@ -147,9 +154,10 @@ private:
                     // if next is the END, descend a level
                     break;
                 } 
-                next_curr = cache->template Read<Node>(sans(curr->next[height]));
+                next_curr = cache->template Read<Node>(sans(curr->next[height]), use_node1 ? prealloc_fill_node1 : prealloc_fill_node2);
                 if (next_curr->key < key) {
                     curr = std::move(next_curr);
+                    use_node1 = !use_node1; // swap the prealloc
                     continue; // move right
                 } else if (next_curr->key == key){
                     preds[height] = curr.remote_origin();
@@ -236,19 +244,25 @@ private:
     }
 
 public:
-    RdmaSkipList(Peer& self, CacheDepth::CacheDepth depth, RemoteCache* cache, capability* pool, vector<Peer> peers, EBRObjectPool<Node, 100, capability>* ebr) 
-    : self_(std::move(self)), cache_depth_(depth), cache(cache), ebr(ebr) {
+    RdmaSkipList(Peer& self, int cache_floor, RemoteCache* cache, capability* pool, vector<Peer> peers, EBRObjectPool<Node, 100, capability>* ebr) 
+    : self_(std::move(self)), cache_depth_(cache_floor), cache(cache), ebr(ebr) {
         REMUS_INFO("SENTINEL is MIN? {}", MINKEY);
-        tmp_node = pool->template Allocate<Node>();
+        prealloc_node_w = pool->template Allocate<Node>();
+        prealloc_count_node = pool->template Allocate<Node>();
+        prealloc_fill_node1 = pool->template Allocate<Node>();
+        prealloc_fill_node2 = pool->template Allocate<Node>();
+        prealloc_find_node1 = pool->template Allocate<Node>();
+        prealloc_find_node2 = pool->template Allocate<Node>();
+        prealloc_helper_node = pool->template Allocate<Node>();
     }
 
     void helper_thread(std::atomic<bool>* do_cont, capability* pool, EBRObjectPool<Node, 100, capability>* ebr_helper, vector<LimboLists<Node>*> qs){
         CachedObject<Node> curr;
         int i = 0;
         while(do_cont->load()){ // endlessly traverse and maintain the index
-            curr = cache->template Read<Node>(root);
+            curr = cache->template Read<Node>(root, prealloc_helper_node);
             while(sans(curr->next[0]) != nullptr && do_cont->load()){
-                curr = cache->template Read<Node>(sans(curr->next[0]));
+                curr = cache->template Read<Node>(sans(curr->next[0]), prealloc_helper_node);
                 if (curr->value == DELETE_SENTINEL && curr->link_level == curr->height){
                     rdma_ptr<uint64_t> ptr = get_value_ptr(curr.remote_origin());
                     uint64_t last = pool->template CompareAndSwap<uint64_t>(ptr, DELETE_SENTINEL, UNLINK_SENTINEL);
@@ -284,7 +298,13 @@ public:
 
     /// Free all the resources associated with the data structure
     void destroy(capability* pool, bool delete_as_first = true) {
-        pool->template Deallocate<Node>(tmp_node);
+        pool->template Deallocate<Node>(prealloc_count_node);
+        pool->template Deallocate<Node>(prealloc_fill_node1);
+        pool->template Deallocate<Node>(prealloc_fill_node2);
+        pool->template Deallocate<Node>(prealloc_node_w);
+        pool->template Deallocate<Node>(prealloc_find_node1);
+        pool->template Deallocate<Node>(prealloc_find_node2);
+        pool->template Deallocate<Node>(prealloc_helper_node);
         if (delete_as_first) pool->template Deallocate<Node>(root);
     }
 
@@ -331,27 +351,29 @@ public:
     /// Will unlink nodes only at the data level leaving them indexable
     private: CachedObject<Node> find(capability* pool, K key, bool is_insert){
         // first node is a sentinel, it will always be linked in the data structure
-        CachedObject<Node> curr = cache->template Read<Node>(root); // root is never deleted, let's say curr is never a deleted node
+        CachedObject<Node> curr = cache->template Read<Node>(root, prealloc_find_node1); // root is never deleted, let's say curr is never a deleted node
+        bool use_node1 = false;
         CachedObject<Node> next_curr;
         for(int height = MAX_HEIGHT - 1; height != -1; height--){
             // iterate on this level until we find the last node that <= the key
             K last_key = MINKEY;
             while(true){
-                if (last_key >= curr->key && last_key != MINKEY){
-                    REMUS_ERROR("Infinite loop detected height={} prev={} curr={}", height, last_key, curr->key);
-                    abort();
-                }
+                REMUS_ASSERT_DEBUG(last_key < curr->key || last_key == MINKEY, "Infinite loop detected");
+                // if (last_key >= curr->key && last_key != MINKEY) REMUS_FATAL("Infinite loop height={} prev={} curr={}", height, last_key, curr->key);
                 last_key = curr->key;
 
                 if (curr->key == key) return curr; // stop early if we find the right key
                 if (sans(curr->next[height]) == nullptr) break; // if next is the END, descend a level
-                next_curr = cache->template Read<Node>(sans(curr->next[height]));
+                next_curr = cache->template Read<Node>(sans(curr->next[height]), use_node1 ? prealloc_find_node1 : prealloc_find_node2);
                 if (is_insert && height == 0 && is_marked_del(curr->next[height]) && next_curr->key >= key){
                     // we found a node that we are inserting directly after. Lets help unlink
                     nonblock_unlink_node(pool, curr->key);
                     return find(pool, key, is_insert); // recursively retry
                 }
-                if (next_curr->key <= key) curr = std::move(next_curr); // next_curr is eligible, continue with it
+                if (next_curr->key <= key) {
+                    curr = std::move(next_curr); // next_curr is eligible, continue with it
+                    use_node1 = !use_node1;
+                }
                 else break; // otherwise descend a level since next_curr is past the limit
             }
         }
@@ -413,7 +435,7 @@ public:
             } else {
                 Node new_node = Node(key, value);
                 new_node.next[0] = curr->next[0];
-                pool->template Write<Node>(new_node_ptr, new_node, tmp_node);
+                pool->template Write<Node>(new_node_ptr, new_node, prealloc_node_w);
             }
 
             // if the next is a deleted node, we need to physically delete
@@ -519,11 +541,22 @@ public:
     int count(capability* pool){
         // Get leftmost leaf by wrapping SENTINEL
         int count = 0;
-        Node curr = *cache->template Read<Node>(root);
+        int counter[MAX_HEIGHT];
+        int total_counter[MAX_HEIGHT];
+        memset(counter, 0, sizeof(int) * MAX_HEIGHT);
+        memset(total_counter, 0, sizeof(int) * MAX_HEIGHT);
+        Node curr = *cache->template Read<Node>(root, prealloc_count_node);
         while(curr.next[0] != nullptr){
             curr = *cache->template Read<Node>(curr.next[0]);
+            counter[curr.height - 1]++;
+            for(int i = 0; i <= curr.height - 1; i++){
+                total_counter[i]++;
+            }
             if (curr.value != DELETE_SENTINEL && curr.value != UNLINK_SENTINEL)
                 count++;
+        }
+        for(int i = 0; i < MAX_HEIGHT; i++){
+            REMUS_INFO("nodes with height {} = {}, cumulative={}", i, counter[i], total_counter[i]);
         }
         return count;
     }

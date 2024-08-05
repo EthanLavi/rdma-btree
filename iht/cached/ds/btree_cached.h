@@ -1200,6 +1200,9 @@ public:
 
   /// No concurrent or thread safe (if everyone is readonly, then its fine). Counts the number of elements in the IHT
   int count(capability* pool){
+    int height = cache->template Read<BRoot>(root)->height;
+    REMUS_INFO("Final height = {}", height);
+
     // Get leftmost leaf by wrapping SENTINEL
     CachedObject<BLeaf> curr = traverse(pool, INT_MIN + 1, false, function([=](BLeaf*, int){}));
     int count = 0;
