@@ -26,13 +26,7 @@ static const K SENTINEL = INT_MAX;
 static const bool ADDR = false;
 
 /*
-todo
-
-Run btree and skiplist on RDMA since they underwent significant changes!
-1) Optimize using a built-in flag into cachedobject so that we can skip verification
-2) Optimize write behaviors
-3) Caching
-4) Prealloc?
+todo: Caching
 */
 
 template <class V, int DEGREE, class capability> class RdmaBPTree {
@@ -297,12 +291,18 @@ private:
   
   // preallocated memory for RDMA operations (avoiding frequent allocations)
   rdma_ptr<uint64_t> temp_lock;
+  rdma_ptr<BRoot> prealloc_root_r;
+  rdma_ptr<BRoot> prealloc_root_w;
+  rdma_ptr<BNode> prealloc_node_w;
+  rdma_ptr<BLeaf> prealloc_leaf_r1;
+  rdma_ptr<BLeaf> prealloc_leaf_r2;
+  rdma_ptr<BLeaf> prealloc_leaf_w;
 
   /// returns true if we can acquire the version of the node
   template <class ptr_t>
   bool try_acquire(capability* pool, rdma_ptr<ptr_t> node, long version){
     // swap the first 8 bytes (the lock) from unlocked to locked
-    uint64_t v = pool->template CompareAndSwap<uint64_t>(static_cast<rdma_ptr<uint64_t>>(unmark_ptr(node)), version, version | LOCK_BIT);
+    uint64_t v = pool->template CompareAndSwap<uint64_t>(static_cast<rdma_ptr<uint64_t>>(unmark_ptr(node)), version & ~LOCK_BIT, version | LOCK_BIT);
     if (v == (version & ~LOCK_BIT)) return true; // I think the lock bit will never be set in this scenario since we'd detect a broken read primarily
     return false;
   }
@@ -310,7 +310,7 @@ private:
   template <class ptr_t>
   void release(capability* pool, rdma_ptr<ptr_t> node, long version){
     // todo: optimize using write behaviors and caching
-    pool->template Write<uint64_t>(static_cast<rdma_ptr<uint64_t>>(unmark_ptr(node)), version, temp_lock);
+    pool->template Write<uint64_t>(static_cast<rdma_ptr<uint64_t>>(unmark_ptr(node)), version, temp_lock, internal::RDMAWriteBehavior::RDMAWriteWithNoAck);
   }
 
   enum ReadBehavior {
@@ -319,23 +319,22 @@ private:
     WILL_NEED_ACQUIRE = 2,
   };
 
-  // todo: mark cached obj as valid to avoid the check?
   template <class ptr_t>
-  inline CachedObject<ptr_t> reliable_read(rdma_ptr<ptr_t> node, ReadBehavior behavior){
-    CachedObject<ptr_t> obj = cache->template Read<ptr_t>(node);
+  inline CachedObject<ptr_t> reliable_read(rdma_ptr<ptr_t> node, ReadBehavior behavior, rdma_ptr<ptr_t> prealloc = nullptr){
+    CachedObject<ptr_t> obj = cache->template Read<ptr_t>(node, prealloc);
     if (behavior == IGNORE_LOCK){
       while(!obj->is_valid(true)){
-        obj = cache->template Read<ptr_t>(node);
+        obj = cache->template Read<ptr_t>(node, prealloc);
       }
     } else if (behavior == LOOK_FOR_SPLIT_MERGE) {
       bool should_ignore_lock = (obj->key_at(SIZE - 1) != SENTINEL) || (obj->key_at(0) == SENTINEL);
       while(!obj->is_valid(should_ignore_lock)){
-        obj = cache->template Read<ptr_t>(node);
+        obj = cache->template Read<ptr_t>(node, prealloc);
         should_ignore_lock = (obj->key_at(SIZE - 1) != SENTINEL) || (obj->key_at(0) == SENTINEL);
       }
     } else { // WILL_NEED_ACQUIRE
       while(!obj->is_valid(false)){
-        obj = cache->template Read<ptr_t>(node);
+        obj = cache->template Read<ptr_t>(node, prealloc);
       }
     }
     return obj;
@@ -459,7 +458,7 @@ private:
       BNode new_neighbor_local = BNode();
       to_parent = split_keys<BNode*, BNode*>(&node, &new_neighbor_local, true);
       split_ptrs(&node, &new_neighbor_local);
-      cache->template Write<BNode>(new_neighbor, new_neighbor_local);
+      cache->template Write<BNode>(new_neighbor, new_neighbor_local, prealloc_node_w);
     }
 
     if (pool->template is_local(new_parent)){
@@ -472,14 +471,14 @@ private:
       new_parent_local.set_key(0, to_parent);
       new_parent_local.set_ptr(0, node_p.remote_origin());
       new_parent_local.set_ptr(1, new_neighbor);
-      cache->template Write<BNode>(new_parent, new_parent_local);
+      cache->template Write<BNode>(new_parent, new_parent_local, prealloc_node_w);
     }
 
     parent.increment_version();
     node.increment_version(); // increment version before writing
 
-    cache->template Write<BRoot>(parent_p.remote_origin(), parent);      
-    cache->template Write<BNode>(node_p.remote_origin(), node);
+    cache->template Write<BRoot>(parent_p.remote_origin(), parent, prealloc_root_w);      
+    cache->template Write<BNode>(node_p.remote_origin(), node, prealloc_node_w);
   }
 
   /// Move
@@ -504,7 +503,7 @@ private:
       to_parent = split_keys<BLeaf*, BLeaf*>(&node, &new_leaf, false);
       split_values(&node, &new_leaf);
       new_leaf.set_range(to_parent, key_high);
-      cache->template Write<BLeaf>(new_neighbor, new_leaf); // todo: prealloc?
+      cache->template Write<BLeaf>(new_neighbor, new_leaf, prealloc_leaf_w);
     }
     node.set_next(new_neighbor);
     node.set_range(key_low, to_parent);
@@ -519,13 +518,13 @@ private:
       new_parent_local.set_key(0, to_parent);
       new_parent_local.set_ptr(0, static_cast<bnode_ptr>(node_p.remote_origin()));
       new_parent_local.set_ptr(1, static_cast<bnode_ptr>(new_neighbor));
-      cache->template Write<BNode>(new_parent, new_parent_local);
+      cache->template Write<BNode>(new_parent, new_parent_local, prealloc_node_w);
     }
   
     parent.increment_version();
     node.increment_version();
-    cache->template Write<BRoot>(parent_p.remote_origin(), parent);
-    cache->template Write<BLeaf>(node_p.remote_origin(), node);
+    cache->template Write<BRoot>(parent_p.remote_origin(), parent, prealloc_root_w);
+    cache->template Write<BLeaf>(node_p.remote_origin(), node, prealloc_leaf_w);
   }
 
   /// Not at root
@@ -544,7 +543,7 @@ private:
       BNode new_neighbor_local = BNode();
       to_parent = split_keys<BNode*, BNode*>(&node, &new_neighbor_local, true);
       split_ptrs(&node, &new_neighbor_local);
-      cache->template Write<BNode>(new_neighbor, new_neighbor_local);
+      cache->template Write<BNode>(new_neighbor, new_neighbor_local, prealloc_node_w);
     }
 
     int bucket = search_node<BNode>(parent_p, to_parent);
@@ -557,8 +556,8 @@ private:
     parent.increment_version(); // increment version before writing
     node.increment_version();
 
-    cache->template Write<BNode>(parent_p.remote_origin(), parent);
-    cache->template Write<BNode>(node_p.remote_origin(), node);
+    cache->template Write<BNode>(parent_p.remote_origin(), parent, prealloc_node_w);
+    cache->template Write<BNode>(node_p.remote_origin(), node, prealloc_node_w);
   }
 
   /// At leaf. Try to split the leaf into two and move a key to the parent
@@ -585,7 +584,7 @@ private:
       new_leaf.set_next(node.get_next());
       new_leaf.set_range(to_parent, key_high);
       new_leaf.lock(); // start locked
-      cache->template Write<BLeaf>(new_neighbor, new_leaf); // todo: prealloc?
+      cache->template Write<BLeaf>(new_neighbor, new_leaf, prealloc_leaf_w);
     }
     node.set_next(new_neighbor);
     node.set_range(key_low, to_parent);
@@ -599,8 +598,7 @@ private:
     parent.increment_version();
     node.increment_version();
 
-    // todo: prealloc?
-    cache->template Write<BNode>(parent_p.remote_origin(), parent);
+    cache->template Write<BNode>(parent_p.remote_origin(), parent, prealloc_node_w);
     // leave the leaf unmodified and locked for further use
     return node;
   }
@@ -667,18 +665,18 @@ private:
     REMUS_ASSERT(it_counter < 1000, "Too many retries! Infinite recursion detected?");
   
     // read root first
-    CachedObject<BRoot> curr_root = cache->template Read<BRoot>(root);
+    CachedObject<BRoot> curr_root = cache->template Read<BRoot>(root, prealloc_root_r);
     int height = curr_root->height;
     bnode_ptr next_level = curr_root->start;
     REMUS_ASSERT_DEBUG(next_level != nullptr, "Accessing SENTINEL's ptr");
 
     if (height == 0){
-      CachedObject<BLeaf> next_leaf = reliable_read<BLeaf>(static_cast<bleaf_ptr>(next_level), modifiable ? WILL_NEED_ACQUIRE : IGNORE_LOCK);
+      CachedObject<BLeaf> next_leaf = reliable_read<BLeaf>(static_cast<bleaf_ptr>(next_level), modifiable ? WILL_NEED_ACQUIRE : IGNORE_LOCK, prealloc_leaf_r1);
       if (modifiable){
         // failed to get locks, retraverse
         if (!try_acquire<BRoot>(pool, curr_root.remote_origin(), curr_root->version())) return traverse(pool, key, modifiable, effect);
         if (!try_acquire<BLeaf>(pool, next_leaf.remote_origin(), next_leaf->version())) {
-          release<BRoot>(pool, curr_root.remote_origin(), 0);
+          release<BRoot>(pool, curr_root.remote_origin(), curr_root->version());
           return traverse(pool, key, modifiable, effect);
         }
         if (next_leaf->key_at(SIZE - 1) != SENTINEL){
@@ -690,8 +688,8 @@ private:
           BLeaf leaf_updated = *next_leaf;
           effect(&leaf_updated, search_node<BLeaf>(&leaf_updated, key));
           leaf_updated.increment_version();
-          release<BRoot>(pool, curr_root.remote_origin(), 0);
-          cache->template Write<BLeaf>(next_leaf.remote_origin(), leaf_updated);
+          release<BRoot>(pool, curr_root.remote_origin(), curr_root->version());
+          cache->template Write<BLeaf>(next_leaf.remote_origin(), leaf_updated, prealloc_leaf_w);
         }
       }
 
@@ -706,7 +704,7 @@ private:
     if (modifiable && curr->key_at(SIZE - 1) != SENTINEL){
       if (!try_acquire<BRoot>(pool, curr_root.remote_origin(), curr_root->version())) return traverse(pool, key, modifiable, effect);
       if (!try_acquire<BNode>(pool, curr.remote_origin(), curr->version())) {
-        release<BRoot>(pool, curr_root.remote_origin(), 0);
+        release<BRoot>(pool, curr_root.remote_origin(), curr_root->version());
         return traverse(pool, key, modifiable, effect);
       }
       split_node(pool, curr_root, curr);
@@ -721,12 +719,12 @@ private:
           new_root.start = curr->ptr_at(0);
           new_root.increment_version();
 
-          cache->template Write<BRoot>(curr_root.remote_origin(), new_root);
+          cache->template Write<BRoot>(curr_root.remote_origin(), new_root, prealloc_root_w);
           release<BNode>(pool, curr.remote_origin(), curr->version());
 
           ebr_node->deallocate(curr.remote_origin()); // deallocate the unlinked node
         } else {
-          release<BRoot>(pool, curr_root.remote_origin(), 0); // continue traversing, we failed to lower a level
+          release<BRoot>(pool, curr_root.remote_origin(), curr_root->version()); // continue traversing, we failed to lower a level
         }
       }
     }
@@ -781,9 +779,9 @@ private:
                 empty_node.increment_version();
                 merged_node.increment_version();
                 parent_of_merge.increment_version();
-                cache->template Write<BNode>(curr.remote_origin(), empty_node);
-                cache->template Write<BNode>(merging_node.remote_origin(), merged_node);
-                cache->template Write<BNode>(parent.remote_origin(), parent_of_merge);
+                cache->template Write<BNode>(curr.remote_origin(), empty_node, prealloc_node_w);
+                cache->template Write<BNode>(merging_node.remote_origin(), merged_node, prealloc_node_w);
+                cache->template Write<BNode>(parent.remote_origin(), parent_of_merge, prealloc_node_w);
                 // re-read the parent and continue
                 curr = reliable_read<BNode>(parent.remote_origin(), LOOK_FOR_SPLIT_MERGE);
                 bucket = search_node<BNode>(curr, key);
@@ -808,7 +806,7 @@ private:
     // Get the next level ptr
     next_level = read_level((BNode*) curr.get(), bucket);
     bleaf_ptr next_leaf = static_cast<bleaf_ptr>(next_level);
-    CachedObject<BLeaf> leaf = reliable_read<BLeaf>(next_leaf, modifiable ? WILL_NEED_ACQUIRE : IGNORE_LOCK);
+    CachedObject<BLeaf> leaf = reliable_read<BLeaf>(next_leaf, modifiable ? WILL_NEED_ACQUIRE : IGNORE_LOCK, prealloc_leaf_r1);
     if (!leaf->key_in_range(key)){
       // key is out of the range, we traversed wrong
       return traverse(pool, key, modifiable, effect, it_counter + 1);
@@ -817,91 +815,100 @@ private:
     // Handle updates to the leaf
     if (modifiable){
       // acquire parent and current leaf
-      if (try_acquire<BNode>(pool, curr.remote_origin(), curr->version())){
-        if (try_acquire<BLeaf>(pool, leaf.remote_origin(), leaf->version())){
-          if (leaf->key_at(SIZE - 1) != SENTINEL){
-            // should split
-            BLeaf leaf_updated = split_node(pool, curr, leaf);
-            next_leaf = leaf_updated.get_next(); // next_leaf is readonly since we left it locked
-            bucket = search_node<BLeaf>(&leaf_updated, key);
-            if (!leaf_updated.key_in_range(key)) {
-              // key goes into next
-              cache->template Write<BLeaf>(leaf.remote_origin(), leaf_updated); // write and unlock the prev
-              CachedObject<BLeaf> next_leaf_local_const = reliable_read<BLeaf>(next_leaf, IGNORE_LOCK);
-              BLeaf next_leaf_local = *next_leaf_local_const;
-              effect(&next_leaf_local, search_node<BLeaf>(next_leaf_local_const, key)); // modify the next
-              next_leaf_local.increment_version();
-              cache->template Write<BLeaf>(next_leaf, next_leaf_local);
-              return leaf;
-            } else {
-              // key goes into current, unlock next
-              release<BLeaf>(pool, next_leaf, 0);
-              effect(&leaf_updated, bucket);
-              cache->template Write<BLeaf>(leaf.remote_origin(), leaf_updated);
-              return leaf;
-            }
-          } else if (leaf->key_at(0) == SENTINEL && curr->key_at(0) != SENTINEL){
-            // Empty node with a neighbor, try to remove it
-            int bucket_neighbor;
-            rdma_ptr<BLeaf> merge_leaf_ptr;
-            if (bucket == 0) {
-              merge_leaf_ptr = static_cast<bleaf_ptr>(read_level((BNode*) curr.get(), 1));
-              bucket_neighbor = 1;
-            } else {
-              merge_leaf_ptr = static_cast<bleaf_ptr>(read_level((BNode*) curr.get(), bucket - 1));
-              bucket_neighbor = bucket - 1;
-            }
-
-            CachedObject<BLeaf> merging_leaf;
-            bool do_merge = true;
-            while(true){ // aggressively acquire the node since we only compete with simple insert/remove
-              merging_leaf = reliable_read<BLeaf>(merge_leaf_ptr, WILL_NEED_ACQUIRE);
-              if (merging_leaf->key_at(SIZE - 1) != SENTINEL) {
-                do_merge = false; // give up because merging will cause inserts to fail!
-                break;
-              }
-              // ? if we add linearizable range queries, we prob need to re-traverse instead to prevent deadlock!
-              if (try_acquire(pool, merging_leaf.remote_origin(), merging_leaf->version())) break;
-            }
-
-            if (!do_merge){
-              // lock, update, write back
-              BLeaf leaf_updated = *leaf;
-              effect(&leaf_updated, search_node<BLeaf>(&leaf_updated, key));
-              leaf_updated.increment_version();
-              cache->template Write<BLeaf>(leaf.remote_origin(), leaf_updated);
-              release<BNode>(pool, curr.remote_origin(), curr->version()); // release parent
-              return leaf;
-            }
-            BLeaf empty_leaf = *leaf;
-            effect(&empty_leaf, 0);
-            BLeaf merged_leaf = *merging_leaf;
-            BNode parent_of_merge = *curr;
-            if (merge_leaf(&empty_leaf, bucket, &merged_leaf, bucket_neighbor, &parent_of_merge)){
-              ebr_leaf->deallocate(leaf.remote_origin());
-            } else {
-              ebr_leaf->deallocate(merging_leaf.remote_origin());
-            }
-
-            empty_leaf.increment_version();
-            merged_leaf.increment_version();
-            parent_of_merge.increment_version();
-            cache->template Write<BLeaf>(leaf.remote_origin(), empty_leaf);
-            cache->template Write<BLeaf>(merging_leaf.remote_origin(), merged_leaf);
-            cache->template Write<BNode>(curr.remote_origin(), parent_of_merge);
-            return leaf;
-          } else {
-            // modifiable so lock, update, write back
-            BLeaf leaf_updated = *leaf;
-            effect(&leaf_updated, search_node<BLeaf>(&leaf_updated, key));
-            leaf_updated.increment_version();
-            cache->template Write<BLeaf>(leaf.remote_origin(), leaf_updated);
-            release<BNode>(pool, curr.remote_origin(), curr->version()); // release parent
-            return leaf;
-          }
+      if (try_acquire<BLeaf>(pool, leaf.remote_origin(), leaf->version())){
+        if (leaf->key_at(SIZE - 1) == SENTINEL && (leaf->key_at(0) != SENTINEL || curr->key_at(0) == SENTINEL)){
+          // modifiable so lock, update, write back
+          BLeaf leaf_updated = *leaf;
+          effect(&leaf_updated, search_node<BLeaf>(&leaf_updated, key));
+          leaf_updated.increment_version();
+          cache->template Write<BLeaf>(leaf.remote_origin(), leaf_updated, prealloc_leaf_w, internal::RDMAWriteBehavior::RDMAWriteWithNoAck);
+          return leaf;
         } else {
-          // release parent and try again
-          release<BNode>(pool, curr.remote_origin(), curr->version());
+          if (try_acquire<BNode>(pool, curr.remote_origin(), curr->version())){
+            if (leaf->key_at(SIZE - 1) != SENTINEL){
+              // should split
+              BLeaf leaf_updated = split_node(pool, curr, leaf); // todo: are we sure we can unlock parent before writing?
+              next_leaf = leaf_updated.get_next(); // next_leaf is readonly since we left it locked
+              bucket = search_node<BLeaf>(&leaf_updated, key);
+              if (!leaf_updated.key_in_range(key)) {
+                // write and unlock the prev
+                cache->template Write<BLeaf>(leaf.remote_origin(), leaf_updated, prealloc_leaf_w);
+                // key goes into next
+                CachedObject<BLeaf> next_leaf_local_const = reliable_read<BLeaf>(next_leaf, IGNORE_LOCK, prealloc_leaf_r2);
+                BLeaf next_leaf_local = *next_leaf_local_const;
+                effect(&next_leaf_local, search_node<BLeaf>(next_leaf_local_const, key)); // modify the next
+                next_leaf_local.increment_version();
+                cache->template Write<BLeaf>(next_leaf, next_leaf_local, prealloc_leaf_w, internal::RDMAWriteBehavior::RDMAWriteWithNoAck);
+                return leaf;
+              } else {
+                // key goes into current, unlock next
+                release<BLeaf>(pool, next_leaf, 0);
+                effect(&leaf_updated, bucket);
+                cache->template Write<BLeaf>(leaf.remote_origin(), leaf_updated, prealloc_leaf_w, internal::RDMAWriteBehavior::RDMAWriteWithNoAck);
+                return leaf;
+              }
+            } else if (leaf->key_at(0) == SENTINEL && curr->key_at(0) != SENTINEL){
+              // Empty node with a neighbor, try to remove it
+              int bucket_neighbor;
+              rdma_ptr<BLeaf> merge_leaf_ptr;
+              if (bucket == 0) {
+                merge_leaf_ptr = static_cast<bleaf_ptr>(read_level((BNode*) curr.get(), 1));
+                bucket_neighbor = 1;
+              } else {
+                merge_leaf_ptr = static_cast<bleaf_ptr>(read_level((BNode*) curr.get(), bucket - 1));
+                bucket_neighbor = bucket - 1;
+              }
+
+              CachedObject<BLeaf> merging_leaf;
+              bool do_merge = true;
+              while(true){ // aggressively acquire the node since we only compete with simple insert/remove
+                merging_leaf = reliable_read<BLeaf>(merge_leaf_ptr, WILL_NEED_ACQUIRE, prealloc_leaf_r2);
+                if (merging_leaf->key_at(SIZE - 1) != SENTINEL) {
+                  do_merge = false; // give up because merging will cause inserts to fail!
+                  break;
+                }
+                // ? if we add linearizable range queries, we prob need to re-traverse instead to prevent deadlock!
+                if (try_acquire(pool, merging_leaf.remote_origin(), merging_leaf->version())) break;
+              }
+
+              if (!do_merge){
+                // lock, update, write back
+                BLeaf leaf_updated = *leaf;
+                effect(&leaf_updated, search_node<BLeaf>(&leaf_updated, key));
+                leaf_updated.increment_version();
+                cache->template Write<BLeaf>(leaf.remote_origin(), leaf_updated, prealloc_leaf_w, internal::RDMAWriteBehavior::RDMAWriteWithNoAck);
+                release<BNode>(pool, curr.remote_origin(), curr->version()); // release parent
+                return leaf;
+              }
+              BLeaf empty_leaf = *leaf;
+              effect(&empty_leaf, 0);
+              BLeaf merged_leaf = *merging_leaf;
+              BNode parent_of_merge = *curr;
+              if (merge_leaf(&empty_leaf, bucket, &merged_leaf, bucket_neighbor, &parent_of_merge)){
+                ebr_leaf->deallocate(leaf.remote_origin());
+                empty_leaf.increment_version();
+                merged_leaf.increment_version();
+                parent_of_merge.increment_version();
+                cache->template Write<BLeaf>(merging_leaf.remote_origin(), merged_leaf, prealloc_leaf_w);
+                cache->template Write<BLeaf>(leaf.remote_origin(), empty_leaf, prealloc_leaf_w, internal::RDMAWriteBehavior::RDMAWriteWithNoAck);
+                cache->template Write<BNode>(curr.remote_origin(), parent_of_merge, prealloc_node_w, internal::RDMAWriteBehavior::RDMAWriteWithNoAck);
+              } else {
+                ebr_leaf->deallocate(merging_leaf.remote_origin());
+                empty_leaf.increment_version();
+                merged_leaf.increment_version();
+                parent_of_merge.increment_version();
+                cache->template Write<BLeaf>(leaf.remote_origin(), empty_leaf, prealloc_leaf_w);
+                cache->template Write<BLeaf>(merging_leaf.remote_origin(), merged_leaf, prealloc_leaf_w, internal::RDMAWriteBehavior::RDMAWriteWithNoAck);
+                cache->template Write<BNode>(curr.remote_origin(), parent_of_merge, prealloc_node_w, internal::RDMAWriteBehavior::RDMAWriteWithNoAck);
+              }
+              return leaf;
+            } else {
+              REMUS_ASSERT(false, "Unreachable");
+            }
+          } else {
+            // failed to acquire leaf, release
+            release<BLeaf>(pool, leaf.remote_origin(), leaf->version());
+          }
         }
       } // else nothing was acquired, try again
     } else {
@@ -920,11 +927,25 @@ public:
       REMUS_INFO("Struct Memory (BLeaf): {} % 64 = {}", sizeof(BLeaf), sizeof(BLeaf) % 64);
     }
     temp_lock = pool->template Allocate<uint64_t>(8); // allocates 8 to ensure size of object=64
+    // prealloc some memory
+    prealloc_root_r = pool->template Allocate<BRoot>();
+    prealloc_root_w = pool->template Allocate<BRoot>();
+    prealloc_node_w = pool->template Allocate<BNode>();
+    prealloc_leaf_r1 = pool->template Allocate<BLeaf>();
+    prealloc_leaf_r2 = pool->template Allocate<BLeaf>();
+    prealloc_leaf_w = pool->template Allocate<BLeaf>();
   };
 
   /// Free all the resources associated with the IHT
   void destroy(capability* pool) {
     pool->template Deallocate<uint64_t>(temp_lock, 8);
+    pool->template Deallocate<BRoot>(prealloc_root_r);
+    pool->template Deallocate<BRoot>(prealloc_root_w);
+    pool->template Deallocate<BNode>(prealloc_node_w);
+    pool->template Deallocate<BLeaf>(prealloc_leaf_r1);
+    pool->template Deallocate<BLeaf>(prealloc_leaf_r2);
+    pool->template Deallocate<BLeaf>(prealloc_leaf_w);
+
     if (pool->template is_local(root)){
       BRoot tmp_root = *root;
       pool->template Deallocate<BRoot>(root);
