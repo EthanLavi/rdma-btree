@@ -203,13 +203,13 @@ public:
     }
 
     template <typename T>
-    inline CachedObject<T> Read(rdma_ptr<T> ptr){
-        return ExtendedRead(ptr, 1);
+    inline CachedObject<T> Read(rdma_ptr<T> ptr, rdma_ptr<T> prealloc = nullptr){
+        return ExtendedRead(ptr, 1, prealloc);
     }
 
     // todo: add a prealloc that is for non-marked pointers!
     template <typename T>
-    CachedObject<T> ExtendedRead(rdma_ptr<T> ptr, int size){
+    CachedObject<T> ExtendedRead(rdma_ptr<T> ptr, int size, rdma_ptr<T> prealloc = nullptr){
         // Periodically call try_free_some to cleanup limbo lists
         try_free_some();
     
@@ -285,13 +285,15 @@ public:
         } else {
             // -- No cache -- //
             // Setup the result
-            result = pool->template ExtendedRead<T>(ptr, size);
+            result = pool->template ExtendedRead<T>(ptr, size, prealloc);
 
             // Increment metrics
             metrics.remote_reads++;
             metrics.allocation++;
             return CachedObject<T>(ptr, result, [=](){
-                pool->template Deallocate<T>(result, size);
+                if (result != prealloc){ // don't accidentally deallocate prealloc
+                    pool->template Deallocate<T>(result, size);
+                }
             });
         }
     }
