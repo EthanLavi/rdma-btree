@@ -13,9 +13,16 @@ inline rdma_ptr<T> mark_ptr(rdma_ptr<T> ptr){
     return rdma_ptr<T>(ptr.raw() | mask);
 }
 
+template<typename T>
+inline rdma_ptr<T> cond_mark_ptr(bool condition, rdma_ptr<T> ptr){
+    if (condition)
+        return rdma_ptr<T>(ptr.raw() | mask);
+    return ptr;
+}
+
 /// Is marked for caching
 template<typename T>
-inline bool is_marked(rdma_ptr<T>& ptr){
+inline bool is_marked(rdma_ptr<T> ptr){
     return ptr.raw() & mask;
 }
 

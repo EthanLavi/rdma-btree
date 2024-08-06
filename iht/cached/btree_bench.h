@@ -24,7 +24,7 @@ using namespace remus::util;
 using namespace remus::rdma;
 
 typedef RdmaBPTree<int, 12, rdma_capability_thread> BTree; // todo: increment size more?
-typedef RdmaBPTree<int, 12, CountingPool> BTreeLocal;
+typedef RdmaBPTree<int, 1, CountingPool> BTreeLocal;
 
 inline void btree_run(BenchmarkParams& params, rdma_capability* capability, RemoteCache* cache, Peer& host, Peer& self, std::vector<Peer> peers){
     // Create a list of client and server  threads
@@ -343,7 +343,7 @@ inline void btree_run_local(Peer& self){
     RemoteCacheImpl<CountingPool>* cach = new RemoteCacheImpl<CountingPool>(pool);
     RemoteCacheImpl<CountingPool>::pool = pool; // set pool to other pool so we acccept our own cacheline
 
-    if (true){
+    if (false){
         BenchmarkParams params = BenchmarkParams();
         params.cache_depth = CacheDepth::None;
         params.contains = 0;
@@ -373,11 +373,12 @@ inline void btree_run_local(Peer& self){
     ebr_leaf->RegisterThread();
     ebr_node->RegisterThread();
 
-    BTreeLocal tree = BTreeLocal(self, CacheDepth::RootOnly, cach, pool, ebr_leaf, ebr_node, true);
+    BTreeLocal tree = BTreeLocal(self, CacheDepth::UpToLayer2, cach, pool, ebr_leaf, ebr_node, true);
     rdma_ptr<anon_ptr> ptr = tree.InitAsFirst(pool);
     REMUS_INFO("DONE INIT");
 
-    for(int i = 50; i >= 0; i--){
+    for(int i = 40; i >= 0; i--){
+        tree.debug();
         tree.insert(pool, i, i);
     }
 
@@ -388,13 +389,13 @@ inline void btree_run_local(Peer& self){
         if (tree.contains(pool, i).value_or(-1) == i) second_cnt++;
     }
     REMUS_INFO("Contain = {}", second_cnt);
+    tree.debug();
+    // for(int i = 50; i >= 0; i--){
+    //     tree.remove(pool, i);
+    //     tree.remove(pool, i); // do twice to cause a removal
+    // }
 
-    for(int i = 50; i >= 0; i--){
-        tree.remove(pool, i);
-        tree.remove(pool, i); // do twice to cause a removal
-    }
-
-    REMUS_INFO(tree.contains(pool, 0).value_or(-1));
+    // REMUS_INFO(tree.contains(pool, 0).value_or(-1));
 
     // const int THREAD_COUNT = 1;
     // std::vector<std::thread> threads;
@@ -411,7 +412,7 @@ inline void btree_run_local(Peer& self){
     // for(int tid = 0; tid != THREAD_COUNT; tid++){
     //     threads.at(tid).join();
     // }
-    tree.debug();
+    // tree.debug();
     
     REMUS_INFO("Tree is valid? {}", tree.valid());
     REMUS_INFO("Done!");
@@ -421,7 +422,7 @@ inline void btree_run_local(Peer& self){
     tree.destroy(pool);
     delete cach;
     if (!pool->HasNoLeaks()){
-        pool->debug();
+        // pool->debug();
         REMUS_FATAL("Leaked memory");
     }
 }

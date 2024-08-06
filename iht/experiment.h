@@ -88,9 +88,12 @@ public:
             case CacheDepth::UpToLayer2:
                 cache_depth = CacheDepth::UpToLayer2;
                 break;
+            case CacheDepth::UpToLayer3:
+                cache_depth = CacheDepth::UpToLayer3;
+                break;
             default:
-                REMUS_WARN("Unknown cache depth. Defaulting to 0");
-                cache_depth = CacheDepth::None;
+                cache_depth = (CacheDepth::CacheDepth) depth;
+                REMUS_WARN("Unknown cache depth. Defaulting to {}", cache_depth);
                 break;
         }
     }

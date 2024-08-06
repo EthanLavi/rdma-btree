@@ -20,12 +20,7 @@
 using namespace remus::rdma;
 
 /* 
-todo
-
-Run btree and skiplist on RDMA since they underwent significant changes!
-1) Optimize write behaviors
-2) Caching
-3) Prealloc?
+todo: Optimize write behaviors
 */
 
 /// Random seeds with around half of the bits set. 
@@ -99,7 +94,7 @@ private:
     using RemoteCache = RemoteCacheImpl<capability>;
 
     Peer self_;
-    int cache_depth_;
+    int cache_floor_;
 
     typedef node<K, MAX_HEIGHT> Node;
     typedef rdma_ptr<Node> nodeptr;
@@ -245,7 +240,7 @@ private:
 
 public:
     RdmaSkipList(Peer& self, int cache_floor, RemoteCache* cache, capability* pool, vector<Peer> peers, EBRObjectPool<Node, 100, capability>* ebr) 
-    : self_(std::move(self)), cache_depth_(cache_floor), cache(cache), ebr(ebr) {
+    : self_(std::move(self)), cache_floor_(cache_floor), cache(cache), ebr(ebr) {
         REMUS_INFO("SENTINEL is MIN? {}", MINKEY);
         prealloc_node_w = pool->template Allocate<Node>();
         prealloc_count_node = pool->template Allocate<Node>();
@@ -272,7 +267,7 @@ public:
 
                     // deallocate unlinked node
                     LimboLists<Node>* q = qs.at(i);
-                    q->free_lists[2].load()->push(curr.remote_origin());
+                    q->free_lists[2].load()->push(unmark_ptr(curr.remote_origin()));
                     
                     // cycle the index
                     i++;
@@ -429,19 +424,26 @@ public:
 
             // allocates a node
             nodeptr new_node_ptr = ebr->allocate(pool);
+            int height = 1;
             if (pool->is_local(new_node_ptr)){
                 *new_node_ptr = Node(key, value);
+                height = new_node_ptr->height;
                 new_node_ptr->next[0] = curr->next[0];
             } else {
                 Node new_node = Node(key, value);
                 new_node.next[0] = curr->next[0];
+                height = new_node.height;
                 pool->template Write<Node>(new_node_ptr, new_node, prealloc_node_w);
             }
 
             // if the next is a deleted node, we need to physically delete
             rdma_ptr<uint64_t> dest = get_level_ptr(curr.remote_origin(), 0);
+            nodeptr new_node_ptr_marked = new_node_ptr;
+            if (height > cache_floor_){
+                new_node_ptr_marked = mark_ptr(new_node_ptr_marked);
+            }
             // will fail if the ptr is marked for unlinking
-            uint64_t old = pool->template CompareAndSwap<uint64_t>(dest, sans(curr->next[0]).raw(), new_node_ptr.raw());
+            uint64_t old = pool->template CompareAndSwap<uint64_t>(dest, sans(curr->next[0]).raw(), new_node_ptr_marked.raw());
             if (old == curr->next[0].raw()){ // if our CAS was successful, invalidate the object we modified
                 cache->Invalidate(curr.remote_origin());
                 ebr->match_version(pool);
@@ -517,8 +519,10 @@ public:
             Node curr = *root;
             std::cout << height << " SENT -> ";
             while(sans(curr.next[height]) != nullptr){
+                std::string marked_next = "";
+                if (is_marked(curr.next[height])) marked_next = "!";
                 curr = *sans(curr.next[height]);
-                std::cout << curr.key << " -> ";
+                std::cout << curr.key << marked_next << " -> ";
                 counter++;
             }
             std::cout << "END{" << counter << "}" << std::endl;
@@ -528,10 +532,12 @@ public:
         Node curr = *root;
         std::cout << 0 << " SENT -> ";
         while(sans(curr.next[0]) != nullptr){
+            std::string marked_next = "";
+            if (is_marked(curr.next[0])) marked_next = "!";
             curr = *sans(curr.next[0]);
-            if (curr.value == DELETE_SENTINEL) std::cout << "DELETED(" << curr.key << ") -> ";
-            else if (curr.value == UNLINK_SENTINEL) std::cout << "UNLINKED(" << curr.key << ") -> ";
-            else std::cout << curr.key << " -> ";
+            if (curr.value == DELETE_SENTINEL) std::cout << "DELETED(" << curr.key << marked_next << ") -> ";
+            else if (curr.value == UNLINK_SENTINEL) std::cout << "UNLINKED(" << curr.key << marked_next << ") -> ";
+            else std::cout << curr.key << marked_next << " -> ";
             counter++;
         }
         std::cout << "END{" << counter << "}" << std::endl;

@@ -228,7 +228,7 @@ inline void rdmask_run_local(Peer& self){
     EBRObjectPool<Node, 100, CountingPool>* ebr = new EBRObjectPool<Node, 100, CountingPool>(pool, 3);
     // ebr->Init(rdma_capability *two_sided_pool, int node_id, vector<Peer> peers);
     // would use to connect to remote peers
-    RDMASKLocal sk = RDMASKLocal(self, MAX_HEIGHT + 1, cach, pool, {self}, ebr);
+    RDMASKLocal sk = RDMASKLocal(self, 2, cach, pool, {self}, ebr);
     sk.InitAsFirst(pool);
     vector<LimboLists<Node>*> qs;
     qs.push_back(ebr->RegisterThread());

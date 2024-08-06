@@ -1,13 +1,13 @@
 #pragma once
 
 /// @brief an input to determine the depth of the IHT caching
-/// todo: Cache depth is only up to 3 layers
 namespace CacheDepth {
   enum CacheDepth {
     None = 0,
     RootOnly = 1,
     UpToLayer1 = 2,
     UpToLayer2 = 3,
+    UpToLayer3 = 4,
   };
 }
 

@@ -25,10 +25,6 @@ static const K SENTINEL = INT_MAX;
 
 static const bool ADDR = false;
 
-/*
-todo: Caching
-*/
-
 template <class V, int DEGREE, class capability> class RdmaBPTree {
   /// SIZE is DEGREE * 2
   // typedef CountingPool capability;
@@ -113,6 +109,25 @@ public:
         set_ptr(i, nullptr);
       }
       set_ptr(SIZE, nullptr);
+    }
+
+    /// Conditionally mark nodes
+    void cond_unmark(bool cond){
+      if (cond && is_marked(ptr_at(0))){
+        for(int i = 0; i < SIZE + 1; i++){
+          if (ptr_at(i) != nullptr) set_ptr(i, unmark_ptr(ptr_at(i)));
+        }
+      }
+    }
+
+    std::string is_all_marked(){
+      bool has_mark = is_marked(ptr_at(0));
+      for(int i = 1; i < SIZE + 1; i++){
+        if (ptr_at(i) != nullptr && has_mark != is_marked(ptr_at(i))){
+          return "[inconsistent]";
+        }
+      }
+      return has_mark ? "[marked]" : "[unmarked]";
     }
 
     /// Checks if the version is valid
@@ -309,7 +324,6 @@ private:
 
   template <class ptr_t>
   void release(capability* pool, rdma_ptr<ptr_t> node, long version){
-    // todo: optimize using write behaviors and caching
     pool->template Write<uint64_t>(static_cast<rdma_ptr<uint64_t>>(unmark_ptr(node)), version, temp_lock, internal::RDMAWriteBehavior::RDMAWriteWithNoAck);
   }
 
@@ -438,14 +452,14 @@ private:
     return original_key;
   }
 
-  // todo: mark ptr
-  /// At root
+  /// At root, splitting node_p into two with a new parent
   void split_node(capability* pool, CachedObject<BRoot>& parent_p, CachedObject<BNode>& node_p){
     BRoot parent = *parent_p;
     BNode node = *node_p;
 
     // Full node so split
     bnode_ptr new_parent = ebr_node->allocate(pool);
+    new_parent = cond_mark_ptr(cache_depth_ >= CacheDepth::RootOnly, new_parent);
     parent.set_start_and_inc(new_parent);
 
     bnode_ptr new_neighbor = ebr_node->allocate(pool);
@@ -454,10 +468,12 @@ private:
       *new_neighbor = BNode();
       to_parent = split_keys<BNode*, bnode_ptr>(&node, new_neighbor, true);
       split_ptrs(&node, (BNode*) new_neighbor);
+      new_neighbor->cond_unmark(cache_depth_ <= CacheDepth::UpToLayer1);
     } else {
       BNode new_neighbor_local = BNode();
       to_parent = split_keys<BNode*, BNode*>(&node, &new_neighbor_local, true);
       split_ptrs(&node, &new_neighbor_local);
+      new_neighbor_local.cond_unmark(cache_depth_ <= CacheDepth::UpToLayer1);
       cache->template Write<BNode>(new_neighbor, new_neighbor_local, prealloc_node_w);
     }
 
@@ -465,18 +481,20 @@ private:
       *new_parent = BNode();
       new_parent->set_key(0, to_parent);
       new_parent->set_ptr(0, node_p.remote_origin());
-      new_parent->set_ptr(1, new_neighbor);
+      new_parent->set_ptr(1, cond_mark_ptr(is_marked(node_p.remote_origin()), new_neighbor));
+      new_parent->cond_unmark(cache_depth_ <= CacheDepth::RootOnly);
     } else {
       BNode new_parent_local = BNode();
       new_parent_local.set_key(0, to_parent);
       new_parent_local.set_ptr(0, node_p.remote_origin());
-      new_parent_local.set_ptr(1, new_neighbor);
+      new_parent_local.set_ptr(1, cond_mark_ptr(is_marked(node_p.remote_origin()), new_neighbor));
+      new_parent_local.cond_unmark(cache_depth_ <= CacheDepth::RootOnly);
       cache->template Write<BNode>(new_parent, new_parent_local, prealloc_node_w);
     }
 
     parent.increment_version();
     node.increment_version(); // increment version before writing
-
+    node.cond_unmark(cache_depth_ <= CacheDepth::UpToLayer1);
     cache->template Write<BRoot>(parent_p.remote_origin(), parent, prealloc_root_w);      
     cache->template Write<BNode>(node_p.remote_origin(), node, prealloc_node_w);
   }
@@ -488,6 +506,7 @@ private:
 
     // Full node so split
     bnode_ptr new_parent = ebr_node->allocate(pool);
+    new_parent = cond_mark_ptr(cache_depth_ >= CacheDepth::RootOnly, new_parent);
     parent.set_start_and_inc(new_parent);
 
     bleaf_ptr new_neighbor = ebr_leaf->allocate(pool);
@@ -511,13 +530,13 @@ private:
     if (pool->template is_local(new_parent)){
       *new_parent = BNode();
       new_parent->set_key(0, to_parent);
-      new_parent->set_ptr(0, static_cast<bnode_ptr>(node_p.remote_origin()));
-      new_parent->set_ptr(1, static_cast<bnode_ptr>(new_neighbor));
+      new_parent->set_ptr(0, static_cast<bnode_ptr>(unmark_ptr(node_p.remote_origin())));
+      new_parent->set_ptr(1, static_cast<bnode_ptr>(unmark_ptr(new_neighbor)));
     } else {
       BNode new_parent_local = BNode();
       new_parent_local.set_key(0, to_parent);
-      new_parent_local.set_ptr(0, static_cast<bnode_ptr>(node_p.remote_origin()));
-      new_parent_local.set_ptr(1, static_cast<bnode_ptr>(new_neighbor));
+      new_parent_local.set_ptr(0, static_cast<bnode_ptr>(unmark_ptr(node_p.remote_origin())));
+      new_parent_local.set_ptr(1, static_cast<bnode_ptr>(unmark_ptr(new_neighbor)));
       cache->template Write<BNode>(new_parent, new_parent_local, prealloc_node_w);
     }
   
@@ -528,7 +547,7 @@ private:
   }
 
   /// Not at root
-  void split_node(capability* pool, CachedObject<BNode>& parent_p, CachedObject<BNode>& node_p){
+  void split_node(capability* pool, CachedObject<BNode>& parent_p, CachedObject<BNode>& node_p, int level_parent){
     BNode parent = *parent_p;
     BNode node = *node_p;
     
@@ -539,10 +558,12 @@ private:
       *new_neighbor = BNode();
       to_parent = split_keys<BNode*, bnode_ptr>(&node, new_neighbor, true);
       split_ptrs(&node, (BNode*) new_neighbor);
+      new_neighbor->cond_unmark(level_parent + 1 >= cache_depth_);
     } else {
       BNode new_neighbor_local = BNode();
       to_parent = split_keys<BNode*, BNode*>(&node, &new_neighbor_local, true);
       split_ptrs(&node, &new_neighbor_local);
+      new_neighbor_local.cond_unmark(level_parent + 1 >= cache_depth_);
       cache->template Write<BNode>(new_neighbor, new_neighbor_local, prealloc_node_w);
     }
 
@@ -551,11 +572,13 @@ private:
 
     shift_up(&parent, bucket);
     parent.set_key(bucket, to_parent);
-    parent.set_ptr(bucket + 1, new_neighbor);
+    parent.set_ptr(bucket + 1, cond_mark_ptr(is_marked(parent.ptr_at(0)), new_neighbor));
 
     parent.increment_version(); // increment version before writing
     node.increment_version();
-
+    // unmark parent and node in conjuction with splitting
+    parent.cond_unmark(level_parent >= cache_depth_);
+    node.cond_unmark(level_parent + 1 >= cache_depth_);
     cache->template Write<BNode>(parent_p.remote_origin(), parent, prealloc_node_w);
     cache->template Write<BNode>(node_p.remote_origin(), node, prealloc_node_w);
   }
@@ -594,7 +617,7 @@ private:
 
     shift_up(&parent, bucket);
     parent.set_key(bucket, to_parent);
-    parent.set_ptr(bucket + 1, static_cast<bnode_ptr>(new_neighbor));
+    parent.set_ptr(bucket + 1, static_cast<bnode_ptr>(cond_mark_ptr(is_marked(parent.ptr_at(0)), new_neighbor)));
     parent.increment_version();
     node.increment_version();
 
@@ -667,6 +690,7 @@ private:
     // read root first
     CachedObject<BRoot> curr_root = cache->template Read<BRoot>(root, prealloc_root_r);
     int height = curr_root->height;
+    int level = 1;
     bnode_ptr next_level = curr_root->start;
     REMUS_ASSERT_DEBUG(next_level != nullptr, "Accessing SENTINEL's ptr");
 
@@ -722,7 +746,7 @@ private:
           cache->template Write<BRoot>(curr_root.remote_origin(), new_root, prealloc_root_w);
           release<BNode>(pool, curr.remote_origin(), curr->version());
 
-          ebr_node->deallocate(curr.remote_origin()); // deallocate the unlinked node
+          ebr_node->deallocate(unmark_ptr(curr.remote_origin())); // deallocate the unlinked node
         } else {
           release<BRoot>(pool, curr_root.remote_origin(), curr_root->version()); // continue traversing, we failed to lower a level
         }
@@ -741,7 +765,7 @@ private:
         if (try_acquire<BNode>(pool, parent.remote_origin(), parent->version())) {
           if (try_acquire<BNode>(pool, curr.remote_origin(), curr->version())) {
             // can acquire parent and current, so split
-            split_node(pool, parent, curr);
+            split_node(pool, parent, curr, level);
           } else {
             // cannot acquire child so release parent and try again
             release<BNode>(pool, parent.remote_origin(), parent->version());
@@ -772,9 +796,9 @@ private:
                 BNode merged_node = *merging_node;
                 BNode parent_of_merge = *parent;
                 if (merge_node(&empty_node, bucket, &merged_node, bucket_neighbor, &parent_of_merge)){
-                  ebr_node->deallocate(curr.remote_origin());
+                  ebr_node->deallocate(unmark_ptr(curr.remote_origin()));
                 } else {
-                  ebr_node->deallocate(merging_node.remote_origin()); 
+                  ebr_node->deallocate(unmark_ptr(merging_node.remote_origin())); 
                 }
                 empty_node.increment_version();
                 merged_node.increment_version();
@@ -801,6 +825,7 @@ private:
       }
       bucket = search_node<BNode>(curr, key);
       height--;
+      level++;
     }
 
     // Get the next level ptr
@@ -885,7 +910,7 @@ private:
               BLeaf merged_leaf = *merging_leaf;
               BNode parent_of_merge = *curr;
               if (merge_leaf(&empty_leaf, bucket, &merged_leaf, bucket_neighbor, &parent_of_merge)){
-                ebr_leaf->deallocate(leaf.remote_origin());
+                ebr_leaf->deallocate(unmark_ptr(leaf.remote_origin()));
                 empty_leaf.increment_version();
                 merged_leaf.increment_version();
                 parent_of_merge.increment_version();
@@ -893,7 +918,7 @@ private:
                 cache->template Write<BLeaf>(leaf.remote_origin(), empty_leaf, prealloc_leaf_w, internal::RDMAWriteBehavior::RDMAWriteWithNoAck);
                 cache->template Write<BNode>(curr.remote_origin(), parent_of_merge, prealloc_node_w, internal::RDMAWriteBehavior::RDMAWriteWithNoAck);
               } else {
-                ebr_leaf->deallocate(merging_leaf.remote_origin());
+                ebr_leaf->deallocate(unmark_ptr(merging_leaf.remote_origin()));
                 empty_leaf.increment_version();
                 merged_leaf.increment_version();
                 parent_of_merge.increment_version();
@@ -967,16 +992,16 @@ public:
     bleaf_ptr bleaf = pool->template Allocate<BLeaf>();
     *bleaf = BLeaf();
     this->root->start = static_cast<bnode_ptr>(bleaf);
-    // if (cache_depth_ >= 1)
-    //     this->root = mark_ptr(this->root);
+    if (cache_depth_ >= CacheDepth::RootOnly)
+        this->root = mark_ptr(this->root);
     return static_cast<rdma_ptr<anon_ptr>>(this->root);
   }
 
   /// @brief Initialize an IHT from the pointer of another IHT
   /// @param root_ptr the root pointer of the other iht from InitAsFirst();
   void InitFromPointer(rdma_ptr<anon_ptr> root_ptr){
-      // if (cache_depth_ >= 1)
-      //   root_ptr = mark_ptr(root_ptr);
+      if (cache_depth_ >= CacheDepth::RootOnly)
+        root_ptr = mark_ptr(root_ptr);
     this->root = static_cast<rdma_ptr<BRoot>>(root_ptr);
   }
 
@@ -1091,10 +1116,13 @@ public:
     for(int i = 0; i < indent; i++){
       std::cout << "\t";
     }
+    std::cout << n.is_all_marked() << " ";
     std::cout << (n.is_valid() ? "valid " : "invalid ") << "(" << n.version() << ", " << height << ", " << index << ")";
     std::cout << " => ";
     if (ADDR)
       std::cout << std::hex << n.ptr_at(0).address() << std::dec;
+    else
+      std::cout << (is_marked(n.ptr_at(0)) ? "!" : "");
     for(int i = 0; i < SIZE; i++){
       if (ADDR){
         if (n.key_at(i) == SENTINEL)
@@ -1106,6 +1134,7 @@ public:
               std::cout << " (SENT) ";
             else
               std::cout << " (" << n.key_at(i) << ") ";
+          std::cout << (is_marked(n.ptr_at(i + 1)) ? "!" : "");
       }
     }
     std::cout << std::endl;
@@ -1117,6 +1146,16 @@ public:
 
   /// Single threaded print
   void debug(){
+    if (is_marked(root)){
+      std::cout << "[marked] ";
+    } else {
+      std::cout << "[unmarked] ";
+    }
+    if (is_marked(root->start)){
+      std::cout << "[marked-start] ";
+    } else {
+      std::cout << "[unmarked-start] ";
+    }
     BRoot r = *root;
     std::cout << "Root(height=" << r.height << ")" << std::endl;
     debug(r.height, r.start, 0, 0);
