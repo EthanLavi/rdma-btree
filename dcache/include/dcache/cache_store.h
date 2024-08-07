@@ -277,9 +277,9 @@ public:
                 metrics.remote_reads++;
                 metrics.conflict_misses++;
             }
+            reference_counter->fetch_add(1); // increment ref count before releasing cache line and causing other issues
             // Unlock mutex on cache line
             l->mu->unlock();
-            reference_counter->fetch_add(1);
             // remark the ptr for the remote origin
             return CachedObject<T>(mark_ptr(ptr), result, reference_counter);
         } else {
