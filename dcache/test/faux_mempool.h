@@ -5,6 +5,7 @@
 #include <cstring>
 #include <remus/logging/logging.h>
 #include <remus/rdma/rdma.h>
+#include <shared_mutex>
 
 using namespace remus::rdma;
 using namespace std;
@@ -20,25 +21,26 @@ class CountingPool {
     int total_allocations;
     int total_deallocations;
     bool locality;
-    mutex mu;
+    shared_mutex mu;
+    mutex alloc_mu;
 
 public:
     CountingPool(bool all_local) : locality(all_local), total_allocations(0), total_deallocations(0) {}
 
     template <typename T>
     rdma_ptr<T> Allocate(int size = 1){
-        mu.lock();
+        alloc_mu.lock();
         total_allocations++;
         int bytes = sizeof(T) * size;
         T* p = (T*) malloc(bytes);
         allocat[(void*) p] = bytes;
-        mu.unlock();
+        alloc_mu.unlock();
         return rdma_ptr<T>(0, p);
     }
 
     template <typename T>
     void Deallocate(rdma_ptr<T> p, int size = 1){
-        mu.lock();
+        alloc_mu.lock();
         total_deallocations++;
         REMUS_ASSERT(p != nullptr, "Deallocating a nullptr");
         int bytes = sizeof(T) * size;
@@ -47,7 +49,7 @@ public:
         REMUS_ASSERT(allocat.at(add) == bytes, "Found free with ptr {} with wrong size (actual={} != freed={}) {}/{}", p, allocat.at(add), bytes, sizeof(T), size);
         allocat.erase(add);
         free((T*) p.address());
-        mu.unlock();
+        alloc_mu.unlock();
     }
 
     template <typename T>
@@ -67,18 +69,27 @@ public:
         }
         if (prealloc == nullptr){
             rdma_ptr<T> p_new = Allocate<T>(size);
-            mu.lock();
+            mu.lock_shared();
             memcpy(p_new.get(), p.get(), sizeof(T) * size);
-            mu.unlock();
+            mu.unlock_shared();
             return p_new;
         } else {
             // read into prealloc instead of internally allocating
-            mu.lock();
+            mu.lock_shared();
             memcpy(prealloc.get(), p.get(), sizeof(T) * size);
-            mu.unlock();
+            mu.unlock_shared();
             return prealloc;
         }        
     }
+
+    template <typename T> T AtomicSwap(rdma_ptr<T> ptr, uint64_t swap, uint64_t hint = 0) {
+        mu.lock();
+        T old = *ptr;
+        *ptr = swap;
+        mu.unlock();
+        return old;
+    }
+
 
     template <typename T>
     void Write(rdma_ptr<T> ptr, const T& val, rdma_ptr<T> prealloc = nullptr, internal::RDMAWriteBehavior write_behavior = internal::RDMAWriteWithAck){
@@ -139,9 +150,9 @@ public:
     }
 
     bool HasNoLeaks(){
-        mu.lock();
+        alloc_mu.lock();
         int size = allocat.size();
-        mu.unlock();
+        alloc_mu.unlock();
         return size == 0;
     }
 
