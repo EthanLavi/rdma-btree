@@ -4,7 +4,7 @@
 #include <queue>
 #include <remus/rdma/rdma.h>
 // #include "random.h"
-#include "skiplist.h"
+#include "skiplist_api.h"
 // #include "slice.h"
 #include "timer.h"
 #include "WRLock.h"
@@ -22,39 +22,6 @@ struct CacheEntry {
     uint32_t from;
     uint32_t to;
     mutable WithFreq<T>* data;
-};
-
-template<class T>
-struct CacheEntryComparator {
-  typedef CacheEntry<T> DecodedType;
-
-  static CacheEntry<T> decode_key(const char *bytes) {  return *(CacheEntry<T> *) bytes; }
-
-  int cmp(const CacheEntry<T> a_v, const CacheEntry<T> b_v) const {
-    if (a_v.to < b_v.to) {
-      return -1;
-    }
-
-    if (a_v.to > b_v.to) {
-      return +1;
-    }
-
-    if (a_v.from < b_v.from) {
-      return +1;
-    } else if (a_v.from > b_v.from) {
-      return -1;
-    } else {
-      return 0;
-    }
-  }
-
-  int operator()(const char *a, const char *b) const {
-    return cmp(decode_key(a), decode_key(b));
-  }
-
-  int operator()(const char *a, const CacheEntry<T> b) const {
-    return cmp(decode_key(a), b);
-  }
 };
 
 // Defintions from sherman
@@ -100,27 +67,52 @@ inline void compiler_barrier() { asm volatile("" ::: "memory"); }
 
 template <class T, int DEGREE, typename Key>
 class IndexCache {
-  using CacheSkipList = InlineSkipList<CacheEntryComparator<T>>;
+private:
+  using CacheSkipList = SkipList<CacheEntry<T>*>;
   static const int SIZE = (DEGREE * 2) + 1;
+  uint64_t cache_size; // MB;
+  std::atomic<int64_t> free_page_cnt;
+  std::atomic<int64_t> skiplist_node_cnt;
+  int64_t all_page_cnt;
+
+  std::queue<std::pair<WithFreq<T>*, uint64_t>> delay_free_list;
+  WRLock free_lock;
+
+  // SkipList
+  CacheSkipList *skiplist;
+
+  void evict_one(){
+    uint64_t freq1, freq2;
+    auto e1 = get_a_random_entry(freq1);
+    auto e2 = get_a_random_entry(freq2);
+
+    if (freq1 < freq2) {
+      invalidate(e1);
+    } else {
+      invalidate(e2);
+    }
+  }
 public:
   IndexCache(int cache_size) : cache_size(cache_size) {
-    skiplist = new CacheSkipList(cmp, &alloc, 21); // create a skiplist
     uint64_t memory_size = define::MB * cache_size;
-
+    skiplist = new CacheSkipList();
     all_page_cnt = memory_size / sizeof(T);
     free_page_cnt.store(all_page_cnt);
     skiplist_node_cnt.store(0);
   }
 
+  ~IndexCache(){
+    delete skiplist;
+  }
+
   bool add_to_cache(T* page){
-    WithFreq<T>* new_page = (WithFreq<T>*) malloc(sizeof(WithFreq<T>));
-    memcpy(new_page, page, sizeof(T));
-    new_page->index_cache_freq = 0;
+    CacheEntry<T>* new_page = (CacheEntry<T>*) malloc(sizeof(CacheEntry<T>));
+    WithFreq<T>* payload = (WithFreq<T>*) malloc(sizeof(WithFreq<T>));
+    memcpy(payload, page, sizeof(T));
+    payload->index_cache_freq = 0;
+    new_page->data = payload;
 
     if (this->add_entry(page->key_low(), page->key_high(), new_page)) {
-      // todo: remove
-      REMUS_INFO("Success");
-      skiplist->Print();
       skiplist_node_cnt.fetch_add(1);
       auto v = free_page_cnt.fetch_add(-1);
       if (v <= 0) {
@@ -128,9 +120,9 @@ public:
       }
 
       return true;
-    } else { // conflicted
+    } else { // conflicted but matches the keyrange. can cas to new page
       auto e = this->find_entry(page->key_low(), page->key_high());
-      if (e && e->from == page->key_low() && e->to == page->key_high() - 1) {
+      if (e && e->from == page->key_low() && e->to == page->key_high()) {
         WithFreq<T>* ptr = e->data;
         if (ptr == nullptr && __sync_bool_compare_and_swap(&(e->data), 0ull, new_page)) {
           auto v = free_page_cnt.fetch_add(-1);
@@ -188,54 +180,22 @@ public:
     return nullptr;
   }
 
-  void search_range_from_cache(const Key &from, const Key &to, std::vector<WithFreq<T>*>& result){
-    typename CacheSkipList::Iterator iter(skiplist);
-
-    result.clear();
-    CacheEntry<T> e;
-    e.from = from;
-    e.to = from;
-    iter.Seek((char *)&e);
-
-    while (iter.Valid()) {
-      const CacheEntry<T>* val = (const CacheEntry<T>*) iter.key();
-      if (val->data != nullptr) {
-        if (val->from > to) {
-          return;
-        }
-        result.push_back(val->data);
-      }
-      iter.Next();
-    }
+  bool add_entry(const Key &from, const Key &to, CacheEntry<T>* ptr){
+    ptr->from = from;
+    ptr->to = to;
+    return skiplist->insert(from, to, ptr);
   }
 
-  bool add_entry(const Key &from, const Key &to, WithFreq<T>* ptr){
-    // TODO memory leak
-    auto buf = skiplist->AllocateKey(sizeof(CacheEntry<T>));
-    CacheEntry<T> e = *(CacheEntry<T>*) buf;
-    e.from = from;
-    e.to = to - 1; // !IMPORTANT;
-    e.data = ptr;
-    return skiplist->InsertConcurrently(buf);
+  const CacheEntry<T>* find_entry(const Key &k){
+    CacheEntry<T>* tmp;
+    bool result = skiplist->get(k, &tmp);
+    return result ? tmp : nullptr;
   }
 
-  const CacheEntry<T> *find_entry(const Key &k){
-    return find_entry(k, k + 1);
-  }
-
-  const CacheEntry<T> *find_entry(const Key &from, const Key &to){
-    typename CacheSkipList::Iterator iter(skiplist);
-
-    CacheEntry<T> e;
-    e.from = from;
-    e.to = to - 1;
-    iter.Seek((char *)&e);
-    if (iter.Valid()) {
-      auto val = (const CacheEntry<T>*) iter.key();
-      return val;
-    } else {
-      return nullptr;
-    }
+  const CacheEntry<T>* find_entry(const Key &low, const Key &high){
+    CacheEntry<T>* tmp;
+    bool result = skiplist->get(low, &tmp);
+    return result ? tmp : nullptr;
   }
 
   bool invalidate(const CacheEntry<T> *entry) {
@@ -245,10 +205,14 @@ public:
       return false;
     }
 
+    // delete
     if (__sync_bool_compare_and_swap(&(entry->data), ptr, 0)) {
       free_lock.wLock();
       delay_free_list.push(std::make_pair(ptr, asm_rdtsc()));
       free_lock.wUnlock();
+      CacheEntry<T>* tmp;
+      skiplist->remove(entry->from, entry->to, &tmp);
+      // todo: memory leak of cache entry
       return true;
     }
 
@@ -290,31 +254,5 @@ public:
       this->find_entry(r);
     }
     t.end_print(loop);
-}
-
-private:
-  uint64_t cache_size; // MB;
-  std::atomic<int64_t> free_page_cnt;
-  std::atomic<int64_t> skiplist_node_cnt;
-  int64_t all_page_cnt;
-
-  std::queue<std::pair<WithFreq<T>*, uint64_t>> delay_free_list;
-  WRLock free_lock;
-
-  // SkipList
-  CacheSkipList *skiplist;
-  CacheEntryComparator<T> cmp;
-  Allocator alloc;
-
-  void evict_one(){
-    uint64_t freq1, freq2;
-    auto e1 = get_a_random_entry(freq1);
-    auto e2 = get_a_random_entry(freq2);
-
-    if (freq1 < freq2) {
-      invalidate(e1);
-    } else {
-      invalidate(e2);
-    }
   }
 };
