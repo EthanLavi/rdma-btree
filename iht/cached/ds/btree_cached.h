@@ -21,7 +21,7 @@
 using namespace remus::rdma;
 
 typedef int32_t K;
-static const K SENTINEL = INT_MAX;
+#define SENTINEL INT_MAX
 
 static const bool ADDR = false;
 

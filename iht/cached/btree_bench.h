@@ -23,10 +23,8 @@
 using namespace remus::util;
 using namespace remus::rdma;
 
-typedef RdmaBPTree<int, 12, rdma_capability_thread> BTree; // todo: increment size more?
-typedef RdmaBPTree<int, 1, CountingPool> BTreeLocal;
-
 inline void btree_run(BenchmarkParams& params, rdma_capability* capability, RemoteCache* cache, Peer& host, Peer& self, std::vector<Peer> peers){
+    using BTree = RdmaBPTree<int, 12, rdma_capability_thread>; // todo: increment size more?
     // Create a list of client and server  threads
     std::vector<std::thread> threads;
     if (params.node_id == 0){
@@ -184,6 +182,8 @@ inline void btree_run(BenchmarkParams& params, rdma_capability* capability, Remo
 }
 
 inline void btree_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCacheImpl<CountingPool>* cache, Peer& host, Peer& self, std::vector<Peer> peers){
+    using BTreeLocal = RdmaBPTree<int, 1, CountingPool>;
+
     // Create a list of client and server  threads
     std::vector<std::thread> threads;
     if (params.node_id == 0){
@@ -340,7 +340,7 @@ inline void btree_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCac
 
 inline void btree_run_local(Peer& self){
     CountingPool* pool = new CountingPool(true);
-    RemoteCacheImpl<CountingPool>* cach = new RemoteCacheImpl<CountingPool>(pool);
+    RemoteCacheImpl<CountingPool>* cach = new RemoteCacheImpl<CountingPool>(pool, 0);
     RemoteCacheImpl<CountingPool>::pool = pool; // set pool to other pool so we acccept our own cacheline
 
     if (false){
@@ -365,7 +365,8 @@ inline void btree_run_local(Peer& self){
         btree_run_tmp(params, pool, cach, host, self, peers);
         return;
     }
-
+    
+    using BTreeLocal = RdmaBPTree<int, 1, CountingPool>;
     using EBRLeaf = EBRObjectPool<BTreeLocal::BLeaf, 100, CountingPool>;
     using EBRNode = EBRObjectPoolAccompany<BTreeLocal::BNode, BTreeLocal::BLeaf, 100, CountingPool>;
     EBRLeaf* ebr_leaf = new EBRLeaf(pool, 1);
