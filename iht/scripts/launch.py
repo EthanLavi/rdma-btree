@@ -48,11 +48,13 @@ parser.add_argument('--thread_count', type=int, default=1, help="The number of t
 parser.add_argument('--node_count', type=int, default=1, help="The number of nodes to use in the experiment. Will use node0-nodeN")
 parser.add_argument('--qp_per_conn', type=int, default=30, help="The number of queue pairs to use in the experiment MAX")
 parser.add_argument('--cache_depth', type=int, default=0, help="The depth of which to cache layers in the IHT")
-parser.add_argument('--structure', choices=['iht', 'btree', 'skiplist'], required=True, help="The data structure")
+parser.add_argument('--structure', choices=['iht', 'btree', 'skiplist', 'iht_tmp', 'sherman'], required=True, help="The data structure")
 exp_result = {
     "iht": "iht_result.csv", 
     "btree": "btree_result.csv", 
-    "skiplist": "skiplist_result.csv"
+    "skiplist": "skiplist_result.csv",
+    "iht_tmp": "iht_result_tmp.csv",
+    "sherman": "sherman_result.csv"
 }
 ARGS = parser.parse_args()
 
