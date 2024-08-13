@@ -1,5 +1,6 @@
 #include "btree_bench.h"
 #include "rdmask_bench.h"
+#include "sherman_bench.h"
 
 template<> inline thread_local CacheMetrics RemoteCacheImpl<CountingPool>::metrics = CacheMetrics();
 template<> inline thread_local CountingPool* RemoteCacheImpl<CountingPool>::pool = nullptr;
@@ -15,6 +16,8 @@ int main(int argc, char* argv[]){
         btree_run_local(peer);
     else if (structure == "rdmask" || structure == "sk")
         rdmask_run_local(peer);
+    else if (structure == "sherm" || structure == "sherman")
+        sherman_run_local(peer);
     else
         REMUS_ERROR("No valid structure [btree|b OR rdmask|sk]");
 }

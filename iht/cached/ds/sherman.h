@@ -13,6 +13,7 @@
 
 // #include "../../dcache/test/faux_mempool.h"
 #include "ebr.h"
+#include "../sherman/sherman_cache.h"
 
 #include "../../common.h"
 #include <optional>
@@ -21,9 +22,8 @@
 using namespace remus::rdma;
 
 typedef int32_t K;
-static const K SENTINEL = INT_MAX;
-
-static const bool ADDR = false;
+#define SENTINEL INT_MAX
+#define PRINT_ADDR false
 
 template <class V, int DEGREE, class capability> class ShermanBPTree {
   /// SIZE is DEGREE * 2
@@ -33,9 +33,11 @@ template <class V, int DEGREE, class capability> class ShermanBPTree {
 private:
   static const int SIZE = (DEGREE * 2) + 1;
   static const uint64_t LOCK_BIT = (uint64_t) 1 << 63;
+  static std::atomic<bool> is_leader_gen;
+  bool is_leader = false;
 
   static const int VLINE_SIZE = 56 / sizeof(V);
-  static const int HLINE_SIZE = 40 / sizeof(V);
+  static const int HLINE_SIZE = 32 / sizeof(V);
   #define KLINE_SIZE 14
   #define PLINE_SIZE 7
 
@@ -46,13 +48,16 @@ private:
     K key_low; // lower bound (cannot be eq)
     K key_high; // upper bound (can be eq)
     rdma_ptr<hline> next;
+    long is_deleted;
   };
 
   struct fency_keys {
     long version;
+    long height;
     K key_low;
     K key_high;
-    char padding[(64 - sizeof(K) - sizeof(K) - sizeof(long))];
+    bool is_deallocated;
+    char padding[(64 - sizeof(K) - sizeof(K) - sizeof(long) - sizeof(long) - sizeof(bool))];
   };
 
   /// A line with keys
@@ -106,9 +111,11 @@ public:
 
   public:
     BNode(){
+      fency_key.is_deallocated = false;
       fency_key.version = 0;
       fency_key.key_low = INT_MIN; // neither INT_MIN nor INT_MAX are valid keys!
       fency_key.key_high = SENTINEL;
+      fency_key.height = -1;
       for(int i = 0; i < KLINES; i++){
         key_lines[i].version = 0;
       }
@@ -122,23 +129,8 @@ public:
       set_ptr(SIZE, nullptr);
     }
 
-    /// Conditionally mark nodes
-    void cond_unmark(bool cond){
-      if (cond && is_marked(ptr_at(0))){
-        for(int i = 0; i < SIZE + 1; i++){
-          if (ptr_at(i) != nullptr) set_ptr(i, unmark_ptr(ptr_at(i)));
-        }
-      }
-    }
-
-    std::string is_all_marked(){
-      bool has_mark = is_marked(ptr_at(0));
-      for(int i = 1; i < SIZE + 1; i++){
-        if (ptr_at(i) != nullptr && has_mark != is_marked(ptr_at(i))){
-          return "[inconsistent]";
-        }
-      }
-      return has_mark ? "[marked]" : "[unmarked]";
+    void mark_deleted(){
+      fency_key.is_deallocated = true;
     }
 
     /// Checks if the version is valid
@@ -185,8 +177,8 @@ public:
     }
 
     /// Test if a key is in the range
-    bool key_in_range(K key) const {
-      return fency_key.key_low < key && key <= fency_key.key_high;
+    bool key_in_range(K key, int level) const {
+      return fency_key.key_low < key && key <= fency_key.key_high && level == fency_key.height && !fency_key.is_deallocated;
     }
 
     /// Get the lower bound for the leaf (exclusive)
@@ -203,6 +195,14 @@ public:
     void set_range(K key_low, K key_high){
       fency_key.key_low = key_low;
       fency_key.key_high = key_high;
+    }
+
+    long get_level(){
+      return fency_key.height;
+    }
+
+    void set_level(long level){
+      fency_key.height = level;
     }
   };
 
@@ -224,6 +224,7 @@ public:
       last_line.version = 0;
       last_line.key_low = INT_MIN; // neither INT_MIN nor INT_MAX are valid keys!
       last_line.key_high = SENTINEL;
+      last_line.is_deleted = 0;
       for(int i = 0; i < SIZE; i++){
         set_key(i, SENTINEL);
         set_value(i, 0); // set just for debugging
@@ -247,7 +248,12 @@ public:
 
     /// Test if a key is in the range
     bool key_in_range(K key) const {
-      return last_line.key_low < key && key <= last_line.key_high;
+      return last_line.key_low < key && key <= last_line.key_high && last_line.is_deleted == 0;
+    }
+
+    // mark as deleted
+    void mark_deleted(){
+      last_line.is_deleted = 1;
     }
 
     /// Get the lower bound for the leaf (exclusive)
@@ -324,13 +330,13 @@ private:
   typedef rdma_ptr<BNode> bnode_ptr;
   using EBRLeaf = EBRObjectPool<BLeaf, 100, capability>;
   using EBRNode = EBRObjectPoolAccompany<BNode, BLeaf, 100, capability>;
-  using depth_t = CacheDepth::CacheDepth;
   using Cache = RemoteCacheImpl<capability>;
+  using Index = IndexCache<BNode, DEGREE, K>;
   
   Peer self_;
-  depth_t cache_depth_;
   rdma_ptr<BRoot> root;
   Cache* cache;
+  Index* index;
   EBRLeaf* ebr_leaf;
   EBRNode* ebr_node;
 
@@ -351,14 +357,14 @@ private:
   template <class ptr_t>
   bool try_acquire(capability* pool, rdma_ptr<ptr_t> node, long version){
     // swap the first 8 bytes (the lock) from unlocked to locked
-    uint64_t v = pool->template CompareAndSwap<uint64_t>(static_cast<rdma_ptr<uint64_t>>(unmark_ptr(node)), version & ~LOCK_BIT, version | LOCK_BIT);
+    uint64_t v = pool->template CompareAndSwap<uint64_t>(static_cast<rdma_ptr<uint64_t>>(node), version & ~LOCK_BIT, version | LOCK_BIT);
     if (v == (version & ~LOCK_BIT)) return true; // I think the lock bit will never be set in this scenario since we'd detect a broken read primarily
     return false;
   }
 
   template <class ptr_t>
   void release(capability* pool, rdma_ptr<ptr_t> node, long version){
-    pool->template Write<uint64_t>(static_cast<rdma_ptr<uint64_t>>(unmark_ptr(node)), version, temp_lock, internal::RDMAWriteBehavior::RDMAWriteWithNoAck);
+    pool->template Write<uint64_t>(static_cast<rdma_ptr<uint64_t>>(node), version, temp_lock, internal::RDMAWriteBehavior::RDMAWriteWithNoAck);
   }
 
   enum ReadBehavior {
@@ -493,7 +499,6 @@ private:
 
     // Full node so split
     bnode_ptr new_parent = ebr_node->allocate(pool);
-    new_parent = cond_mark_ptr(cache_depth_ >= CacheDepth::RootOnly, new_parent);
     parent.set_start_and_inc(new_parent);
 
     bnode_ptr new_neighbor = ebr_node->allocate(pool);
@@ -502,33 +507,35 @@ private:
       *new_neighbor = BNode();
       to_parent = split_keys<BNode*, bnode_ptr>(&node, new_neighbor, true);
       split_ptrs(&node, (BNode*) new_neighbor);
-      new_neighbor->cond_unmark(cache_depth_ <= CacheDepth::UpToLayer1);
+      new_neighbor->set_range(to_parent, node.key_high());
+      new_neighbor->set_level(node.get_level());
     } else {
       BNode new_neighbor_local = BNode();
       to_parent = split_keys<BNode*, BNode*>(&node, &new_neighbor_local, true);
       split_ptrs(&node, &new_neighbor_local);
-      new_neighbor_local.cond_unmark(cache_depth_ <= CacheDepth::UpToLayer1);
       cache->template Write<BNode>(new_neighbor, new_neighbor_local, prealloc_node_w);
+      new_neighbor_local.set_range(to_parent, node.key_high());
+      new_neighbor_local.set_level(node.get_level());
     }
+    node.set_range(node.key_low(), to_parent);
 
     if (pool->template is_local(new_parent)){
       *new_parent = BNode();
+      new_parent->set_level(parent.height);
       new_parent->set_key(0, to_parent);
       new_parent->set_ptr(0, node_p.remote_origin());
-      new_parent->set_ptr(1, cond_mark_ptr(is_marked(node_p.remote_origin()), new_neighbor));
-      new_parent->cond_unmark(cache_depth_ <= CacheDepth::RootOnly);
+      new_parent->set_ptr(1, new_neighbor);
     } else {
       BNode new_parent_local = BNode();
+      new_parent_local.set_level(parent.height);
       new_parent_local.set_key(0, to_parent);
       new_parent_local.set_ptr(0, node_p.remote_origin());
-      new_parent_local.set_ptr(1, cond_mark_ptr(is_marked(node_p.remote_origin()), new_neighbor));
-      new_parent_local.cond_unmark(cache_depth_ <= CacheDepth::RootOnly);
+      new_parent_local.set_ptr(1, new_neighbor);
       cache->template Write<BNode>(new_parent, new_parent_local, prealloc_node_w);
     }
 
     parent.increment_version();
     node.increment_version(); // increment version before writing
-    node.cond_unmark(cache_depth_ <= CacheDepth::UpToLayer1);
     cache->template Write<BRoot>(parent_p.remote_origin(), parent, prealloc_root_w);      
     cache->template Write<BNode>(node_p.remote_origin(), node, prealloc_node_w);
   }
@@ -540,7 +547,6 @@ private:
 
     // Full node so split
     bnode_ptr new_parent = ebr_node->allocate(pool);
-    new_parent = cond_mark_ptr(cache_depth_ >= CacheDepth::RootOnly, new_parent);
     parent.set_start_and_inc(new_parent);
 
     bleaf_ptr new_neighbor = ebr_leaf->allocate(pool);
@@ -563,14 +569,16 @@ private:
 
     if (pool->template is_local(new_parent)){
       *new_parent = BNode();
+      new_parent->set_level(parent.height);
       new_parent->set_key(0, to_parent);
-      new_parent->set_ptr(0, static_cast<bnode_ptr>(unmark_ptr(node_p.remote_origin())));
-      new_parent->set_ptr(1, static_cast<bnode_ptr>(unmark_ptr(new_neighbor)));
+      new_parent->set_ptr(0, static_cast<bnode_ptr>(node_p.remote_origin()));
+      new_parent->set_ptr(1, static_cast<bnode_ptr>(new_neighbor));
     } else {
       BNode new_parent_local = BNode();
+      new_parent_local.set_level(parent.height);
       new_parent_local.set_key(0, to_parent);
-      new_parent_local.set_ptr(0, static_cast<bnode_ptr>(unmark_ptr(node_p.remote_origin())));
-      new_parent_local.set_ptr(1, static_cast<bnode_ptr>(unmark_ptr(new_neighbor)));
+      new_parent_local.set_ptr(0, static_cast<bnode_ptr>(node_p.remote_origin()));
+      new_parent_local.set_ptr(1, static_cast<bnode_ptr>(new_neighbor));
       cache->template Write<BNode>(new_parent, new_parent_local, prealloc_node_w);
     }
   
@@ -592,27 +600,28 @@ private:
       *new_neighbor = BNode();
       to_parent = split_keys<BNode*, bnode_ptr>(&node, new_neighbor, true);
       split_ptrs(&node, (BNode*) new_neighbor);
-      new_neighbor->cond_unmark(level_parent + 1 >= cache_depth_);
+      new_neighbor->set_range(to_parent, node.key_high());
+      new_neighbor->set_level(node.get_level());
     } else {
       BNode new_neighbor_local = BNode();
       to_parent = split_keys<BNode*, BNode*>(&node, &new_neighbor_local, true);
       split_ptrs(&node, &new_neighbor_local);
-      new_neighbor_local.cond_unmark(level_parent + 1 >= cache_depth_);
       cache->template Write<BNode>(new_neighbor, new_neighbor_local, prealloc_node_w);
+      new_neighbor_local.set_range(to_parent, node.key_high());
+      new_neighbor_local.set_level(node.get_level());
     }
+    node.set_range(node.key_low(), to_parent);
 
     int bucket = search_node<BNode>(parent_p, to_parent);
     REMUS_ASSERT_DEBUG(bucket != -1, "Implies a full parent");
 
     shift_up(&parent, bucket);
     parent.set_key(bucket, to_parent);
-    parent.set_ptr(bucket + 1, cond_mark_ptr(is_marked(parent.ptr_at(0)), new_neighbor));
+    parent.set_ptr(bucket + 1, new_neighbor);
 
     parent.increment_version(); // increment version before writing
     node.increment_version();
     // unmark parent and node in conjuction with splitting
-    parent.cond_unmark(level_parent >= cache_depth_);
-    node.cond_unmark(level_parent + 1 >= cache_depth_);
     cache->template Write<BNode>(parent_p.remote_origin(), parent, prealloc_node_w);
     cache->template Write<BNode>(node_p.remote_origin(), node, prealloc_node_w);
   }
@@ -651,7 +660,7 @@ private:
 
     shift_up(&parent, bucket);
     parent.set_key(bucket, to_parent);
-    parent.set_ptr(bucket + 1, static_cast<bnode_ptr>(cond_mark_ptr(is_marked(parent.ptr_at(0)), new_neighbor)));
+    parent.set_ptr(bucket + 1, static_cast<bnode_ptr>(new_neighbor));
     parent.increment_version();
     node.increment_version();
 
@@ -670,13 +679,14 @@ private:
       std::swap(node_one, node_two);
       std::swap(bucket_one, bucket_two);
     }
-    // then (leaf_one <- leaf_two) and leaf_two is removed
+    // then (node_one <- node_two) and node_two is removed
     K lower_key = shift_down(parent, bucket_one);
     int size_one = 0;
     while(node_one->key_at(size_one) != SENTINEL) size_one++;
     node_one->set_key(size_one, lower_key);
     node_one->set_ptr(size_one + 1, node_two->ptr_at(0)); // get the merged ptr
     size_one++;
+    node_one->set_range(node_one->key_low(), node_two->key_high());
 
     for(int i = 0; i < SIZE; i++){
       if (node_two->key_at(i) == SENTINEL) break;
@@ -684,6 +694,7 @@ private:
       node_one->set_ptr(size_one + 1, node_two->ptr_at(i + 1));
       size_one++;
     }
+    node_two->mark_deleted();
     return one_gone;
   }
 
@@ -708,6 +719,7 @@ private:
       leaf_one->set_value(size_one, leaf_two->value_at(i));
     }
     shift_down(parent, bucket_one);
+    leaf_two->mark_deleted();
     return one_gone;
   }
 
@@ -755,6 +767,38 @@ private:
       return next_leaf;
     } // if statement returns
 
+    // todo: caching root node as well via factor out initial reads?
+    rdma_ptr<BNode> tmp;
+    const CacheEntry<BNode>* entry = index->search_from_cache(key, &tmp, is_leader);
+    if (entry != nullptr){
+      bleaf_ptr l = static_cast<bleaf_ptr>(tmp);
+      CachedObject<BLeaf> leaf = reliable_read<BLeaf>(l, modifiable ? WILL_NEED_ACQUIRE : IGNORE_LOCK, prealloc_leaf_r1);
+      // leaf has room and is in range
+      if (leaf->key_in_range(key)){ // guard against deleted and in range
+        if (modifiable){
+          // do insert/remove procedure
+          if (leaf->key_at(SIZE - 1) == SENTINEL){ // check enough space for ops
+            if (try_acquire<BLeaf>(pool, leaf.remote_origin(), leaf->version())){ // acquire the leaf
+              // modifiable so lock, update, write back
+              BLeaf leaf_updated = *leaf;
+              effect(&leaf_updated, search_node<BLeaf>(&leaf_updated, key));
+              leaf_updated.increment_version();
+              cache->template Write<BLeaf>(leaf.remote_origin(), leaf_updated, prealloc_leaf_w, internal::RDMAWriteBehavior::RDMAWriteWithNoAck);
+              return leaf;
+            } else {
+              // retry if we cannot acquire lock
+              return traverse(pool, key, modifiable, effect);
+            }
+          } // else -> not enough space, need full traversal
+        } else {
+          // do contains procedure
+          return leaf;
+        }
+      } else {
+        index->invalidate(entry);
+      }
+    }
+
     // Traverse bnode until bleaf
     CachedObject<BNode> curr = reliable_read<BNode>(next_level, modifiable ? LOOK_FOR_SPLIT_MERGE : IGNORE_LOCK);
     CachedObject<BNode> parent;
@@ -778,9 +822,11 @@ private:
           new_root.increment_version();
 
           cache->template Write<BRoot>(curr_root.remote_origin(), new_root, prealloc_root_w);
-          release<BNode>(pool, curr.remote_origin(), curr->version());
-
-          ebr_node->deallocate(unmark_ptr(curr.remote_origin())); // deallocate the unlinked node
+          BNode new_curr = *curr;
+          new_curr.mark_deleted();
+          new_curr.increment_version();
+          cache->template Write<BNode>(curr.remote_origin(), new_curr);
+          ebr_node->deallocate(curr.remote_origin()); // deallocate the unlinked node
         } else {
           release<BRoot>(pool, curr_root.remote_origin(), curr_root->version()); // continue traversing, we failed to lower a level
         }
@@ -830,9 +876,9 @@ private:
                 BNode merged_node = *merging_node;
                 BNode parent_of_merge = *parent;
                 if (merge_node(&empty_node, bucket, &merged_node, bucket_neighbor, &parent_of_merge)){
-                  ebr_node->deallocate(unmark_ptr(curr.remote_origin()));
+                  ebr_node->deallocate(curr.remote_origin());
                 } else {
-                  ebr_node->deallocate(unmark_ptr(merging_node.remote_origin())); 
+                  ebr_node->deallocate(merging_node.remote_origin());
                 }
                 empty_node.increment_version();
                 merged_node.increment_version();
@@ -870,6 +916,8 @@ private:
       // key is out of the range, we traversed wrong
       return traverse(pool, key, modifiable, effect, it_counter + 1);
     }
+    // add to cache on traversal
+    index->add_to_cache((const BNode*) curr.get());
 
     // Handle updates to the leaf
     if (modifiable){
@@ -944,7 +992,7 @@ private:
               BLeaf merged_leaf = *merging_leaf;
               BNode parent_of_merge = *curr;
               if (merge_leaf(&empty_leaf, bucket, &merged_leaf, bucket_neighbor, &parent_of_merge)){
-                ebr_leaf->deallocate(unmark_ptr(leaf.remote_origin()));
+                ebr_leaf->deallocate(leaf.remote_origin());
                 empty_leaf.increment_version();
                 merged_leaf.increment_version();
                 parent_of_merge.increment_version();
@@ -952,7 +1000,7 @@ private:
                 cache->template Write<BLeaf>(leaf.remote_origin(), empty_leaf, prealloc_leaf_w, internal::RDMAWriteBehavior::RDMAWriteWithNoAck);
                 cache->template Write<BNode>(curr.remote_origin(), parent_of_merge, prealloc_node_w, internal::RDMAWriteBehavior::RDMAWriteWithNoAck);
               } else {
-                ebr_leaf->deallocate(unmark_ptr(merging_leaf.remote_origin()));
+                ebr_leaf->deallocate(merging_leaf.remote_origin());
                 empty_leaf.increment_version();
                 merged_leaf.increment_version();
                 parent_of_merge.increment_version();
@@ -978,13 +1026,17 @@ private:
   }
 
 public:
-  ShermanBPTree(Peer& self, depth_t depth, Cache* cache, capability* pool, EBRLeaf* leaf, EBRNode* node, bool print_info = false) 
-  : self_(std::move(self)), cache_depth_(depth), cache(cache), ebr_leaf(leaf), ebr_node(node) {
+  ShermanBPTree(Peer& self, Cache* cache, Index* index, capability* pool, EBRLeaf* leaf, EBRNode* node, bool print_info = false) 
+  : self_(std::move(self)), cache(cache), index(index), ebr_leaf(leaf), ebr_node(node) {
     if (print_info){
       REMUS_INFO("Sentinel = {}", SENTINEL);
       REMUS_INFO("Struct Memory (BNode): {} % 64 = {}", sizeof(BNode), sizeof(BNode) % 64);
       REMUS_INFO("Struct Memory (BLeaf): {} % 64 = {}", sizeof(BLeaf), sizeof(BLeaf) % 64);
     }
+
+    this->is_leader = is_leader_gen.exchange(false);
+    REMUS_INFO("Stored is_leader={}", is_leader);
+    
     temp_lock = pool->template Allocate<uint64_t>(8); // allocates 8 to ensure size of object=64
     // prealloc some memory
     prealloc_root_r = pool->template Allocate<BRoot>();
@@ -1026,16 +1078,12 @@ public:
     bleaf_ptr bleaf = pool->template Allocate<BLeaf>();
     *bleaf = BLeaf();
     this->root->start = static_cast<bnode_ptr>(bleaf);
-    if (cache_depth_ >= CacheDepth::RootOnly)
-        this->root = mark_ptr(this->root);
     return static_cast<rdma_ptr<anon_ptr>>(this->root);
   }
 
   /// @brief Initialize an IHT from the pointer of another IHT
   /// @param root_ptr the root pointer of the other iht from InitAsFirst();
   void InitFromPointer(rdma_ptr<anon_ptr> root_ptr){
-      if (cache_depth_ >= CacheDepth::RootOnly)
-        root_ptr = mark_ptr(root_ptr);
     this->root = static_cast<rdma_ptr<BRoot>>(root_ptr);
   }
 
@@ -1128,7 +1176,7 @@ public:
       std::cout << "\t";
     }
 
-    if (ADDR)
+    if (PRINT_ADDR)
       std::cout << "Leaf<next=" << std::hex << leaf.get_next().address() << std::dec << "> ";
     else
       std::cout << "Leaf<low=" << leaf.key_low() << "  high=" << leaf.key_high() << "> ";
@@ -1150,15 +1198,13 @@ public:
     for(int i = 0; i < indent; i++){
       std::cout << "\t";
     }
-    std::cout << n.is_all_marked() << " ";
-    std::cout << (n.is_valid() ? "valid " : "invalid ") << "(" << n.version() << ", " << height << ", " << index << ")";
+    std::cout << (n.is_valid() ? "" : "invalid ") << "(" << n.version() << ", " << height << ", " << index << ")";
     std::cout << " => ";
-    if (ADDR)
+    std::cout << "Node<low=" << n.key_low() << "  high=" << n.key_high() << "  height=" << n.get_level() << "> ";
+    if (PRINT_ADDR)
       std::cout << std::hex << n.ptr_at(0).address() << std::dec;
-    else
-      std::cout << (is_marked(n.ptr_at(0)) ? "!" : "");
     for(int i = 0; i < SIZE; i++){
-      if (ADDR){
+      if (PRINT_ADDR){
         if (n.key_at(i) == SENTINEL)
           std::cout << " (SENT) " << std::hex << n.ptr_at(i+1).address() << std::dec;
         else
@@ -1168,7 +1214,6 @@ public:
               std::cout << " (SENT) ";
             else
               std::cout << " (" << n.key_at(i) << ") ";
-          std::cout << (is_marked(n.ptr_at(i + 1)) ? "!" : "");
       }
     }
     std::cout << std::endl;
@@ -1180,16 +1225,6 @@ public:
 
   /// Single threaded print
   void debug(){
-    if (is_marked(root)){
-      std::cout << "[marked] ";
-    } else {
-      std::cout << "[unmarked] ";
-    }
-    if (is_marked(root->start)){
-      std::cout << "[marked-start] ";
-    } else {
-      std::cout << "[unmarked-start] ";
-    }
     BRoot r = *root;
     std::cout << "Root(height=" << r.height << ")" << std::endl;
     debug(r.height, r.start, 0, 0);
@@ -1290,3 +1325,6 @@ public:
     return count;
   }
 };
+
+template <class V, int DEGREE, class capability> 
+std::atomic<bool> ShermanBPTree<V, DEGREE, capability>::is_leader_gen = true;

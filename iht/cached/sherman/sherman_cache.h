@@ -19,8 +19,8 @@ struct WithFreq {
 
 template <class T>
 struct CacheEntry {
-    uint32_t from;
-    uint32_t to;
+    int from;
+    int to;
     mutable WithFreq<T>* data;
 };
 
@@ -105,13 +105,12 @@ public:
     delete skiplist;
   }
 
-  bool add_to_cache(T* page){
+  bool add_to_cache(const T* page){
     CacheEntry<T>* new_page = (CacheEntry<T>*) malloc(sizeof(CacheEntry<T>));
     WithFreq<T>* payload = (WithFreq<T>*) malloc(sizeof(WithFreq<T>));
     memcpy(payload, page, sizeof(T));
     payload->index_cache_freq = 0;
     new_page->data = payload;
-
     if (this->add_entry(page->key_low(), page->key_high(), new_page)) {
       skiplist_node_cnt.fetch_add(1);
       auto v = free_page_cnt.fetch_add(-1);
@@ -156,7 +155,6 @@ public:
 
     const CacheEntry<T>* entry = find_entry(k);
     WithFreq<T>* page = entry ? entry->data : nullptr;
-
     if (page != nullptr && entry->from <= k && entry->to >= k) {
       page->index_cache_freq++;
       bool find = false;
@@ -172,7 +170,7 @@ public:
       }
 
       compiler_barrier();
-      if (entry->data != nullptr) { // check if it is freed.
+      if (entry->data != nullptr) { // check if it is freed after reading
         return entry;
       }
     }

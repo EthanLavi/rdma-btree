@@ -24,8 +24,10 @@
 using namespace remus::util;
 using namespace remus::rdma;
 
-inline void sherman_run_local(BenchmarkParams& params, rdma_capability* capability, RemoteCache* cache, Peer& host, Peer& self, std::vector<Peer> peers){
+inline void sherman_run(BenchmarkParams& params, rdma_capability* capability, RemoteCache* cache, Peer& host, Peer& self, std::vector<Peer> peers){
     using BTree = ShermanBPTree<int, 12, rdma_capability_thread>; // todo: increment size more?
+    using Cache = IndexCache<BTree::BNode, 12, int>;
+    Cache* index = new Cache(1000); // just like in 
 
     // Create a list of client and server  threads
     std::vector<std::thread> threads;
@@ -41,7 +43,7 @@ inline void sherman_run_local(BenchmarkParams& params, rdma_capability* capabili
 
             // Create a root ptr to the IHT
             Peer p = Peer();
-            BTree btree = BTree(p, cache, pool, nullptr, nullptr, true);
+            BTree btree = BTree(p, cache, index, pool, nullptr, nullptr, true);
             rdma_ptr<anon_ptr> root_ptr = btree.InitAsFirst(pool);
             // Send the root pointer over
             tcp::message ptr_message = tcp::message(root_ptr.raw());
@@ -103,7 +105,7 @@ inline void sherman_run_local(BenchmarkParams& params, rdma_capability* capabili
             }));
             cache->init(peer_roots);
 
-            std::shared_ptr<BTree> btree = std::make_shared<BTree>(self, cache, pool, ebr_leaf, ebr_node);
+            std::shared_ptr<BTree> btree = std::make_shared<BTree>(self, cache, index, pool, ebr_leaf, ebr_node);
             // Get the data from the server to init the btree
             tcp::message ptr_message;
             endpoint->recv_server(&ptr_message);
@@ -181,6 +183,9 @@ inline void sherman_run_local(BenchmarkParams& params, rdma_capability* capabili
     delete_endpoints(endpoint_managers, params);
 
     save_result("btree_result.csv", workload_results, params, params.thread_count);
+    
+    index->statistics();
+    delete index;
 }
 
 inline void sherman_run_local(Peer& self){
@@ -188,22 +193,9 @@ inline void sherman_run_local(Peer& self){
 
     using BTreeLocal = ShermanBPTree<int, 1, CountingPool>;
     using Cache = IndexCache<BTreeLocal::BNode, 1, int>;
-    Cache cache = Cache(1000);
-    rdma_ptr<BTreeLocal::BNode> nptr = pool->Allocate<BTreeLocal::BNode>();
-    BTreeLocal::BNode node = *nptr;
-    node = BTreeLocal::BNode();
-    node.set_range(1, 10);
-    node.set_ptr(0, nptr);
-    REMUS_ASSERT(cache.add_to_cache(&node), "Should be easy to add");
-    rdma_ptr<BTreeLocal::BNode> addr; 
-    const CacheEntry<BTreeLocal::BNode>* entry = cache.search_from_cache(5, &addr);
-    REMUS_ASSERT(entry != nullptr, "Should be valid");
-    REMUS_INFO("bnode={} range=[{}, {}) freq={}", (uint64_t) entry, entry->from, entry->to, entry->data->index_cache_freq);
-    cache.bench();
-    cache.statistics();
-    return;
+    Cache* index = new Cache(1000); // just like in sherman
 
-    RemoteCacheImpl<CountingPool>* cach = new RemoteCacheImpl<CountingPool>(pool, 0);
+    RemoteCacheImpl<CountingPool>* rcach = new RemoteCacheImpl<CountingPool>(pool, 0);
     RemoteCacheImpl<CountingPool>::pool = pool; // set pool to other pool so we acccept our own cacheline
 
     using EBRLeaf = EBRObjectPool<BTreeLocal::BLeaf, 100, CountingPool>;
@@ -213,7 +205,7 @@ inline void sherman_run_local(Peer& self){
     ebr_leaf->RegisterThread();
     ebr_node->RegisterThread();
 
-    BTreeLocal tree = BTreeLocal(self, cach, pool, ebr_leaf, ebr_node, true);
+    BTreeLocal tree = BTreeLocal(self, rcach, index, pool, ebr_leaf, ebr_node, true);
     rdma_ptr<anon_ptr> ptr = tree.InitAsFirst(pool);
     REMUS_INFO("DONE INIT");
 
@@ -237,11 +229,13 @@ inline void sherman_run_local(Peer& self){
     
     REMUS_INFO("Tree is valid? {}", tree.valid());
     REMUS_INFO("Done!");
-    cach->free_all_tmp_objects();
+    rcach->free_all_tmp_objects();
     ebr_leaf->destroy(pool);
     ebr_node->destroy(pool);
     tree.destroy(pool);
-    delete cach;
+    index->statistics();
+    delete rcach;
+    delete index;
     if (!pool->HasNoLeaks()){
         // pool->debug();
         REMUS_FATAL("Leaked memory");
