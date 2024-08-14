@@ -15,6 +15,7 @@
 #include "experiment.h"
 #include "tcp_barrier.h"
 #include "common.h"
+#include "zipfian_int_distribution.h"
 // #include "structures/hashtable.h"
 // #include "structures/test_map.h"
 
@@ -108,29 +109,63 @@ public:
     //       But I would be interested in creating one so everyone can use it.
     this_thread::sleep_for(chrono::seconds(1));
 
-    // Create a random operation generator that is
-    // - evenly distributed among the key range
-    // - within the specified ratios for operations
-    uniform_int_distribution<int> op_dist = uniform_int_distribution<int>(1, 100);
-    uniform_int_distribution<int> k_dist = uniform_int_distribution<int>(key_lb, key_ub);
-
     // Ensuring each node has a different seed value
     default_random_engine gen(client->params_.node_id * client->params_.thread_count + thread_id);
+
+    // Create a random operation generator that is
+    // - follows the provided distribution (e.g. evenly distributed among the key range)
+    // - within the specified ratios for operations
+    uniform_int_distribution<int> op_dist = uniform_int_distribution<int>(1, 100);
     int contains = client->params_.contains;
     int insert = client->params_.insert;
-    function<Operation(void)> generator = [&]() {
-      int rng = op_dist(gen);
-      int k = k_dist(gen);
-      if (rng <= contains) {
-        // between 0 and CONTAINS
-        return Operation(CONTAINS, k, 0);
-      } else if (rng <= contains + insert) { 
-        // between CONTAINS and CONTAINS + INSERT
-        return Operation(INSERT, k, k);
-      } else {
-        return Operation(REMOVE, k, 0);
-      }
-    };
+    function<Operation(void)> generator;
+    if (client->params_.distribution == "uniform"){
+      generator = [&]() {
+        uniform_int_distribution<int> k_dist = uniform_int_distribution<int>(key_lb, key_ub);
+        int rng = op_dist(gen);
+        int k = k_dist(gen);
+        if (rng <= contains) {
+          // between 0 and CONTAINS
+          return Operation(CONTAINS, k, 0);
+        } else if (rng <= contains + insert) { 
+          // between CONTAINS and CONTAINS + INSERT
+          return Operation(INSERT, k, k);
+        } else {
+          return Operation(REMOVE, k, 0);
+        }
+      };
+    } else if (client->params_.distribution == "skew90"){
+      generator = [&]() {
+        zipfian_int_distribution<int> k_dist = zipfian_int_distribution<int>(key_lb, key_ub, 0.90);
+        int rng = op_dist(gen);
+        int k = k_dist(gen);
+        if (rng <= contains) return Operation(CONTAINS, k, 0);
+        else if (rng <= contains + insert) return Operation(INSERT, k, k);
+        else return Operation(REMOVE, k, 0);
+      };
+    } else if (client->params_.distribution == "skew95"){
+      generator = [&]() {
+        zipfian_int_distribution<int> k_dist = zipfian_int_distribution<int>(key_lb, key_ub, 0.95);
+        int rng = op_dist(gen);
+        int k = k_dist(gen);
+        if (rng <= contains) return Operation(CONTAINS, k, 0);
+        else if (rng <= contains + insert) return Operation(INSERT, k, k);
+        else return Operation(REMOVE, k, 0);
+      };
+    } else if (client->params_.distribution == "skew99"){
+      generator = [&]() {
+        zipfian_int_distribution<int> k_dist = zipfian_int_distribution<int>(key_lb, key_ub, 0.99);
+        int rng = op_dist(gen);
+        int k = k_dist(gen);
+        if (rng <= contains) return Operation(CONTAINS, k, 0);
+        else if (rng <= contains + insert) return Operation(INSERT, k, k);
+        else return Operation(REMOVE, k, 0);
+      };
+    } else {
+      REMUS_FATAL("Cannot find distribution");
+    }
+
+    
 
     // Generate two streams based on what the user wants (operation count or
     // timed stream)

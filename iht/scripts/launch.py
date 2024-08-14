@@ -42,19 +42,21 @@ parser.add_argument('--op_distribution', type=str, default="80-10-10", help="The
 parser.add_argument('--op_count', type=int, default=10000, help="The number of operations to run if unlimited stream is passed as False.")
 parser.add_argument('-lb', '--lb', type=str, default='0', help="Pass in the lower bound of the key range. Can use e-notation as well.")
 parser.add_argument('-ub', '--ub', type=str, default='1e5', help="Pass in the ubber bound of the key range. Can use e-notation as well.")
+parser.add_argument('--distribution', type=str, choices=['uniform', 'skew90', 'skew95', 'skew99'])
 parser.add_argument('--region_size', type=int, default=25, help="2 ^ x bytes to allocate on each node")
 # Experiment resources
 parser.add_argument('--thread_count', type=int, default=1, help="The number of threads to start per client. Only applicable in send_exp")
 parser.add_argument('--node_count', type=int, default=1, help="The number of nodes to use in the experiment. Will use node0-nodeN")
 parser.add_argument('--qp_per_conn', type=int, default=30, help="The number of queue pairs to use in the experiment MAX")
 parser.add_argument('--cache_depth', type=int, default=0, help="The depth of which to cache layers in the IHT")
-parser.add_argument('--structure', choices=['iht', 'btree', 'skiplist', 'iht_tmp', 'sherman'], required=True, help="The data structure")
+parser.add_argument('--structure', choices=['iht', 'btree', 'skiplist', 'iht_tmp', 'sherman', 'multi'], required=True, help="The data structure")
 exp_result = {
     "iht": "iht_result.csv", 
     "btree": "btree_result.csv", 
     "skiplist": "skiplist_result.csv",
     "iht_tmp": "iht_result_tmp.csv",
-    "sherman": "sherman_result.csv"
+    "sherman": "sherman_result.csv",
+    "multi": "multi_result.csv"
 }
 ARGS = parser.parse_args()
 
@@ -80,14 +82,14 @@ def process_exp_flags(node_id):
             # Load the json into the proto
             json_data = f.read()
             mapper = json.loads(json_data)
-            one_to_ones = ["runtime", "op_count", "contains", "insert", "remove", "key_lb", "key_ub", "region_size", "thread_count", "node_count", "qp_per_conn", "cache_depth"]
+            one_to_ones = ["runtime", "op_count", "contains", "insert", "remove", "key_lb", "key_ub", "region_size", "thread_count", "node_count", "qp_per_conn", "cache_depth", "distribution"]
             for param in one_to_ones:
                 params += f" --{param} " + str(mapper[param]).lower()
             if mapper['unlimited_stream']:
                 params += f" --unlimited_stream "
         params += " --structure " + str(ARGS.structure)
     else:
-        one_to_ones = ["runtime", "op_count", "region_size", "thread_count", "node_count", "qp_per_conn", "cache_depth", "structure"]
+        one_to_ones = ["runtime", "op_count", "region_size", "thread_count", "node_count", "qp_per_conn", "cache_depth", "structure", "distribution"]
         for param in one_to_ones:
             params += f" --{param} " + str(eval(f"ARGS.{param}")).lower()
         if ARGS.unlimited_stream:
