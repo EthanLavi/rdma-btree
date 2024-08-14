@@ -209,6 +209,11 @@ inline void sherman_run_local(Peer& self){
     rdma_ptr<anon_ptr> ptr = tree.InitAsFirst(pool);
     REMUS_INFO("DONE INIT");
 
+    // Assert size=0
+    for(int i = 0; i <= 100; i++){
+        REMUS_ASSERT(tree.contains(pool, i).value_or(-1) == -1, "Should be empty");
+    }
+
     for(int i = 40; i >= 0; i--){
         tree.insert(pool, i, i);
     }

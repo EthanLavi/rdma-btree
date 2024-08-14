@@ -14,6 +14,7 @@
 // #include "../../dcache/test/faux_mempool.h"
 #include "ebr.h"
 #include "../sherman/sherman_cache.h"
+#include "../sherman/sherman_root.h"
 
 #include "../../common.h"
 #include <optional>
@@ -177,8 +178,12 @@ public:
     }
 
     /// Test if a key is in the range
-    bool key_in_range(K key, int level) const {
-      return fency_key.key_low < key && key <= fency_key.key_high && level == fency_key.height && !fency_key.is_deallocated;
+    bool key_in_range(K key) const {
+      return fency_key.key_low < key && key <= fency_key.key_high && !fency_key.is_deallocated;
+    }
+
+    bool key_in_range(K key, int height) const {
+      return fency_key.key_low < key && key <= fency_key.key_high && height == fency_key.height && !fency_key.is_deallocated;
     }
 
     /// Get the lower bound for the leaf (exclusive)
@@ -337,6 +342,7 @@ private:
   rdma_ptr<BRoot> root;
   Cache* cache;
   Index* index;
+  ShermanRoot<K>* backup_index;
   EBRLeaf* ebr_leaf;
   EBRNode* ebr_node;
 
@@ -589,7 +595,7 @@ private:
   }
 
   /// Not at root
-  void split_node(capability* pool, CachedObject<BNode>& parent_p, CachedObject<BNode>& node_p, int level_parent){
+  void split_node(capability* pool, CachedObject<BNode>& parent_p, CachedObject<BNode>& node_p){
     BNode parent = *parent_p;
     BNode node = *node_p;
     
@@ -732,42 +738,7 @@ private:
 
   CachedObject<BLeaf> traverse(capability* pool, K key, bool modifiable, function<void(BLeaf*, int)> effect, int it_counter = 0){
     REMUS_ASSERT(it_counter < 1000, "Too many retries! Infinite recursion detected?");
-  
-    // read root first
-    CachedObject<BRoot> curr_root = cache->template Read<BRoot>(root, prealloc_root_r);
-    int height = curr_root->height;
-    int level = 1;
-    bnode_ptr next_level = curr_root->start;
-    REMUS_ASSERT_DEBUG(next_level != nullptr, "Accessing SENTINEL's ptr");
 
-    if (height == 0){
-      CachedObject<BLeaf> next_leaf = reliable_read<BLeaf>(static_cast<bleaf_ptr>(next_level), modifiable ? WILL_NEED_ACQUIRE : IGNORE_LOCK, prealloc_leaf_r1);
-      if (modifiable){
-        // failed to get locks, retraverse
-        if (!try_acquire<BRoot>(pool, curr_root.remote_origin(), curr_root->version())) return traverse(pool, key, modifiable, effect);
-        if (!try_acquire<BLeaf>(pool, next_leaf.remote_origin(), next_leaf->version())) {
-          release<BRoot>(pool, curr_root.remote_origin(), curr_root->version());
-          return traverse(pool, key, modifiable, effect);
-        }
-        if (next_leaf->key_at(SIZE - 1) != SENTINEL){
-          split_node(pool, curr_root, next_leaf);
-          // Just restart
-          return traverse(pool, key, modifiable, effect);
-        } else {
-          // Acquire both locks if room to spare in leaf, then write back
-          BLeaf leaf_updated = *next_leaf;
-          effect(&leaf_updated, search_node<BLeaf>(&leaf_updated, key));
-          leaf_updated.increment_version();
-          release<BRoot>(pool, curr_root.remote_origin(), curr_root->version());
-          cache->template Write<BLeaf>(next_leaf.remote_origin(), leaf_updated, prealloc_leaf_w);
-        }
-      }
-
-      // Made it to the leaf
-      return next_leaf;
-    } // if statement returns
-
-    // todo: caching root node as well via factor out initial reads?
     rdma_ptr<BNode> tmp;
     const CacheEntry<BNode>* entry = index->search_from_cache(key, &tmp, is_leader);
     if (entry != nullptr){
@@ -795,42 +766,101 @@ private:
           return leaf;
         }
       } else {
+        // failed traversal...
         index->invalidate(entry);
       }
     }
 
-    // Traverse bnode until bleaf
-    CachedObject<BNode> curr = reliable_read<BNode>(next_level, modifiable ? LOOK_FOR_SPLIT_MERGE : IGNORE_LOCK);
-    CachedObject<BNode> parent;
-    // if split, we updated the root and we need to retraverse
-    if (modifiable && curr->key_at(SIZE - 1) != SENTINEL){
-      if (!try_acquire<BRoot>(pool, curr_root.remote_origin(), curr_root->version())) return traverse(pool, key, modifiable, effect);
-      if (!try_acquire<BNode>(pool, curr.remote_origin(), curr->version())) {
-        release<BRoot>(pool, curr_root.remote_origin(), curr_root->version());
-        return traverse(pool, key, modifiable, effect);
-      }
-      split_node(pool, curr_root, curr);
-      return traverse(pool, key, modifiable, effect);
-    } else if (modifiable && curr->key_at(0) == SENTINEL){
-      // Current is empty, remove a level
-      if (try_acquire<BRoot>(pool, curr_root.remote_origin(), curr_root->version())){
-        if (try_acquire<BNode>(pool, curr.remote_origin(), curr->version())){
-          // Update the root
-          BRoot new_root = *curr_root;
-          new_root.height--;
-          new_root.start = curr->ptr_at(0);
-          new_root.increment_version();
+    int height;
+    bnode_ptr next_level;
 
-          cache->template Write<BRoot>(curr_root.remote_origin(), new_root, prealloc_root_w);
-          BNode new_curr = *curr;
-          new_curr.mark_deleted();
-          new_curr.increment_version();
-          cache->template Write<BNode>(curr.remote_origin(), new_curr);
-          ebr_node->deallocate(curr.remote_origin()); // deallocate the unlinked node
-        } else {
-          release<BRoot>(pool, curr_root.remote_origin(), curr_root->version()); // continue traversing, we failed to lower a level
+    rdma_ptr<anon_ptr> ccptr = backup_index->find_ptr(key);
+    CachedObject<BNode> curr;
+    CachedObject<BNode> parent;
+    bool just_read_root = false;
+    if (ccptr != nullptr){
+      bnode_ptr next_node = static_cast<bnode_ptr>(ccptr);
+      curr = reliable_read<BNode>(next_node, modifiable ? LOOK_FOR_SPLIT_MERGE : IGNORE_LOCK);
+      BNode n = *curr;
+      if(!n.key_in_range(key)){ // todo: add in range to the rest?
+        backup_index->invalidate(key);
+        goto was_bad;
+      } else {
+        height = n.get_level();
+        if (curr->key_at(SIZE - 1) != SENTINEL){ // full parent, gonna need root node for split
+          goto was_bad;
         }
       }
+    } else {
+      was_bad:
+      // read root first
+      CachedObject<BRoot> curr_root = cache->template Read<BRoot>(root, prealloc_root_r);
+      height = curr_root->height;
+      next_level = curr_root->start;
+      REMUS_ASSERT_DEBUG(next_level != nullptr, "Accessing SENTINEL's ptr");
+
+      if (height == 0){
+        CachedObject<BLeaf> next_leaf = reliable_read<BLeaf>(static_cast<bleaf_ptr>(next_level), modifiable ? WILL_NEED_ACQUIRE : IGNORE_LOCK, prealloc_leaf_r1);
+        if (modifiable){
+          // failed to get locks, retraverse
+          if (!try_acquire<BRoot>(pool, curr_root.remote_origin(), curr_root->version())) return traverse(pool, key, modifiable, effect);
+          if (!try_acquire<BLeaf>(pool, next_leaf.remote_origin(), next_leaf->version())) {
+            release<BRoot>(pool, curr_root.remote_origin(), curr_root->version());
+            return traverse(pool, key, modifiable, effect);
+          }
+          if (next_leaf->key_at(SIZE - 1) != SENTINEL){
+            split_node(pool, curr_root, next_leaf);
+            // Just restart
+            return traverse(pool, key, modifiable, effect);
+          } else {
+            // Acquire both locks if room to spare in leaf, then write back
+            BLeaf leaf_updated = *next_leaf;
+            effect(&leaf_updated, search_node<BLeaf>(&leaf_updated, key));
+            leaf_updated.increment_version();
+            release<BRoot>(pool, curr_root.remote_origin(), curr_root->version());
+            cache->template Write<BLeaf>(next_leaf.remote_origin(), leaf_updated, prealloc_leaf_w);
+          }
+        }
+
+        // Made it to the leaf
+        return next_leaf;
+      } // if statement returns
+
+      // Traverse bnode until bleaf
+      curr = reliable_read<BNode>(next_level, modifiable ? LOOK_FOR_SPLIT_MERGE : IGNORE_LOCK);
+      // if split, we updated the root and we need to retraverse
+      if (modifiable && curr->key_at(SIZE - 1) != SENTINEL){
+        if (!try_acquire<BRoot>(pool, curr_root.remote_origin(), curr_root->version())) return traverse(pool, key, modifiable, effect);
+        if (!try_acquire<BNode>(pool, curr.remote_origin(), curr->version())) {
+          release<BRoot>(pool, curr_root.remote_origin(), curr_root->version());
+          return traverse(pool, key, modifiable, effect);
+        }
+        split_node(pool, curr_root, curr);
+        return traverse(pool, key, modifiable, effect);
+      } else if (modifiable && curr->key_at(0) == SENTINEL){
+        // Current is empty, remove a level
+        if (try_acquire<BRoot>(pool, curr_root.remote_origin(), curr_root->version())){
+          if (try_acquire<BNode>(pool, curr.remote_origin(), curr->version())){
+            // Update the root
+            BRoot new_root = *curr_root;
+            new_root.height--;
+            new_root.start = curr->ptr_at(0);
+            new_root.increment_version();
+
+            cache->template Write<BRoot>(curr_root.remote_origin(), new_root, prealloc_root_w);
+            BNode new_curr = *curr;
+            new_curr.mark_deleted();
+            new_curr.increment_version();
+            cache->template Write<BNode>(curr.remote_origin(), new_curr);
+            ebr_node->deallocate(curr.remote_origin()); // deallocate the unlinked node
+          } else {
+            release<BRoot>(pool, curr_root.remote_origin(), curr_root->version()); // continue traversing, we failed to lower a level
+          }
+        }
+        return traverse(pool, key, modifiable, effect); // retraverse
+      }
+
+      just_read_root = true;  
     }
 
     int bucket = search_node<BNode>(curr, key);
@@ -841,11 +871,16 @@ private:
       // Read it as a BNode
       parent = std::move(curr);
       curr = reliable_read<BNode>(next_level, modifiable ? LOOK_FOR_SPLIT_MERGE : IGNORE_LOCK);
+      if (just_read_root){
+        backup_index->put_into_cache(curr->key_low(), curr->key_high(), static_cast<rdma_ptr<anon_ptr>>(next_level));
+      }
+      just_read_root = false;
+
       if (modifiable && curr->key_at(SIZE - 1) != SENTINEL) {
         if (try_acquire<BNode>(pool, parent.remote_origin(), parent->version())) {
           if (try_acquire<BNode>(pool, curr.remote_origin(), curr->version())) {
             // can acquire parent and current, so split
-            split_node(pool, parent, curr, level);
+            split_node(pool, parent, curr);
           } else {
             // cannot acquire child so release parent and try again
             release<BNode>(pool, parent.remote_origin(), parent->version());
@@ -905,7 +940,6 @@ private:
       }
       bucket = search_node<BNode>(curr, key);
       height--;
-      level++;
     }
 
     // Get the next level ptr
@@ -1045,6 +1079,8 @@ public:
     prealloc_leaf_r1 = pool->template Allocate<BLeaf>();
     prealloc_leaf_r2 = pool->template Allocate<BLeaf>();
     prealloc_leaf_w = pool->template Allocate<BLeaf>();
+
+    backup_index = new ShermanRoot<K>(SIZE + 1);
   };
 
   /// Free all the resources associated with the IHT
@@ -1064,6 +1100,8 @@ public:
          pool->template Deallocate<BLeaf>(static_cast<bleaf_ptr>(tmp_root.start));
       }
     }
+
+    delete backup_index;
   }
 
   /// @brief Create a fresh iht
