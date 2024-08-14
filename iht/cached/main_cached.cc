@@ -11,6 +11,8 @@
 #include "iht_bench.h"
 #include "btree_bench.h"
 #include "rdmask_bench.h"
+#include "sherman_bench.h"
+#include "multi_bench.h"
 
 #include <dcache/cache_store.h>
 
@@ -32,6 +34,7 @@ auto ARGS = {
     I64_ARG("--key_ub", "The upper limit of the key range for operations"),
     I64_ARG_OPT("--cache_depth", "The depth of the cache for the data structure", 0),
     STR_ARG("--structure", "The type of data structure to benchmark"), // rdmask, btree, iht
+    STR_ARG("--distribution", "The distribution of operations"), // uniform, skew90, skew95, skew99
 };
 
 #define PATH_MAX 4096
@@ -100,15 +103,19 @@ int main(int argc, char **argv) {
 
     // Create our remote cache (can initialize the cache space with any pool)
     auto pool = capability->RegisterThread();
-    RemoteCache* cache = new RemoteCache(pool, 1000);
+    RemoteCache* cache = new RemoteCache(pool, self.id, 1000);
     if (params.structure == "iht"){
         iht_run(params, capability, cache, host, self);
     } else if (params.structure == "iht_tmp"){
         bulk_time(params, capability, cache, host, self);
     } else if (params.structure == "btree"){
         btree_run(params, capability, cache, host, self, peers);
+    } else if (params.structure == "sherman"){
+        sherman_run(params, capability, cache, host, self, peers);
     } else if (params.structure == "skiplist"){
         rdmask_run(params, capability, cache, host, self, peers);
+    } else if (params.structure == "multi"){
+        multi_run(params, capability, cache, host, self, peers);
     } else {
         REMUS_ERROR("Cannot identify structure");
     }

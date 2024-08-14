@@ -21,6 +21,8 @@ struct CacheMetrics {
     int hits;
     /// Number of cold lines in the cache
     int empty_lines;
+    /// Invalidations
+    int successful_invalidations;
 
     CacheMetrics(){
         remote_reads = 0;
@@ -32,6 +34,7 @@ struct CacheMetrics {
         conflict_misses = 0;
         hits = 0;
         empty_lines = 0;
+        successful_invalidations = 0;
     }
 
     std::string as_string() {
@@ -46,6 +49,7 @@ struct CacheMetrics {
         ss += "  <RemoteCAS = " + std::to_string(remote_cas) + "/>\n";
         ss += "  <CacheHits = " + std::to_string(hits) + "/>\n";
         ss += "  <EmptyLines = " + std::to_string(empty_lines) + "/>\n";
+        ss += "  <Invalidations = " + std::to_string(successful_invalidations) + "/>\n";
         ss += "</Metrics>\n";
         return ss;
     }

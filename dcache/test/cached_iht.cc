@@ -20,7 +20,7 @@ int main(){
     CountingPool* pool = new CountingPool(false);
 
     // Construct the remote cache
-    RemoteCacheImpl<CountingPool>* cache = new RemoteCacheImpl<CountingPool>(pool);
+    RemoteCacheImpl<CountingPool>* cache = new RemoteCacheImpl<CountingPool>(pool, 0);
     RemoteCacheImpl<CountingPool>::pool = pool; // set pool to other pool so we acccept our own cacheline
     cache->init({cache->root()}); // initialize with itself
 

@@ -1,13 +1,14 @@
 #include "btree_bench.h"
 #include "rdmask_bench.h"
 #include "sherman_bench.h"
+#include "multi_bench.h"
 
 template<> inline thread_local CacheMetrics RemoteCacheImpl<CountingPool>::metrics = CacheMetrics();
 template<> inline thread_local CountingPool* RemoteCacheImpl<CountingPool>::pool = nullptr;
 
 int main(int argc, char* argv[]){
     if (argc == 1) {
-        REMUS_ERROR("Missing datastructure");
+        REMUS_ERROR("Missing structure [btree|b OR rdmask|sk OR sherm|sherman OR multi|multis]");
         return 1;
     }
     std::string structure(argv[1]);
@@ -18,6 +19,8 @@ int main(int argc, char* argv[]){
         rdmask_run_local(peer);
     else if (structure == "sherm" || structure == "sherman")
         sherman_run_local(peer);
+    else if (structure == "multi" || structure == "multis")
+        multi_run_local(peer);
     else
-        REMUS_ERROR("No valid structure [btree|b OR rdmask|sk]");
+        REMUS_ERROR("No valid structure [btree|b OR rdmask|sk OR sherm|sherman OR multi|multis]");
 }

@@ -13,6 +13,7 @@
 #include "cached_ptr.h"
 #include "mark_ptr.h"
 #include "metrics.h"
+// #include "../test/faux_mempool.h"
 
 using namespace remus::rdma;
 
@@ -43,7 +44,7 @@ thread_local static ObjectPool<DeallocTask> dealloc_pool = ObjectPool<DeallocTas
 
 // todo: fix memory issue (all of it is in rdma accessible memory when only the addresses need to be)? Better for cache?
 struct CacheLine {
-    uint64_t address;
+    uint64_t address; // todo: assert at the beginning?
     // int priority;
     std::mutex* mu;
     rdma_ptr<Object> local_ptr;
@@ -58,6 +59,7 @@ private:
     vector<rdma_ptr<CacheLine>> remote_caches;
     CacheLine* lines;
     int number_of_lines;
+    uint16_t self_id;
 
     template <typename T>
     uint64_t hash(rdma_ptr<T> ptr){
@@ -112,7 +114,7 @@ public:
     thread_local static CacheMetrics metrics;
     thread_local static Pool* pool;
 
-    RemoteCacheImpl(Pool* intializer, int number_of_lines = 2000) {
+    RemoteCacheImpl(Pool* intializer, uint16_t self_id, int number_of_lines = 2000) : self_id(self_id) {
         REMUS_ASSERT(sizeof(Object) == 1, "Precondition");
         this->number_of_lines = number_of_lines;
         origin_address = intializer->template Allocate<CacheLine>(number_of_lines);
@@ -257,8 +259,11 @@ public:
                 }
             } else {
                 // -- Cache miss (compulsory or conflict) -- //
-                // Overwrite the address
-                l->address = ptr.raw();
+                // Overwrite the address 
+                // todo: is it possible that this address change is not messed up?
+                // l->address = ptr.raw();
+                rdma_ptr<uint64_t> cache_line = rdma_ptr<uint64_t>(self_id, (uint64_t) l);
+                pool->template AtomicSwap<uint64_t>(cache_line, ptr.raw(), l->address);
                 atomic_thread_fence(std::memory_order_seq_cst);
 
                 // Then read the data and update the cache line
@@ -312,6 +317,7 @@ public:
             // Invalidate locally
             l->mu->lock();
             if ((l->address & ~mask) == ptr.raw()){
+                // todo?
                 l->address = l->address | mask;
             }
             l->mu->unlock();
@@ -320,7 +326,8 @@ public:
             for(int i = 0; i < remote_caches.size(); i++){
                 // CAS the remote cache's address to have the mask
                 rdma_ptr<uint64_t> cache_line = static_cast<rdma_ptr<uint64_t>>(remote_caches[i][hash(ptr) % number_of_lines]);
-                pool->template CompareAndSwap<uint64_t>(cache_line, ptr.raw(), ptr.raw() | mask);
+                uint64_t old_value = pool->template CompareAndSwap<uint64_t>(cache_line, ptr.raw(), ptr.raw() | mask);
+                if (old_value == ptr.raw()) metrics.successful_invalidations++;
                 metrics.remote_cas++;
                 // todo: batch compare and swap
             }
@@ -337,6 +344,9 @@ public:
     /// Useful if we need multiple writes
     template <typename T>
     void Invalidate(rdma_ptr<T> ptr){
+        if (!is_marked(ptr)) {
+            return; // if the ptr is not marked, don't invalidate the object
+        }
         // Get the cache line
         ptr = unmark_ptr(ptr);
         CacheLine* l = &lines[hash(ptr) % number_of_lines];
@@ -352,7 +362,10 @@ public:
         for(int i = 0; i < remote_caches.size(); i++){
             // CAS the remote cache's address to have the mask
             rdma_ptr<uint64_t> cache_line = static_cast<rdma_ptr<uint64_t>>(remote_caches[i][hash(ptr) % number_of_lines]);
-            pool->template CompareAndSwap<uint64_t>(cache_line, ptr.raw(), ptr.raw() | mask);
+            uint64_t old_value = pool->template CompareAndSwap<uint64_t>(cache_line, ptr.raw(), ptr.raw() | mask);
+            if (old_value == ptr.raw()) {
+                metrics.successful_invalidations++;
+            }
             metrics.remote_cas++;
             // todo: batch compare and swap
         }
