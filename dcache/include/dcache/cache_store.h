@@ -212,6 +212,7 @@ public:
     // todo: add a prealloc that is for non-marked pointers!
     template <typename T>
     CachedObject<T> ExtendedRead(rdma_ptr<T> ptr, int size, rdma_ptr<T> prealloc = nullptr){
+        REMUS_ASSERT_DBEUG(ptr != nullptr, "Cant read nullptr");
         // Periodically call try_free_some to cleanup limbo lists
         try_free_some();
     

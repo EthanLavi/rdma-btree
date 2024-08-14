@@ -27,13 +27,13 @@ using namespace remus::util;
 using namespace remus::rdma;
 
 // todo: increment size here! log2(keyspace)?
-#ifndef MAX_HEIGHT_SK
-#define MAX_HEIGHT_SK 16
+#ifndef MAX_HEIGHT_MK
+#define MAX_HEIGHT_MK 12
 #endif
 
 inline void multi_run(BenchmarkParams& params, rdma_capability* capability, RemoteCache* cache, Peer& host, Peer& self, std::vector<Peer> peers){
-    using MultiList = RdmaMultiList<int, MAX_HEIGHT_SK, INT_MIN, ULONG_MAX, ULONG_MAX - 1, rdma_capability_thread>;
-    using Node = node<int, MAX_HEIGHT_SK>;
+    using MultiList = RdmaMultiList<int, MAX_HEIGHT_MK, INT_MIN, ULONG_MAX, ULONG_MAX - 1, rdma_capability_thread>;
+    using Node = node<int, MAX_HEIGHT_MK>;
 
     REMUS_ASSERT(params.thread_count >= 2, "Thread count should be at least 2 to account for the helper thread");
     
@@ -51,7 +51,7 @@ inline void multi_run(BenchmarkParams& params, rdma_capability* capability, Remo
 
             // Create a root ptr to the IHT
             Peer p = Peer();
-            MultiList sk = MultiList(self, MAX_HEIGHT_SK - params.cache_depth, cache, pool, peers, nullptr);
+            MultiList sk = MultiList(self, params.cache_depth + 1, cache, pool, peers, nullptr);
             sk.set_key_range(params.key_lb, params.key_ub);
             rdma_ptr<anon_ptr> root_ptr = sk.InitAsFirst(pool);
             // Send the root pointer over
@@ -118,7 +118,7 @@ inline void multi_run(BenchmarkParams& params, rdma_capability* capability, Remo
             }));
             cache->init(peer_roots);
 
-            std::shared_ptr<MultiList> sk = std::make_shared<MultiList>(self, MAX_HEIGHT_SK - params.cache_depth, cache, pool, peers, ebr);
+            std::shared_ptr<MultiList> sk = std::make_shared<MultiList>(self, params.cache_depth + 1, cache, pool, peers, ebr);
             sk->set_key_range(params.key_lb, params.key_ub);
             // Get the data from the server to init the btree
             tcp::message ptr_message;
@@ -164,8 +164,6 @@ inline void multi_run(BenchmarkParams& params, rdma_capability* capability, Remo
                         ExperimentManager::ClientArriveBarrier(endpoint);
                         populate_amount = sk->count(pool);
                         ExperimentManager::ClientArriveBarrier(endpoint);
-                        cache->print_metrics();
-                        cache->reset_metrics();
 
                         std::this_thread::sleep_for(std::chrono::seconds(3)); // wait 3 seconds for the helper thread to catch up
                     }
@@ -209,7 +207,6 @@ inline void multi_run(BenchmarkParams& params, rdma_capability* capability, Remo
 
             ExperimentManager::ClientArriveBarrier(endpoint);
             REMUS_INFO("[{} THREAD] -- End of execution; -- ", thread_index == helper_tidx ? "HELPER" : "CLIENT");
-            cache->print_metrics(thread_index == helper_tidx ? "Helper -> " : "");
         }, i));
     }
 
@@ -223,12 +220,12 @@ inline void multi_run(BenchmarkParams& params, rdma_capability* capability, Remo
     }
     delete_endpoints(endpoint_managers, params);
 
-    save_result("skiplist_result.csv", workload_results, params, params.thread_count - 1);
+    save_result("multi_result.csv", workload_results, params, params.thread_count - 1);
 }
 
 inline void multi_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCacheImpl<CountingPool>* cache, Peer& host, Peer& self, std::vector<Peer> peers){
-    using Node = node<int, MAX_HEIGHT_SK>;
-    using MultiListLocal = RdmaMultiList<int, MAX_HEIGHT_SK, INT_MIN, ULONG_MAX, ULONG_MAX - 1, CountingPool>;
+    using Node = node<int, MAX_HEIGHT_MK>;
+    using MultiListLocal = RdmaMultiList<int, MAX_HEIGHT_MK, INT_MIN, ULONG_MAX, ULONG_MAX - 1, CountingPool>;
     REMUS_ASSERT(params.thread_count >= 3, "Thread count should be at least 3 to account for the two helper thread");
     
     // Create a list of client and server  threads
@@ -244,7 +241,7 @@ inline void multi_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCac
 
             // Create a root ptr to the IHT
             Peer p = Peer();
-            MultiListLocal sk = MultiListLocal(self, MAX_HEIGHT_SK - params.cache_depth, cache, pool, peers, nullptr);
+            MultiListLocal sk = MultiListLocal(self, params.cache_depth + 1, cache, pool, peers, nullptr);
             sk.set_key_range(params.key_lb, params.key_ub);
             rdma_ptr<anon_ptr> root_ptr = sk.InitAsFirst(pool);
             // Send the root pointer over
@@ -310,7 +307,7 @@ inline void multi_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCac
             }));
             cache->init(peer_roots);
 
-            std::shared_ptr<MultiListLocal> sk = std::make_shared<MultiListLocal>(self, MAX_HEIGHT_SK - params.cache_depth, cache, pool, peers, ebr);
+            std::shared_ptr<MultiListLocal> sk = std::make_shared<MultiListLocal>(self, params.cache_depth + 1, cache, pool, peers, ebr);
             sk->set_key_range(params.key_lb, params.key_ub);
             // Get the data from the server to init the btree
             tcp::message ptr_message;
@@ -358,9 +355,6 @@ inline void multi_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCac
                         ExperimentManager::ClientArriveBarrier(endpoint);
                         populate_amount = sk->count(pool);
                         ExperimentManager::ClientArriveBarrier(endpoint);
-                        cache->print_metrics();
-                        cache->reset_metrics();
-
                         std::this_thread::sleep_for(std::chrono::seconds(3)); // wait 3 seconds for the helper thread to catch up
                     }
                 );
@@ -403,7 +397,6 @@ inline void multi_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCac
 
             ExperimentManager::ClientArriveBarrier(endpoint);
             REMUS_INFO("[{} THREAD] -- End of execution; -- ", thread_index == helper_tidx ? "HELPER" : "CLIENT");
-            cache->print_metrics((thread_index == helper_tidx || thread_index == helper_tidx - 1) ? "Helper -> " : "");
         }, i));
     }
 
@@ -417,12 +410,12 @@ inline void multi_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCac
     }
     delete_endpoints(endpoint_managers, params);
 
-    save_result("skiplist_result.csv", workload_results, params, params.thread_count - 2);
+    save_result("multi_result.csv", workload_results, params, params.thread_count - 2);
 }
 
 inline void multi_run_local(Peer& self){
-    using Node = node<int, MAX_HEIGHT_SK>;
-    using MultiListLocal = RdmaMultiList<int, MAX_HEIGHT_SK, INT_MIN, ULONG_MAX, ULONG_MAX - 1, CountingPool>;
+    using Node = node<int, MAX_HEIGHT_MK>;
+    using MultiListLocal = RdmaMultiList<int, MAX_HEIGHT_MK, INT_MIN, ULONG_MAX, ULONG_MAX - 1, CountingPool>;
     CountingPool* pool = new CountingPool(true);
     RemoteCacheImpl<CountingPool>* cach = new RemoteCacheImpl<CountingPool>(pool, 0);
     RemoteCacheImpl<CountingPool>::pool = pool; // set pool to other pool so we acccept our own cacheline
@@ -430,23 +423,24 @@ inline void multi_run_local(Peer& self){
     static const int KEY_LB = 0;
     static const int KEY_UB = 100;
 
-    if (false){
+    if (true){
         BenchmarkParams params = BenchmarkParams();
-        params.cache_depth = (CacheDepth::CacheDepth) 16;
-        params.contains = 50;
-        params.insert = 25;
-        params.remove = 25;
+        params.cache_depth = (CacheDepth::CacheDepth) 4;
+        params.contains = 80;
+        params.insert = 10;
+        params.remove = 10;
         params.key_lb = 0;
         params.key_ub = 100;
         params.node_count = 1;
         params.node_id = 0;
-        params.thread_count = 8;
+        params.thread_count = 5;
         params.op_count = 10000;
         params.runtime = 1;
         params.qp_per_conn = 1;
-        params.structure = "skiplist";
+        params.structure = "multi";
         params.unlimited_stream = false;
         params.region_size = 28;
+        params.distribution = "uniform";
         Peer host = self;
         vector<Peer> peers = {};
         multi_run_tmp(params, pool, cach, host, self, peers);

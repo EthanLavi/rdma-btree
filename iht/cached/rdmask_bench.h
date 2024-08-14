@@ -440,6 +440,7 @@ inline void rdmask_run_local(Peer& self){
         params.structure = "skiplist";
         params.unlimited_stream = false;
         params.region_size = 28;
+        params.distribution = "uniform";
         Peer host = self;
         vector<Peer> peers = {};
         rdmask_run_tmp(params, pool, cach, host, self, peers);

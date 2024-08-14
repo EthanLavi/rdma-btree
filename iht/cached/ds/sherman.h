@@ -57,8 +57,8 @@ private:
     long height;
     K key_low;
     K key_high;
-    bool is_deallocated;
-    char padding[(64 - sizeof(K) - sizeof(K) - sizeof(long) - sizeof(long) - sizeof(bool))];
+    long is_deleted;
+    char padding[(64 - sizeof(K) - sizeof(K) - sizeof(long) - sizeof(long) - sizeof(long))];
   };
 
   /// A line with keys
@@ -112,7 +112,7 @@ public:
 
   public:
     BNode(){
-      fency_key.is_deallocated = false;
+      fency_key.is_deleted = 0xDEADDEADDEADDEAD;
       fency_key.version = 0;
       fency_key.key_low = INT_MIN; // neither INT_MIN nor INT_MAX are valid keys!
       fency_key.key_high = SENTINEL;
@@ -131,11 +131,16 @@ public:
     }
 
     void mark_deleted(){
-      fency_key.is_deallocated = true;
+      fency_key.is_deleted = 0;
+    }
+
+    bool is_deleted() const {
+      return fency_key.is_deleted != 0xDEADDEADDEADDEAD;
     }
 
     /// Checks if the version is valid
     bool is_valid(bool ignore_lock = false) const {
+      if (is_deleted()) return false;
       long base = key_lines[0].version;
       if (ignore_lock) base = base & ~LOCK_BIT;
       for(int i = 0; i < KLINES; i++){
@@ -179,11 +184,11 @@ public:
 
     /// Test if a key is in the range
     bool key_in_range(K key) const {
-      return fency_key.key_low < key && key <= fency_key.key_high && !fency_key.is_deallocated;
+      return fency_key.key_low < key && key <= fency_key.key_high && !is_deleted();
     }
 
     bool key_in_range(K key, int height) const {
-      return fency_key.key_low < key && key <= fency_key.key_high && height == fency_key.height && !fency_key.is_deallocated;
+      return fency_key.key_low < key && key <= fency_key.key_high && height == fency_key.height && !is_deleted();
     }
 
     /// Get the lower bound for the leaf (exclusive)
@@ -229,7 +234,7 @@ public:
       last_line.version = 0;
       last_line.key_low = INT_MIN; // neither INT_MIN nor INT_MAX are valid keys!
       last_line.key_high = SENTINEL;
-      last_line.is_deleted = 0;
+      last_line.is_deleted = 0xDEADDEADDEADDEAD;
       for(int i = 0; i < SIZE; i++){
         set_key(i, SENTINEL);
         set_value(i, 0); // set just for debugging
@@ -237,8 +242,13 @@ public:
       set_next(nullptr);
     }
 
+    bool is_deleted() const {
+      return last_line.is_deleted != 0xDEADDEADDEADDEAD;
+    }
+
     /// Checks if the version is valid
     bool is_valid(bool ignore_lock = false) const {
+      if (is_deleted()) return false;
       long base = key_lines[0].version;
       if (ignore_lock) base = base & ~LOCK_BIT;
       for(int i = 1; i < KLINES; i++){
@@ -253,12 +263,12 @@ public:
 
     /// Test if a key is in the range
     bool key_in_range(K key) const {
-      return last_line.key_low < key && key <= last_line.key_high && last_line.is_deleted == 0;
+      return last_line.key_low < key && key <= last_line.key_high && !is_deleted();
     }
 
     // mark as deleted
     void mark_deleted(){
-      last_line.is_deleted = 1;
+      last_line.is_deleted = 0;
     }
 
     /// Get the lower bound for the leaf (exclusive)
@@ -384,16 +394,19 @@ private:
     CachedObject<ptr_t> obj = cache->template Read<ptr_t>(node, prealloc);
     if (behavior == IGNORE_LOCK){
       while(!obj->is_valid(true)){
+        if (obj->is_deleted()) return obj;
         obj = cache->template Read<ptr_t>(node, prealloc);
       }
     } else if (behavior == LOOK_FOR_SPLIT_MERGE) {
       bool should_ignore_lock = (obj->key_at(SIZE - 1) != SENTINEL) || (obj->key_at(0) == SENTINEL);
       while(!obj->is_valid(should_ignore_lock)){
+        if (obj->is_deleted()) return obj;
         obj = cache->template Read<ptr_t>(node, prealloc);
         should_ignore_lock = (obj->key_at(SIZE - 1) != SENTINEL) || (obj->key_at(0) == SENTINEL);
       }
     } else { // WILL_NEED_ACQUIRE
       while(!obj->is_valid(false)){
+        if (obj->is_deleted()) return obj;
         obj = cache->template Read<ptr_t>(node, prealloc);
       }
     }
@@ -782,7 +795,7 @@ private:
       bnode_ptr next_node = static_cast<bnode_ptr>(ccptr);
       curr = reliable_read<BNode>(next_node, modifiable ? LOOK_FOR_SPLIT_MERGE : IGNORE_LOCK);
       BNode n = *curr;
-      if(!n.key_in_range(key)){ // todo: add in range to the rest?
+      if(!n.key_in_range(key)){ // guard against deleted
         backup_index->invalidate(key);
         goto was_bad;
       } else {

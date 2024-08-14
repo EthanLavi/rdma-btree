@@ -311,8 +311,9 @@ public:
     /// @param root_ptr the root pointer of the other iht from InitAsFirst();
     void InitFromPointer(rdma_ptr<anon_ptr> root_ptr){
         rdma_ptr<CachedStart> multiroot = static_cast<rdma_ptr<CachedStart>>(root_ptr);
+        CachedObject<CachedStart> roots = cache->template ExtendedRead<CachedStart>(multiroot, branch_n);
         for(int i = 0; i < branch_n; i++){
-            multi_start[i] = multiroot[i]->np;
+            multi_start[i] = roots.get()[i]->np;
         }
     }
 
