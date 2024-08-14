@@ -10,7 +10,6 @@
 #include <dcache/cache_store.h>
 #include <dcache/cached_ptr.h>
 
-#include "dcache/mark_ptr.h"
 #include "ebr.h"
 
 #include "../../common.h"
@@ -26,22 +25,40 @@ todo: Optimize read behaviors
 */
 
 /// SIZE is DEGREE * 2
-template <class K, int MAX_HEIGHT, K MINKEY, uint64_t DELETE_SENTINEL, uint64_t UNLINK_SENTINEL, class capability> class RdmaMultiList {
+template <class K, int MAX_HEIGHT, K MINKEY, uint64_t DELETE_SENTINEL, uint64_t UNLINK_SENTINEL, class capability> 
+class RdmaMultiList {
+public:
+    typedef node<K, MAX_HEIGHT> Node;
+    typedef rdma_ptr<Node> nodeptr;
+
+    struct alignas(64) CachedStart {
+        nodeptr np;
+    };
 private:
     using RemoteCache = RemoteCacheImpl<capability>;
 
     Peer self_;
-    int cache_floor_;
-
-    typedef node<K, MAX_HEIGHT> Node;
-    typedef rdma_ptr<Node> nodeptr;
+    int branch_n;
 
     template <typename T> inline bool is_local(rdma_ptr<T> ptr) {
         return ptr.id() == self_.id;
     }
 
-    nodeptr root;
+    nodeptr* multi_start;
     RemoteCache* cache;
+
+    K key_lb;
+    K key_ub;
+
+    rdma_ptr<Node> get_root(int key_in_range){
+        if (branch_n == 1) return multi_start[0]; // doesn't work if distance is too big
+        K distance = (key_ub / branch_n) - (key_lb / branch_n);
+        int index = ((double) key_in_range / distance) - (key_lb / distance);
+        // clamp [0, degree)
+        if (index < 0) index = 0;
+        if (index >= branch_n) index = branch_n - 1;
+        return multi_start[index];
+    }
   
     // preallocated memory for RDMA operations (avoiding frequent allocations)
     rdma_ptr<Node> prealloc_node_w;
@@ -56,22 +73,22 @@ private:
 
     inline rdma_ptr<uint64_t> get_value_ptr(nodeptr node) {
         Node* tmp = (Node*) 0x0;
-        return rdma_ptr<uint64_t>(unmark_ptr(node).id(), unmark_ptr(node).address() + (uint64_t) &tmp->value);
+        return rdma_ptr<uint64_t>(node.id(), node.address() + (uint64_t) &tmp->value);
     }
 
     inline rdma_ptr<uint64_t> get_link_height_ptr(nodeptr node) {
         Node* tmp = (Node*) 0x0;
-        return rdma_ptr<uint64_t>(unmark_ptr(node).id(), unmark_ptr(node).address() + (uint64_t) &tmp->link_level);
+        return rdma_ptr<uint64_t>(node.id(), node.address() + (uint64_t) &tmp->link_level);
     }
 
     inline rdma_ptr<uint64_t> get_level_ptr(nodeptr node, int level) {          
         Node* tmp = (Node*) 0x0;
-        return rdma_ptr<uint64_t>(unmark_ptr(node).id(), unmark_ptr(node).address() + (uint64_t) &tmp->next[level]);
+        return rdma_ptr<uint64_t>(node.id(), node.address() + (uint64_t) &tmp->next[level]);
     }
 
     CachedObject<Node> fill(K key, rdma_ptr<Node> preds[MAX_HEIGHT], rdma_ptr<Node> succs[MAX_HEIGHT], bool found[MAX_HEIGHT], K prev_keys[MAX_HEIGHT]){
         // first node is a sentinel, it will always be linked in the data structure
-        CachedObject<Node> curr = cache->template Read<Node>(root, prealloc_fill_node1); // root is never deleted, let's say curr is never a deleted node
+        CachedObject<Node> curr = cache->template Read<Node>(get_root(key), prealloc_fill_node1); 
         CachedObject<Node> next_curr;
         bool use_node1 = false;
         for(int height = MAX_HEIGHT - 1; height != -1; height--){
@@ -186,8 +203,8 @@ private:
     }
 
 public:
-    RdmaMultiList(Peer& self, int cache_floor, RemoteCache* cache, capability* pool, vector<Peer> peers, EBRObjectPool<Node, 100, capability>* ebr) 
-    : self_(std::move(self)), cache_floor_(cache_floor), cache(cache), ebr(ebr) {
+    RdmaMultiList(Peer& self, int degree, RemoteCache* cache, capability* pool, vector<Peer> peers, EBRObjectPool<Node, 100, capability>* ebr) 
+    : self_(std::move(self)), branch_n(1 << degree), cache(cache), ebr(ebr) {
         REMUS_INFO("SENTINEL is MIN? {}", MINKEY);
         prealloc_node_w = pool->template Allocate<Node>();
         prealloc_count_node = pool->template Allocate<Node>();
@@ -196,46 +213,61 @@ public:
         prealloc_find_node1 = pool->template Allocate<Node>();
         prealloc_find_node2 = pool->template Allocate<Node>();
         prealloc_helper_node = pool->template Allocate<Node>();
+        REMUS_INFO("size = {}", branch_n);
+        multi_start = new nodeptr[branch_n];
+        key_lb = MINKEY;
+        key_ub = MINKEY + 1;
+    }
+
+    void set_key_range(K new_key_lb, K new_key_ub){
+        key_lb = new_key_lb;
+        key_ub = new_key_ub;
+    }
+
+    int list_n() const {
+        return branch_n;
     }
 
     void helper_thread(std::atomic<bool>* do_cont, capability* pool, EBRObjectPool<Node, 100, capability>* ebr_helper, vector<LimboLists<Node>*> qs){
         CachedObject<Node> curr;
         int i = 0;
         while(do_cont->load()){ // endlessly traverse and maintain the index
-            curr = cache->template Read<Node>(root, prealloc_helper_node);
-            while(sans(curr->next[0]) != nullptr && do_cont->load()){
-                curr = cache->template Read<Node>(sans(curr->next[0]), prealloc_helper_node);
-                if (curr->value == DELETE_SENTINEL && curr->link_level == curr->height){
-                    rdma_ptr<uint64_t> ptr = get_value_ptr(curr.remote_origin());
-                    uint64_t last = pool->template CompareAndSwap<uint64_t>(ptr, DELETE_SENTINEL, UNLINK_SENTINEL);
-                    if (last != DELETE_SENTINEL) continue; // something changed, gonna skip this node
-                    cache->Invalidate(curr.remote_origin());
-                    unlink_node(pool, curr->key); // physically unlink (has guarantee of unlink)
-                    curr = cache->template Read<Node>(curr.remote_origin()); // refresh curr now that it has changed!
+            for(int branch = 0; branch < branch_n; branch++){
+                curr = cache->template Read<Node>(multi_start[branch], prealloc_helper_node);
+                while(sans(curr->next[0]) != nullptr && do_cont->load()){
+                    curr = cache->template Read<Node>(sans(curr->next[0]), prealloc_helper_node);
+                    if (curr->value == DELETE_SENTINEL && curr->link_level == curr->height){
+                        rdma_ptr<uint64_t> ptr = get_value_ptr(curr.remote_origin());
+                        uint64_t last = pool->template CompareAndSwap<uint64_t>(ptr, DELETE_SENTINEL, UNLINK_SENTINEL);
+                        if (last != DELETE_SENTINEL) continue; // something changed, gonna skip this node
+                        cache->Invalidate(curr.remote_origin());
+                        unlink_node(pool, curr->key); // physically unlink (has guarantee of unlink)
+                        curr = cache->template Read<Node>(curr.remote_origin()); // refresh curr now that it has changed!
 
-                    // deallocate unlinked node
-                    LimboLists<Node>* q = qs.at(i);
-                    q->free_lists[2].load()->push(unmark_ptr(curr.remote_origin()));
-                    
-                    // cycle the index
-                    i++;
-                    i %= qs.size();
-                } else if (curr->value == UNLINK_SENTINEL){
-                    continue; // someone else is unlinking
-                } else {
-                    // Hasn't been raised yet and isn't in the process or raising (Test-Test-And-Set)
-                    if (curr->link_level == 0 && curr->height > 1){
-                        // Raise the node
-                        int old_height = pool->template CompareAndSwap<uint64_t>(get_link_height_ptr(curr.remote_origin()), 0, 1);
-                        if (old_height == 0){
-                            cache->Invalidate(curr.remote_origin());
-                            raise_node(pool, curr->key, curr->height);
-                            curr = cache->template Read<Node>(curr.remote_origin()); // refresh curr, now that it has changed
-                        }
+                        // deallocate unlinked node
+                        LimboLists<Node>* q = qs.at(i);
+                        q->free_lists[2].load()->push(curr.remote_origin());
+                        
+                        // cycle the index
+                        i++;
+                        i %= qs.size();
+                    } else if (curr->value == UNLINK_SENTINEL){
+                        continue; // someone else is unlinking
                     } else {
-                        int old_height = pool->template CompareAndSwap<uint64_t>(get_link_height_ptr(curr.remote_origin()), 0, 1);
-                        if (old_height == curr->link_level){
-                            cache->Invalidate(curr.remote_origin());
+                        // Hasn't been raised yet and isn't in the process or raising (Test-Test-And-Set)
+                        if (curr->link_level == 0 && curr->height > 1){
+                            // Raise the node
+                            int old_height = pool->template CompareAndSwap<uint64_t>(get_link_height_ptr(curr.remote_origin()), 0, 1);
+                            if (old_height == 0){
+                                cache->Invalidate(curr.remote_origin());
+                                raise_node(pool, curr->key, curr->height);
+                                curr = cache->template Read<Node>(curr.remote_origin()); // refresh curr, now that it has changed
+                            }
+                        } else {
+                            int old_height = pool->template CompareAndSwap<uint64_t>(get_link_height_ptr(curr.remote_origin()), 0, 1);
+                            if (old_height == curr->link_level){
+                                cache->Invalidate(curr.remote_origin());
+                            }
                         }
                     }
                 }
@@ -253,28 +285,35 @@ public:
         pool->template Deallocate<Node>(prealloc_find_node1);
         pool->template Deallocate<Node>(prealloc_find_node2);
         pool->template Deallocate<Node>(prealloc_helper_node);
-        if (delete_as_first) pool->template Deallocate<Node>(root);
+        for(int i = 0; i < branch_n; i++){
+            if (delete_as_first) pool->template Deallocate<Node>(multi_start[i]);
+        }
+        delete[] multi_start;
     }
 
     /// @brief Create a fresh iht
     /// @param pool the capability to init the IHT with
     /// @return the iht root pointer
     rdma_ptr<anon_ptr> InitAsFirst(capability* pool){
-        this->root = pool->template Allocate<Node>();
-        this->root->key = MINKEY;
-        this->root->value = 0;
-        for(int i = 0; i < MAX_HEIGHT; i++)
-            this->root->next[i] = nullptr;
-        this->root = this->root;
-        if (cache_floor_ < MAX_HEIGHT) this->root = mark_ptr(this->root);
-        return static_cast<rdma_ptr<anon_ptr>>(this->root);
+        rdma_ptr<CachedStart> multiroot = pool->template Allocate<CachedStart>(branch_n);
+        for(int i = 0; i < branch_n; i++){
+            multi_start[i] = pool->template Allocate<Node>();
+            multi_start[i]->key = MINKEY;
+            multi_start[i]->value = 0;
+            for(int j = 0; j < MAX_HEIGHT; j++)
+                multi_start[i]->next[j] = nullptr;
+            multiroot[i]->np = multi_start[i];
+        }
+        return static_cast<rdma_ptr<anon_ptr>>(multiroot);
     }
 
     /// @brief Initialize an IHT from the pointer of another IHT
     /// @param root_ptr the root pointer of the other iht from InitAsFirst();
     void InitFromPointer(rdma_ptr<anon_ptr> root_ptr){
-        this->root = static_cast<nodeptr>(root_ptr);
-        if (cache_floor_ < MAX_HEIGHT) this->root = mark_ptr(this->root);
+        rdma_ptr<CachedStart> multiroot = static_cast<rdma_ptr<CachedStart>>(root_ptr);
+        for(int i = 0; i < branch_n; i++){
+            multi_start[i] = multiroot[i]->np;
+        }
     }
 
     private: void nonblock_unlink_node(capability* pool, K key){
@@ -303,7 +342,7 @@ public:
     /// Will unlink nodes only at the data level leaving them indexable
     private: CachedObject<Node> find(capability* pool, K key, bool is_insert){
         // first node is a sentinel, it will always be linked in the data structure
-        CachedObject<Node> curr = cache->template Read<Node>(root, prealloc_find_node1); // root is never deleted, let's say curr is never a deleted node
+        CachedObject<Node> curr = cache->template Read<Node>(get_root(key), prealloc_find_node1);
         bool use_node1 = false;
         CachedObject<Node> next_curr;
         for(int height = MAX_HEIGHT - 1; height != -1; height--){
@@ -396,12 +435,9 @@ public:
 
             // if the next is a deleted node, we need to physically delete
             rdma_ptr<uint64_t> dest = get_level_ptr(curr.remote_origin(), 0);
-            nodeptr new_node_ptr_marked = new_node_ptr;
-            if (height > cache_floor_){
-                new_node_ptr_marked = mark_ptr(new_node_ptr_marked);
-            }
+
             // will fail if the ptr is marked for unlinking
-            uint64_t old = pool->template CompareAndSwap<uint64_t>(dest, sans(curr->next[0]).raw(), new_node_ptr_marked.raw());
+            uint64_t old = pool->template CompareAndSwap<uint64_t>(dest, sans(curr->next[0]).raw(), new_node_ptr.raw());
             if (old == sans(curr->next[0]).raw()){ // if our CAS was successful, invalidate the object we modified
                 cache->Invalidate(curr.remote_origin());
                 ebr->match_version(pool);
@@ -472,6 +508,14 @@ public:
 
     /// Single threaded, local print
     void debug(){
+        for(int i = 0; i < branch_n; i++){
+            std::cout << "Skiplist " << i + 1 << std::endl;
+            debug(multi_start[i]);
+            std::cout << std::endl;
+        }
+    }
+
+    void debug(rdma_ptr<Node> root){
         for(int height = MAX_HEIGHT - 1; height != 0; height--){
             int counter = 0;
             Node curr = *root;
@@ -509,15 +553,17 @@ public:
         int total_counter[MAX_HEIGHT];
         memset(counter, 0, sizeof(int) * MAX_HEIGHT);
         memset(total_counter, 0, sizeof(int) * MAX_HEIGHT);
-        Node curr = *cache->template Read<Node>(unmark_ptr(root), prealloc_count_node);
-        while(curr.next[0] != nullptr){
-            curr = *cache->template Read<Node>(unmark_ptr(curr.next[0]), prealloc_count_node);
-            counter[curr.height - 1]++;
-            for(int i = 0; i <= curr.height - 1; i++){
-                total_counter[i]++;
+        for(int i = 0; i < branch_n; i++){
+            Node curr = *cache->template Read<Node>(multi_start[i], prealloc_count_node);
+            while(curr.next[0] != nullptr){
+                curr = *cache->template Read<Node>(curr.next[0], prealloc_count_node);
+                counter[curr.height - 1]++;
+                for(int i = 0; i <= curr.height - 1; i++){
+                    total_counter[i]++;
+                }
+                if (curr.value != DELETE_SENTINEL && curr.value != UNLINK_SENTINEL)
+                    count++;
             }
-            if (curr.value != DELETE_SENTINEL && curr.value != UNLINK_SENTINEL)
-                count++;
         }
         for(int i = 0; i < MAX_HEIGHT; i++){
             REMUS_INFO("nodes with height {} = {}, cumulative={}", i, counter[i], total_counter[i]);
