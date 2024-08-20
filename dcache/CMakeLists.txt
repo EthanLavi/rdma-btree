@@ -9,6 +9,10 @@ add_executable(cache_store_test test/cache_store.cc)
 target_link_libraries(cache_store_test PUBLIC remus::rdma remus::workload remus::util)
 add_test(cache_store_test cache_store_test)
 
+add_executable(dynamics_test test/dynamics.cc)
+target_link_libraries(dynamics_test PUBLIC remus::rdma remus::workload remus::util)
+add_test(dynamics_test dynamics_test)
+
 add_executable(object_pool_test test/object_pool.cc)
 target_link_libraries(object_pool_test PUBLIC remus::rdma remus::workload remus::util)
 add_test(object_pool_test object_pool_test)

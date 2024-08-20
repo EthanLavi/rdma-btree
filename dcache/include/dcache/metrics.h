@@ -15,8 +15,12 @@ struct CacheMetrics {
     int deallocation;
     /// something was found in the cache but was invalid
     int coherence_misses;
-    /// had to swap something out (or was cold/compulsory miss)
+    /// had to swap something out (compulsory miss)
     int conflict_misses;
+    /// cold miss. Swap something in and replace nothing
+    int cold_misses;
+    /// priority miss (the priority of the item to be swapped out was lower/higher than the one to swap in (thus leading to normal execution))
+    int priority_misses;
     /// hit in the cache
     int hits;
     /// Number of cold lines in the cache
@@ -32,9 +36,11 @@ struct CacheMetrics {
         deallocation = 0;
         coherence_misses = 0;
         conflict_misses = 0;
+        cold_misses = 0;
         hits = 0;
         empty_lines = 0;
         successful_invalidations = 0;
+        priority_misses = 0;
     }
 
     std::string as_string() {
@@ -44,6 +50,8 @@ struct CacheMetrics {
         ss += "  <Deallocations = " + std::to_string(deallocation) + "/>\n";
         ss += "  <CoherenceMiss = " + std::to_string(coherence_misses) + "/>\n";
         ss += "  <ConflictMiss = " + std::to_string(conflict_misses) + "/>\n";
+        ss += "  <ColdMiss = " + std::to_string(cold_misses) + "/>\n";
+        ss += "  <PriorityMiss = " + std::to_string(priority_misses) + "/>\n";
         ss += "  <RemoteRead = " + std::to_string(remote_reads) + "/>\n";
         ss += "  <RemoteWrite = " + std::to_string(remote_writes) + "/>\n";
         ss += "  <RemoteCAS = " + std::to_string(remote_cas) + "/>\n";

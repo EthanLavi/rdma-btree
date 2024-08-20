@@ -76,6 +76,17 @@ void main_body(CountingPool* pool, RemoteCacheImpl<CountingPool>* cache){
         tmp_copy.x[1] += 1;
         cache->Write<Structure>(at_ptr, tmp_copy);
     }
+    REMUS_INFO("Test 4 -- PASSED");
+
+    // -- Test 5 -- //
+    rdma_ptr<Structure> ptr2 = pool->Allocate<Structure>();
+    rdma_ptr<Structure> ptr3 = pool->Allocate<Structure>();
+    CachedObject<Structure> data = cache->Read<Structure>(mark_ptr(ptr2), nullptr, -1);
+    test(cache->metrics.priority_misses == 0, "Made it into cache");
+    CachedObject<Structure> data2 = cache->Read<Structure>(mark_ptr(ptr3), nullptr, 10);
+    test(cache->metrics.priority_misses == 1, "Made it into cache"); // cache was full, caused priority miss
+    REMUS_INFO("Test 5 -- PASSED");
+
     // free all the structures
     for(int i = 0; i < TRIAL_WIDTH; i++){
         pool->Deallocate<Structure>(ps[i]);
@@ -83,6 +94,8 @@ void main_body(CountingPool* pool, RemoteCacheImpl<CountingPool>* cache){
 
     // deallocate main pointer
     pool->Deallocate<Structure>(p, 2);
+    pool->Deallocate<Structure>(ptr2);
+    pool->Deallocate<Structure>(ptr3);
 }
 
 int main(){
@@ -90,7 +103,7 @@ int main(){
     CountingPool* pool = new CountingPool(false);
 
     // Construct the remote cache
-    RemoteCacheImpl<CountingPool>* cache = new RemoteCacheImpl<CountingPool>(pool, 0);
+    RemoteCacheImpl<CountingPool>* cache = new RemoteCacheImpl<CountingPool>(pool, 0, 500);
     RemoteCacheImpl<CountingPool>::pool = pool; // set pool to other pool so we acccept our own cacheline
     cache->init({cache->root()}); // initialize with itself
 

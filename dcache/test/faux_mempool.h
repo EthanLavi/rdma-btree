@@ -124,7 +124,7 @@ public:
         mu.lock();
         if (async_jobs.find(ptr.id()) == async_jobs.end()){
             async_jobs[ptr.id()] = new std::vector<AsyncJob>();
-        }        
+        }
         uint64_t prev = *ptr;
         async_jobs[ptr.id()]->push_back(AsyncJob(result, prev));
         if (prev == expected){
