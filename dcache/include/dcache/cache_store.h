@@ -66,6 +66,13 @@ struct CacheLine {
     std::atomic<int>* ref_counter;
 };
 
+struct alignas(64) CacheConfig {
+    long version;
+    int number_of_lines;
+    bool use_mixer;
+    uint64_t divisor;
+};
+
 static_assert(offsetof(CacheLine, address) == 0);
 
 static CacheMetrics history[10];
@@ -76,6 +83,9 @@ class RemoteCacheImpl {
 private:
     rdma_ptr<CacheLine> origin_address;
     vector<rdma_ptr<CacheLine>> remote_caches;
+    // vector<rdma_ptr<CacheConfig>> configs; // every one else's config
+    // 1) Random thread detects the change
+    // 2) 
     vector<rdma_ptr<uint64_t>> prealloc_cas_result;
     CacheLine* lines;
     int number_of_lines;
@@ -103,29 +113,38 @@ private:
         return hashed + offset;
     }
 
+    inline bool is_power_of_two(int v){
+        return (v & (v - 1)) == 0;
+    }
+
     /// Try to identify a simple commanality in the empty slots to inform the divisor parameter
     int find_pattern(){
-        int indexes[4];
-        indexes[0] = -1;
-        indexes[1] = -1;
-        indexes[2] = -1;
-        indexes[3] = -1;
+        int indexes[number_of_lines];
         int index_at = 0;
         for(int i = 0; i < number_of_lines; i++){
             if (lines[i].address != 0){
                 indexes[index_at] = i;
+                REMUS_INFO("indexes[{}] = {}", index_at, i);
 
                 // increment index
                 index_at++;
-                if (index_at == 4) break;
             }
         }
 
+        if (index_at < 2) return 0; // cache is not filled enough to make a decision
         int difference = indexes[1] - indexes[0];
-        for(int i = 2; i < 4; i++){
-            if (difference != indexes[i] - indexes[i - 1]) return -1;
+        int smallest_diff = difference;
+        for(int i = 2; i < index_at; i++){
+            int next_diff = indexes[i] - indexes[i - 1];
+            if ((next_diff & 1) == 1) return -1; // odd difference
+            if (next_diff < smallest_diff) smallest_diff = next_diff;
         }
-        return difference;
+        if (!is_power_of_two(smallest_diff)) {
+            return -1; // use mixer b/c no pattern
+        } else {
+            // is a power of two, indicates an alignment issue
+            return smallest_diff;
+        }
     }
 
     void enable_mixer(){
@@ -139,7 +158,11 @@ private:
     /// Change the size of the change by the sizeof increase
     void change_size(double increase){
         int new_size = number_of_lines * increase;
-        REMUS_INFO("Expanding to {}", new_size);
+        REMUS_INFO("Changing size to {}", new_size);
+    }
+
+    double fmtd(double percent){
+        return round(percent * 10000.0) / 100.0;
     }
 
     void state_transition_forward(){
@@ -150,30 +173,33 @@ private:
         double percent_coherence_miss = (double) metrics.coherence_misses / total_requests;
         double percent_conflict_miss = (double) metrics.conflict_misses / total_requests;
         double percent_priority_miss = (double) metrics.priority_misses / total_requests;
+        double percent_cold_miss = (double) metrics.cold_misses / total_requests;
         double percent_hit = (double) metrics.hits / total_requests;
         double percent_empty = (double) empty_lines / number_of_lines;
 
-        if (percent_empty > 0.75 && percent_conflict_miss > 0.2){
+        if (percent_empty > 0.6 && percent_conflict_miss > 0.15){
             // Case 1 (low utilization but high conflict miss -> modify hash function)
             int pattern = find_pattern();
+            REMUS_INFO("Pattern = {}", pattern);
             if (pattern == -1 && !use_mixer) {
                 // Case 1a (random pattern -> enable the mixer function?)
                 enable_mixer();
-            } else if (pattern != -1 && pattern != 1){
-                // Case 1b (simple pattern -> modify 'divisor' parameter, is too low)
+            } else if (pattern != -1 && pattern != 1 && pattern != 0){
+                // Case 1b (simple pattern -> modify 'divisor' parameter, is too low).
                 change_divisor(divisor * pattern);
-            } else {
-                // pattern is 1 or -1 using the mixer, meaning we have no quick-fix. Expand size...
+            } else if (pattern != 0) {
+                // pattern is (1) || (-1 using the mixer), meaning we have no quick-fix. Expand size...
                 change_size(2);
-            }
-        } else if (percent_empty < 0.25 && percent_conflict_miss > 0.2){
+            } // else is 0, which is "not enough information"
+        } else if (percent_empty < 0.25 && percent_conflict_miss > 0.15){
             // Case 2 (high utilization and high conflict miss -> increase size)
             change_size(2);
         } else if (percent_empty < 0.25 && percent_priority_miss > 0.8){
             // Case 3 (high utilization and high priority miss -> increase size)
             change_size(2);
-        } else if (percent_empty > 0.75 && percent_hit > 0.8 && percent_conflict_miss < 0.1){
-            // Case 4 (low utilization and high hit/low conflict ratio -> decrease size)
+        } else if (percent_empty > 0.9 && percent_hit > 0.8 && percent_conflict_miss < 0.1){
+            // Case 4 (low utilization and high hit/low conflict ratio -> decrease size?)
+            // todo: decreasing size here doesn't drastically improve memory consumption or performance
             change_size(0.5);
         } else if (percent_coherence_miss > 0.2){
             // Case 5 (high coherence miss -> do nothing? warning? shrink cache to improve priority miss?)
@@ -182,7 +208,10 @@ private:
             // Case 6 (high utilization and high hit ratio -> do nothing) ! important case
             // If we are still running into issues, then something is wrong with our conditions
         }
-        print_metrics("Iteration: " + to_string(counter));
+        counter++;
+        REMUS_INFO("empty={}%, hit={}%, priority={}%, coherence={}%, conflict={}%, cold={}%", fmtd(percent_empty), fmtd(percent_hit), fmtd(percent_priority_miss), fmtd(percent_coherence_miss), fmtd(percent_conflict_miss), fmtd(percent_cold_miss));
+        print_metrics("Iteration: " + to_string(counter) + "\n");
+        reset_metrics(); // reset for next iteration
 
         check_freq *= 2; // todo: double the length until next check so that the cache doesn't experience parameter thrashing??
     }
@@ -282,7 +311,7 @@ public:
     /// - number_of_lines: The initial number of lines in the cache. This can change dynamically
     /// - check_freq: How often the master thread should check it's metrics to determine if a dynamic change is warranted
     RemoteCacheImpl(Pool* intializer, uint16_t self_id, int number_of_lines = 2000, int freq = 1000) : self_id(self_id), check_freq(freq) {
-        REMUS_ASSERT(sizeof(Object) == 1, "Precondition");
+        static_assert(sizeof(Object) == 1, "Precondition");
         this->number_of_lines = number_of_lines;
         origin_address = intializer->template Allocate<CacheLine>(number_of_lines);
         REMUS_INFO("CacheLine start: {}, CacheLine end: {}", origin_address, origin_address + number_of_lines);
@@ -299,6 +328,7 @@ public:
             lines[i].mu = new std::mutex();
             #endif
         }
+        op_count = 0;
         reset_metrics();
     }
 
@@ -402,13 +432,6 @@ public:
 
     template <typename T>
     CachedObject<T> ExtendedRead(rdma_ptr<T> ptr, int size, rdma_ptr<T> prealloc = nullptr, int priority = 0){
-        if (is_leader){
-            op_count++;
-            if (op_count >= check_freq){
-                op_count = 0;
-                state_transition_forward();
-            }
-        }
         REMUS_ASSERT_DEBUG(ptr != nullptr, "Cant read nullptr");
         // Periodically call try_free_some to cleanup limbo lists
         try_free_some();
@@ -419,6 +442,15 @@ public:
         rdma_ptr<T> result;
         ref_t* reference_counter;
         if (is_marked(ptr)){
+            // Handle state transitions if the leader
+            if (is_leader){
+                op_count++;
+                if (op_count >= check_freq){
+                    op_count = 0;
+                    state_transition_forward();
+                }
+            }
+
             // Get cache line and lock
             ptr = unmark_ptr(ptr);
             CacheLine* l = &lines[hash(ptr) % number_of_lines];

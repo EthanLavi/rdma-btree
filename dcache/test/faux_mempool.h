@@ -17,6 +17,7 @@ class CountingPool {
         AsyncJob(rdma_ptr<uint64_t> org, uint64_t new_val) : org(org), new_val(new_val){}
     };
     unordered_map<void*, int> allocat; // ptr to size
+    unordered_map<void*, void*> ptr_map; // aligned ptr to original ptr
     unordered_map<int, std::vector<AsyncJob>*> async_jobs;
     int total_allocations;
     int total_deallocations;
@@ -27,13 +28,16 @@ class CountingPool {
 public:
     CountingPool(bool all_local) : locality(all_local), total_allocations(0), total_deallocations(0) {}
 
+    /// Returns a value that accounts for alignment of the type (for parity with slab allocator)
     template <typename T>
     rdma_ptr<T> Allocate(int size = 1){
         alloc_mu.lock();
         total_allocations++;
         int bytes = sizeof(T) * size;
-        T* p = (T*) malloc(bytes);
+        void* org_ptr = malloc(bytes * 2);
+        T* p = (T*) (((long) org_ptr + alignof(T)) & (~(alignof(T) - 1)));
         allocat[(void*) p] = bytes;
+        ptr_map[(void*) p] = org_ptr;
         alloc_mu.unlock();
         return rdma_ptr<T>(0, p);
     }
@@ -48,7 +52,7 @@ public:
         REMUS_ASSERT(allocat.find(add) != allocat.end(), "Found double free with ptr {}", p);
         REMUS_ASSERT(allocat.at(add) == bytes, "Found free with ptr {} with wrong size (actual={} != freed={}) {}/{}", p, allocat.at(add), bytes, sizeof(T), size);
         allocat.erase(add);
-        free((T*) p.address());
+        free(ptr_map[add]);
         alloc_mu.unlock();
     }
 
