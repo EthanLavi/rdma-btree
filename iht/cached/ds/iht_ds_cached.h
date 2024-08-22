@@ -207,7 +207,7 @@ private:
     }
     // Deallocate the old elist
     // TODO replace for remote deallocation
-    pool->Deallocate<EList>(source);
+    // pool->Deallocate<EList>(source);
     return new_p;
   }
 
@@ -362,7 +362,7 @@ public:
 
       // We locked an elist, we can read the baseptr and progress
       remote_elist bucket_base = static_cast<remote_elist>(curr->buckets[bucket].base);
-      remote_elist e = is_local(bucket_base) ? bucket_base : pool->Read<EList>(bucket_base, temp_elist, 1000);
+      remote_elist e = is_local(bucket_base) ? bucket_base : pool->Read<EList>(bucket_base, temp_elist);
 
       // We have recursed to an non-empty elist
       for (size_t i = 0; i < e->count; i++) {
@@ -444,7 +444,7 @@ public:
       // We locked an elist, we can read the baseptr and progress
       remote_elist bucket_base = static_cast<remote_elist>(curr->buckets[bucket].base);
       // Past this point we have recursed to an elist
-      remote_elist e = is_local(bucket_base) ? bucket_base : pool->Read<EList>(bucket_base, temp_elist, 1000);
+      remote_elist e = is_local(bucket_base) ? bucket_base : pool->Read<EList>(bucket_base, temp_elist);
 
       // Get elist and linear search
       for (size_t i = 0; i < e->count; i++) {

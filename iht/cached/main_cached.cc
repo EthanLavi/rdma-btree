@@ -13,6 +13,7 @@
 #include "rdmask_bench.h"
 #include "sherman_bench.h"
 #include "multi_bench.h"
+#include "iht_bench2.h"
 
 #include <dcache/cache_store.h>
 
@@ -108,6 +109,8 @@ int main(int argc, char **argv) {
         iht_run(params, capability, cache, host, self);
     } else if (params.structure == "iht_tmp"){
         bulk_time(params, capability, cache, host, self);
+    } else if (params.structure == "iht_tuned"){
+        iht2_run(params, capability, cache, host, self);
     } else if (params.structure == "btree"){
         btree_run(params, capability, cache, host, self, peers);
     } else if (params.structure == "sherman"){
