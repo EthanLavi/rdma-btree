@@ -611,7 +611,7 @@ private:
   void split_node(capability* pool, CachedObject<BNode>& parent_p, CachedObject<BNode>& node_p){
     BNode parent = *parent_p;
     BNode node = *node_p;
-    
+
     // Full node so split
     bnode_ptr new_neighbor = ebr_node->allocate(pool);
     K to_parent;
@@ -752,9 +752,9 @@ private:
   CachedObject<BLeaf> traverse(capability* pool, K key, bool modifiable, function<void(BLeaf*, int)> effect, int it_counter = 0){
     REMUS_ASSERT(it_counter < 1000, "Too many retries! Infinite recursion detected?");
 
-    rdma_ptr<BNode> tmp;
-    const CacheEntry<BNode>* entry = index->search_from_cache(key, &tmp, is_leader);
-    if (entry != nullptr){
+    rdma_ptr<BNode> tmp = nullptr;
+    bool success = index->search_from_cache(key, &tmp, is_leader);
+    if (success){
       bleaf_ptr l = static_cast<bleaf_ptr>(tmp);
       CachedObject<BLeaf> leaf = reliable_read<BLeaf>(l, modifiable ? WILL_NEED_ACQUIRE : IGNORE_LOCK, prealloc_leaf_r1);
       // leaf has room and is in range
@@ -780,7 +780,7 @@ private:
         }
       } else {
         // failed traversal...
-        index->invalidate(entry);
+        index->invalidate(key);
       }
     }
 
@@ -858,6 +858,7 @@ private:
             BRoot new_root = *curr_root;
             new_root.height--;
             new_root.start = curr->ptr_at(0);
+            REMUS_ASSERT_DEBUG(new_root.start != nullptr, "Nullptr impossible");
             new_root.increment_version();
 
             cache->template Write<BRoot>(curr_root.remote_origin(), new_root, prealloc_root_w);
@@ -956,6 +957,9 @@ private:
     }
 
     // Get the next level ptr
+    if (!curr->key_in_range(key)){ // protect against caching garbage
+      return traverse(pool, key, modifiable, effect, it_counter + 1);
+    }
     next_level = read_level((BNode*) curr.get(), bucket);
     bleaf_ptr next_leaf = static_cast<bleaf_ptr>(next_level);
     CachedObject<BLeaf> leaf = reliable_read<BLeaf>(next_leaf, modifiable ? WILL_NEED_ACQUIRE : IGNORE_LOCK, prealloc_leaf_r1);
@@ -964,7 +968,7 @@ private:
       return traverse(pool, key, modifiable, effect, it_counter + 1);
     }
     // add to cache on traversal
-    index->add_to_cache((const BNode*) curr.get());
+    index->add_to_cache((BNode*) curr.get());
 
     // Handle updates to the leaf
     if (modifiable){
