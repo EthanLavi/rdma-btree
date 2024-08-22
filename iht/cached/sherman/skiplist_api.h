@@ -7,16 +7,19 @@ class SkipList {
 private:
     skiplist_raw sk_;
 
+public:
     struct my_node {
         // Metadata for skiplist node.
         skiplist_node snode;
         // My data here: {int, int} pair.
         int to;
         int from;
+        int access;
         // Specialized data
         T val;
     };
 
+private:
     static int skiplist_cmp_t(skiplist_node *a, skiplist_node *b, void *aux){
         // Get `my_node` from skiplist node `a` and `b`.
         my_node* aa = _get_entry(a, my_node, snode);
@@ -44,17 +47,19 @@ private:
         if (bb->to <= aa->from) return 1;
         return 0;
     }
+
 public:
     SkipList(){
         skiplist_init(&sk_, skiplist_cmp_t);
     }
 
-    bool insert(int from, int to, T val){
+    bool insert(int from, int to, T& val){
         if (from == to) return false; // can't insert non-ranges
         my_node* node = (my_node*) malloc(sizeof(my_node));
         node->to = to;
         node->from = from;
         node->val = val;
+        node->access = 0;
         skiplist_init_node(&node->snode);
         bool result = skiplist_insert_nodup(&sk_, &node->snode);
         return result == 0;
@@ -85,7 +90,9 @@ public:
         return true;
     }
 
-    bool get(int key, T* ret_val){
+    /// Returns -1 when it is not present
+    /// Otherwise returns accesses
+    int get(int key, T* ret_val, bool increment_freq = false){
         my_node query;
         query.to = key;
         query.from = key;
@@ -93,16 +100,30 @@ public:
         skiplist_node* cursor = skiplist_find(&sk_, &query.snode);
 
         // If `cursor` is NULL, key doesn't exist.
-        if (!cursor) return false;
+        if (!cursor) return -1;
 
         // Get `my_node` from `cursor`.
         // Note: found->snode == *cursor
         my_node* found = _get_entry(cursor, my_node, snode);
         *ret_val = found->val;
 
+        if (increment_freq){
+            found->access++;
+        }
+
         // Release `cursor` (== &found->snode).
         // Other thread cannot free `cursor` until `cursor` is released.
         skiplist_release_node(cursor);
-        return true;
+        return found->access;
+    }
+
+    int count(){
+        int total = 0;
+        skiplist_node* cursor = skiplist_begin(&sk_);
+        while(cursor != nullptr){
+            total++;
+            cursor = skiplist_next(&sk_, cursor);
+        }
+        return total;
     }
 };

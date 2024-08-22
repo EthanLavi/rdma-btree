@@ -1,28 +1,15 @@
 #pragma once
 
 #include <cstdint>
-#include <queue>
 #include <remus/rdma/rdma.h>
 // #include "random.h"
 #include "skiplist_api.h"
 // #include "slice.h"
 #include "timer.h"
 #include "WRLock.h"
+#include "lockfree_sk.h"
 
 using namespace remus::rdma;
-
-template <class T>
-struct WithFreq {
-  const T data;
-  mutable uint64_t index_cache_freq;
-};
-
-template <class T>
-struct CacheEntry {
-    int from;
-    int to;
-    mutable WithFreq<T>* data;
-};
 
 // Defintions from sherman
 namespace define {
@@ -68,14 +55,15 @@ inline void compiler_barrier() { asm volatile("" ::: "memory"); }
 template <class T, int DEGREE, typename Key>
 class IndexCache {
 private:
-  using CacheSkipList = SkipList<CacheEntry<T>*>;
+  // using CacheSkipList = SkipList<T>;
+  using CacheSkipList = LockFreeSkiplist;
   static const int SIZE = (DEGREE * 2) + 1;
   uint64_t cache_size; // MB;
-  std::atomic<int64_t> free_page_cnt;
-  std::atomic<int64_t> skiplist_node_cnt;
+  std::atomic<int64_t> skiplist_room_entries;
+  std::atomic<int64_t> skiplist_success_adds;
   int64_t all_page_cnt;
+  LocalEBR<T, 1000>* local_ebr;
 
-  std::queue<std::pair<WithFreq<T>*, uint64_t>> delay_free_list;
   WRLock free_lock;
 
   // SkipList
@@ -93,12 +81,14 @@ private:
     }
   }
 public:
-  IndexCache(int cache_size) : cache_size(cache_size) {
+  IndexCache(int cache_size, int thread_count) : cache_size(cache_size) {
     uint64_t memory_size = define::MB * cache_size;
-    skiplist = new CacheSkipList();
+    skiplist = new CacheSkipList(thread_count);
     all_page_cnt = memory_size / sizeof(T);
-    free_page_cnt.store(all_page_cnt);
-    skiplist_node_cnt.store(0);
+    REMUS_INFO("!CHECKME! {} {} {}", memory_size, sizeof(T), all_page_cnt);
+    skiplist_room_entries.store(all_page_cnt);
+    skiplist_success_adds.store(0);
+    local_ebr = new LocalEBR<T, 1000>(thread_count);
   }
 
   ~IndexCache(){
@@ -106,141 +96,99 @@ public:
   }
 
   bool add_to_cache(const T* page){
-    CacheEntry<T>* new_page = (CacheEntry<T>*) malloc(sizeof(CacheEntry<T>));
-    WithFreq<T>* payload = (WithFreq<T>*) malloc(sizeof(WithFreq<T>));
-    memcpy(payload, page, sizeof(T));
-    payload->index_cache_freq = 0;
-    new_page->data = payload;
-    if (this->add_entry(page->key_low(), page->key_high(), new_page)) {
-      skiplist_node_cnt.fetch_add(1);
-      auto v = free_page_cnt.fetch_add(-1);
+    T* data = (T*) malloc(sizeof(T));
+    *data = *page;
+    if (add_entry(page->key_low(), page->key_high(), data)) {
+      skiplist_success_adds.fetch_add(1);
+      auto v = skiplist_room_entries.fetch_sub(1);
       if (v <= 0) {
         evict_one();
       }
-
+      local_ebr->match_version();
       return true;
-    } else { // conflicted but matches the keyrange. can cas to new page
-      auto e = this->find_entry(page->key_low(), page->key_high());
-      if (e && e->from == page->key_low() && e->to == page->key_high()) {
-        WithFreq<T>* ptr = e->data;
-        if (ptr == nullptr && __sync_bool_compare_and_swap(&(e->data), 0ull, new_page)) {
-          auto v = free_page_cnt.fetch_add(-1);
-          if (v <= 0) {
-            evict_one();
-          }
-          return true;
-        }
-      }
-
-      free(new_page);
-      return false;
     }
+    local_ebr->match_version();
     return false;
   }
 
-  const CacheEntry<T> *search_from_cache(const Key &k, rdma_ptr<T>* addr,
-                                      bool is_leader = false){
-    // notice: please ensure the thread 0 can make progress
-    if (is_leader && !delay_free_list.empty()) { // try to free a page in the delay-free-list
-      std::pair<WithFreq<T>*, uint64_t> p = delay_free_list.front();
-      if (asm_rdtsc() - p.second > 3000ull * 10) {
-        free(p.first);
-        free_page_cnt.fetch_add(1);
-
-        free_lock.wLock();
-        delay_free_list.pop();
-        free_lock.wUnlock();
-      }
+  bool search_from_cache(const Key &k, rdma_ptr<T>* addr, bool is_leader = false){
+    int accesses = -1;
+    T* page = find_entry(k, &accesses);
+    if (accesses == -1 || page == nullptr) {
+      local_ebr->match_version();
+      return false;
     }
-
-    const CacheEntry<T>* entry = find_entry(k);
-    WithFreq<T>* page = entry ? entry->data : nullptr;
-    if (page != nullptr && entry->from <= k && entry->to >= k) {
-      page->index_cache_freq++;
-      bool find = false;
-      for (int i = 0; i < SIZE; ++i) {
-        if (k <= page->data.key_at(i)) {
-          find = true;
-          *addr = page->data.ptr_at(i);
-          break;
-        }
-      }
-      if (!find) {
-        *addr = page->data.ptr_at(SIZE);
-      }
-
-      compiler_barrier();
-      if (entry->data != nullptr) { // check if it is freed after reading
-        return entry;
-      }
-    }
-
-    return nullptr;
-  }
-
-  bool add_entry(const Key &from, const Key &to, CacheEntry<T>* ptr){
-    ptr->from = from;
-    ptr->to = to;
-    return skiplist->insert(from, to, ptr);
-  }
-
-  const CacheEntry<T>* find_entry(const Key &k){
-    CacheEntry<T>* tmp;
-    bool result = skiplist->get(k, &tmp);
-    return result ? tmp : nullptr;
-  }
-
-  const CacheEntry<T>* find_entry(const Key &low, const Key &high){
-    CacheEntry<T>* tmp;
-    bool result = skiplist->get(low, &tmp);
-    return result ? tmp : nullptr;
-  }
-
-  bool invalidate(const CacheEntry<T> *entry) {
-    WithFreq<T>* ptr = entry->data;
-
-    if (ptr == nullptr) {
+    if (!page->key_in_range(k)) {
+      local_ebr->match_version();
       return false;
     }
 
-    // delete
-    if (__sync_bool_compare_and_swap(&(entry->data), ptr, 0)) {
-      free_lock.wLock();
-      delay_free_list.push(std::make_pair(ptr, asm_rdtsc()));
-      free_lock.wUnlock();
-      CacheEntry<T>* tmp;
-      skiplist->remove(entry->from, entry->to, &tmp);
-      // todo: memory leak of cache entry
-      return true;
+    bool find = false;
+    for (int i = 0; i < SIZE; ++i) {
+      if (k <= page->key_at(i)) {
+        find = true;
+        *addr = page->ptr_at(i);
+        break;
+      }
     }
-
-    return false;
+    if (!find) {
+      *addr = page->ptr_at(SIZE);
+    }
+    local_ebr->match_version();
+    return true;
   }
 
-  const CacheEntry<T> *get_a_random_entry(uint64_t &freq){
+  bool add_entry(const Key &from, const Key &to, T* data){
+    return skiplist->insert(from, to, data);
+  }
+
+  T* get_a_random_entry(uint64_t &freq){
     uint32_t seed = asm_rdtsc();
-    rdma_ptr<T> tmp_addr;
   retry:
     auto k = rand_r(&seed) % (1000ull * define::MB);
-    const CacheEntry<T>* e = this->search_from_cache(k, &tmp_addr);
-    if (!e) {
-      goto retry;
-    }
-    WithFreq<T>* ptr = e->data;
-    if (ptr == nullptr) {
-      goto retry;
-    }
+    int accesses = -1;
+    T* page = find_entry(k, &accesses);
+    if (accesses == -1 || page == nullptr) goto retry;
+  
+    freq = accesses;
+    return page;
+  }
 
-    freq = ptr->index_cache_freq;
-    if (e->data != ptr) {
-      goto retry;
+  /// Return data or nullptr
+  T* find_entry(const Key &k, int* accesses){
+    void* data = skiplist->get(k, accesses);
+    return (T*) data;
+  }
+
+  // T* find_entry(const Key &low, const Key &high, int* accesses){
+  //   void* data = skiplist->get(low, accesses);
+  //   return (T*) data;
+  // }
+
+  bool invalidate(const Key& key) {
+    void* result = skiplist->remove(key, key);
+    if (result != nullptr) {
+      skiplist_room_entries.fetch_add(1);
+      local_ebr->deallocate((T*) result);
     }
-    return e;
+    return result;
+  }
+
+  bool invalidate(T* data) {
+    void* result = skiplist->remove(data->key_low(), data->key_high());
+    if (result != nullptr) {
+      skiplist_room_entries.fetch_add(1);
+      local_ebr->deallocate((T*) result);
+    }
+    return result;
   }
 
   void statistics(){
-    printf("[skiplist node: %ld]  [page cache: %ld]\n", skiplist_node_cnt.load(),
-         all_page_cnt - free_page_cnt.load());
+    long number_of_nodes = skiplist->count();
+    int per_node = sizeof(skiplist_node) + sizeof(T) + sizeof(int) * 3;
+    REMUS_INFO("!CHECKME! sizeof(for each entry) {}", per_node);
+    printf("[skiplist adds: %ld]  [skiplist load: %ld] [count: %ld] [size: %ld KB]\n", skiplist_success_adds.load(), 
+      all_page_cnt - skiplist_room_entries.load(), number_of_nodes, number_of_nodes * per_node / 1000);
   }
 
   void bench(){
@@ -249,7 +197,7 @@ public:
     const int loop = 100000;
     for (int i = 0; i < loop; ++i) {
       uint64_t r = rand() % (5 * define::MB);
-      this->find_entry(r);
+      find_entry(r, nullptr);
     }
     t.end_print(loop);
   }
