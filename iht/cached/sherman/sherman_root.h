@@ -19,6 +19,7 @@ private:
 public:
     ShermanRoot(int size) : size(size) {
         ptrs = new RootEntry[size];
+        REMUS_INFO("!CHECKME! also + {} KB", ((double) sizeof(RootEntry) * size) / 1000.0);
         for(int i = 0; i < size; i++){
             ptrs[i].present = false;
         }
