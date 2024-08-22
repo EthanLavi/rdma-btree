@@ -243,19 +243,20 @@ public:
     /// @param key_ub the upper bound for the key range
     /// @param value the value to associate with each key. Currently, we have
     /// asserts for result to be equal to the key. Best to set value equal to key!
-    void populate(int op_count, int key_lb, int key_ub, std::function<int(int)> value) {
+    int populate(int op_count, int key_lb, int key_ub, std::function<int(int)> value) {
         // Populate only works when we have numerical keys
         int key_range = key_ub - key_lb;
-        // todo: Under-populating because of insert collisions?
         // Create a random operation generator that is
         // - evenly distributed among the key range
+        int success_count = 0;
         std::uniform_real_distribution<double> dist = std::uniform_real_distribution<double>(0.0, 1.0);
-        std::default_random_engine gen(std::chrono::system_clock::now().time_since_epoch().count());
-        for (int c = 0; c < op_count; c++) {
+        std::default_random_engine gen(std::chrono::system_clock::now().time_since_epoch().count() * self_.id);
+        while (success_count != op_count) {
             int k = (dist(gen) * key_range) + key_lb;
-            insert(k, value(k));
+            if (insert(k, value(k)) == std::nullopt) success_count++;
             // Wait some time before doing next insert...
             std::this_thread::sleep_for(std::chrono::nanoseconds(10));
         }
+        return success_count;
     }
 };
