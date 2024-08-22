@@ -80,7 +80,7 @@ public:
         my_proto.set_raddr((uint64_t) my_version);
         RemoteObjectProto next_proto;
 
-        int send_id = (node_id - 1) % peers.size();
+        int send_id = (node_id + peers.size() - 1) % peers.size();
         int recv_id = (node_id + 1) % peers.size();
         Peer sender = peers.at(send_id);
         Peer recvr = peers.at(recv_id);
