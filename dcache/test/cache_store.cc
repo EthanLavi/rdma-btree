@@ -105,7 +105,7 @@ int main(){
     // Construct the remote cache
     RemoteCacheImpl<CountingPool>* cache = new RemoteCacheImpl<CountingPool>(pool, 0, 500);
     RemoteCacheImpl<CountingPool>::pool = pool; // set pool to other pool so we acccept our own cacheline
-    cache->init({cache->root()}); // initialize with itself
+    cache->init({cache->root()}, 0); // initialize with itself
 
     main_body(pool, cache);
 
@@ -115,7 +115,7 @@ int main(){
 
     // Construct the remote cache
     cache = new RemoteCacheImpl<CountingPool>(pool, 0, 4); // smaller cache so more conflicts
-    cache->init({cache->root()}); // initialize with itself
+    cache->init({cache->root()}, 0); // initialize with itself
 
     main_body(pool, cache);
 
