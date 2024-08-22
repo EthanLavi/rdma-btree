@@ -171,7 +171,7 @@ def main():
                 cmake_flags = "-DCMAKE_BUILD_TYPE=Debug -DLOG_LEVEL=DEBUG"
             else:
                 cmake_flags = "-DCMAKE_BUILD_TYPE=Debug -DLOG_LEVEL=TRACE"
-            payload = f"cd {bin_dir} && cmake {cmake_flags} . && {del_cmd}make && LD_LIBRARY_PATH=.:./protos ./iht/"
+            payload = f"cd {bin_dir} && cmake {cmake_flags} . && {del_cmd}make iht_rome_cached && LD_LIBRARY_PATH=.:./protos ./iht/"
             if ARGS.runtype == "test":
                 payload += "iht_rome_test --send_test"
             elif ARGS.runtype == "concurrent_test":
