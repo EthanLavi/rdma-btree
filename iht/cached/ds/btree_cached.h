@@ -303,7 +303,7 @@ private:
   template <typename T> inline bool is_local(rdma_ptr<T> ptr) {
     return ptr.id() == self_.id;
   }
-  
+
   // preallocated memory for RDMA operations (avoiding frequent allocations)
   rdma_ptr<uint64_t> temp_lock;
   rdma_ptr<BRoot> prealloc_root_r;
@@ -325,6 +325,7 @@ private:
   template <class ptr_t>
   void release(capability* pool, rdma_ptr<ptr_t> node, long version){
     pool->template Write<uint64_t>(static_cast<rdma_ptr<uint64_t>>(unmark_ptr(node)), version, temp_lock, internal::RDMAWriteBehavior::RDMAWriteWithNoAck);
+    cache->template Invalidate<ptr_t>(node);
   }
 
   enum ReadBehavior {
@@ -334,21 +335,21 @@ private:
   };
 
   template <class ptr_t>
-  inline CachedObject<ptr_t> reliable_read(rdma_ptr<ptr_t> node, ReadBehavior behavior, rdma_ptr<ptr_t> prealloc = nullptr){
-    CachedObject<ptr_t> obj = cache->template Read<ptr_t>(node, prealloc);
+  inline CachedObject<ptr_t> reliable_read(rdma_ptr<ptr_t> node, ReadBehavior behavior, int priority, rdma_ptr<ptr_t> prealloc = nullptr){
+    CachedObject<ptr_t> obj = cache->template Read<ptr_t>(node, prealloc, priority);
     if (behavior == IGNORE_LOCK){
       while(!obj->is_valid(true)){
-        obj = cache->template Read<ptr_t>(node, prealloc);
+        obj = cache->template Read<ptr_t>(node, prealloc, priority);
       }
     } else if (behavior == LOOK_FOR_SPLIT_MERGE) {
       bool should_ignore_lock = (obj->key_at(SIZE - 1) != SENTINEL) || (obj->key_at(0) == SENTINEL);
       while(!obj->is_valid(should_ignore_lock)){
-        obj = cache->template Read<ptr_t>(node, prealloc);
+        obj = cache->template Read<ptr_t>(node, prealloc, priority);
         should_ignore_lock = (obj->key_at(SIZE - 1) != SENTINEL) || (obj->key_at(0) == SENTINEL);
       }
     } else { // WILL_NEED_ACQUIRE
       while(!obj->is_valid(false)){
-        obj = cache->template Read<ptr_t>(node, prealloc);
+        obj = cache->template Read<ptr_t>(node, prealloc, priority);
       }
     }
     return obj;
@@ -688,14 +689,14 @@ private:
     REMUS_ASSERT(it_counter < 1000, "Too many retries! Infinite recursion detected?");
   
     // read root first
-    CachedObject<BRoot> curr_root = cache->template Read<BRoot>(root, prealloc_root_r);
+    CachedObject<BRoot> curr_root = cache->template Read<BRoot>(root, prealloc_root_r, -1);
     int height = curr_root->height;
     int level = 1;
     bnode_ptr next_level = curr_root->start;
     REMUS_ASSERT_DEBUG(next_level != nullptr, "Accessing SENTINEL's ptr");
 
     if (height == 0){
-      CachedObject<BLeaf> next_leaf = reliable_read<BLeaf>(static_cast<bleaf_ptr>(next_level), modifiable ? WILL_NEED_ACQUIRE : IGNORE_LOCK, prealloc_leaf_r1);
+      CachedObject<BLeaf> next_leaf = reliable_read<BLeaf>(static_cast<bleaf_ptr>(next_level), modifiable ? WILL_NEED_ACQUIRE : IGNORE_LOCK, 1000, prealloc_leaf_r1);
       if (modifiable){
         // failed to get locks, retraverse
         if (!try_acquire<BRoot>(pool, curr_root.remote_origin(), curr_root->version())) return traverse(pool, key, modifiable, effect);
@@ -722,7 +723,7 @@ private:
     } // if statement returns
 
     // Traverse bnode until bleaf
-    CachedObject<BNode> curr = reliable_read<BNode>(next_level, modifiable ? LOOK_FOR_SPLIT_MERGE : IGNORE_LOCK);
+    CachedObject<BNode> curr = reliable_read<BNode>(next_level, modifiable ? LOOK_FOR_SPLIT_MERGE : IGNORE_LOCK, level);
     CachedObject<BNode> parent;
     // if split, we updated the root and we need to retraverse
     if (modifiable && curr->key_at(SIZE - 1) != SENTINEL){
@@ -760,7 +761,7 @@ private:
 
       // Read it as a BNode
       parent = std::move(curr);
-      curr = reliable_read<BNode>(next_level, modifiable ? LOOK_FOR_SPLIT_MERGE : IGNORE_LOCK);
+      curr = reliable_read<BNode>(next_level, modifiable ? LOOK_FOR_SPLIT_MERGE : IGNORE_LOCK, level);
       if (modifiable && curr->key_at(SIZE - 1) != SENTINEL) {
         if (try_acquire<BNode>(pool, parent.remote_origin(), parent->version())) {
           if (try_acquire<BNode>(pool, curr.remote_origin(), curr->version())) {
@@ -772,7 +773,7 @@ private:
           }
         }
         // re-read the parent and continue
-        curr = reliable_read<BNode>(parent.remote_origin(), modifiable ? LOOK_FOR_SPLIT_MERGE : IGNORE_LOCK);
+        curr = reliable_read<BNode>(parent.remote_origin(), modifiable ? LOOK_FOR_SPLIT_MERGE : IGNORE_LOCK, level);
         bucket = search_node<BNode>(curr, key);
         continue;
       } else if (modifiable && curr->key_at(0) == SENTINEL && parent->key_at(0) != SENTINEL){
@@ -786,7 +787,7 @@ private:
           merge_node_ptr = read_level((BNode*) parent.get(), bucket - 1);
           bucket_neighbor = bucket - 1;
         }
-        CachedObject<BNode> merging_node = reliable_read<BNode>(merge_node_ptr, WILL_NEED_ACQUIRE);
+        CachedObject<BNode> merging_node = reliable_read<BNode>(merge_node_ptr, WILL_NEED_ACQUIRE, level);
         if (merging_node->key_at(SIZE - 1) == SENTINEL){ // there is room in neighbor for the ptr
           if (try_acquire<BNode>(pool, parent.remote_origin(), parent->version())) {
             if (try_acquire<BNode>(pool, curr.remote_origin(), curr->version())) {
@@ -807,7 +808,7 @@ private:
                 cache->template Write<BNode>(merging_node.remote_origin(), merged_node, prealloc_node_w);
                 cache->template Write<BNode>(parent.remote_origin(), parent_of_merge, prealloc_node_w);
                 // re-read the parent and continue
-                curr = reliable_read<BNode>(parent.remote_origin(), LOOK_FOR_SPLIT_MERGE);
+                curr = reliable_read<BNode>(parent.remote_origin(), LOOK_FOR_SPLIT_MERGE, level);
                 bucket = search_node<BNode>(curr, key);
                 continue;
               } else {
@@ -831,7 +832,7 @@ private:
     // Get the next level ptr
     next_level = read_level((BNode*) curr.get(), bucket);
     bleaf_ptr next_leaf = static_cast<bleaf_ptr>(next_level);
-    CachedObject<BLeaf> leaf = reliable_read<BLeaf>(next_leaf, modifiable ? WILL_NEED_ACQUIRE : IGNORE_LOCK, prealloc_leaf_r1);
+    CachedObject<BLeaf> leaf = reliable_read<BLeaf>(next_leaf, modifiable ? WILL_NEED_ACQUIRE : IGNORE_LOCK, 1000, prealloc_leaf_r1);
     if (!leaf->key_in_range(key)){
       // key is out of the range, we traversed wrong
       return traverse(pool, key, modifiable, effect, it_counter + 1);
@@ -859,7 +860,7 @@ private:
                 // write and unlock the prev
                 cache->template Write<BLeaf>(leaf.remote_origin(), leaf_updated, prealloc_leaf_w);
                 // key goes into next
-                CachedObject<BLeaf> next_leaf_local_const = reliable_read<BLeaf>(next_leaf, IGNORE_LOCK, prealloc_leaf_r2);
+                CachedObject<BLeaf> next_leaf_local_const = reliable_read<BLeaf>(next_leaf, IGNORE_LOCK, 1000, prealloc_leaf_r2);
                 BLeaf next_leaf_local = *next_leaf_local_const;
                 effect(&next_leaf_local, search_node<BLeaf>(next_leaf_local_const, key)); // modify the next
                 next_leaf_local.increment_version();
@@ -887,7 +888,7 @@ private:
               CachedObject<BLeaf> merging_leaf;
               bool do_merge = true;
               while(true){ // aggressively acquire the node since we only compete with simple insert/remove
-                merging_leaf = reliable_read<BLeaf>(merge_leaf_ptr, WILL_NEED_ACQUIRE, prealloc_leaf_r2);
+                merging_leaf = reliable_read<BLeaf>(merge_leaf_ptr, WILL_NEED_ACQUIRE, 1000, prealloc_leaf_r2);
                 if (merging_leaf->key_at(SIZE - 1) != SENTINEL) {
                   do_merge = false; // give up because merging will cause inserts to fail!
                   break;
@@ -1239,7 +1240,7 @@ public:
 
   /// No concurrent or thread safe (if everyone is readonly, then its fine). Counts the number of elements in the IHT
   int count(capability* pool){
-    int height = cache->template Read<BRoot>(root)->height;
+    int height = cache->template Read<BRoot>(root, nullptr, -1)->height;
     REMUS_INFO("Final height = {}", height);
 
     // Get leftmost leaf by wrapping SENTINEL
@@ -1251,7 +1252,7 @@ public:
         if (curr->key_at(i) != SENTINEL) count++;
       }
       if (curr->get_next() == nullptr) break;
-      curr = cache->template Read<BLeaf>(curr->get_next());
+      curr = cache->template Read<BLeaf>(curr->get_next(), nullptr, 1000);
     }
     return count;
   }

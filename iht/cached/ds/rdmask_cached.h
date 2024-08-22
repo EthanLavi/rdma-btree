@@ -72,6 +72,7 @@ private:
     // shared EBRObjectPool has thread_local internals so its all thread safe
     EBRObjectPool<Node, 100, capability>* ebr;
 
+    // todo: replace for offset of
     inline rdma_ptr<uint64_t> get_value_ptr(nodeptr node) {
         Node* tmp = (Node*) 0x0;
         return rdma_ptr<uint64_t>(unmark_ptr(node).id(), unmark_ptr(node).address() + (uint64_t) &tmp->value);
@@ -89,7 +90,7 @@ private:
 
     CachedObject<Node> fill(K key, rdma_ptr<Node> preds[MAX_HEIGHT], rdma_ptr<Node> succs[MAX_HEIGHT], bool found[MAX_HEIGHT], K prev_keys[MAX_HEIGHT]){
         // first node is a sentinel, it will always be linked in the data structure
-        CachedObject<Node> curr = cache->template Read<Node>(root, prealloc_fill_node1); // root is never deleted, let's say curr is never a deleted node
+        CachedObject<Node> curr = cache->template Read<Node>(root, prealloc_fill_node1, -1); // root is never deleted, let's say curr is never a deleted node
         CachedObject<Node> next_curr;
         bool use_node1 = false;
         for(int height = MAX_HEIGHT - 1; height != -1; height--){
@@ -103,7 +104,7 @@ private:
                     // if next is the END, descend a level
                     break;
                 }
-                next_curr = cache->template Read<Node>(sans(curr->next[height]), use_node1 ? prealloc_fill_node1 : prealloc_fill_node2);
+                next_curr = cache->template Read<Node>(sans(curr->next[height]), use_node1 ? prealloc_fill_node1 : prealloc_fill_node2, MAX_HEIGHT - curr->height);
                 if (next_curr->key < key) {
                     curr = std::move(next_curr);
                     use_node1 = !use_node1; // swap the prealloc
@@ -220,16 +221,16 @@ public:
         CachedObject<Node> curr;
         int i = 0;
         while(do_cont->load()){ // endlessly traverse and maintain the index
-            curr = cache->template Read<Node>(root, prealloc_helper_node);
+            curr = cache->template Read<Node>(root, prealloc_helper_node, -1);
             while(sans(curr->next[0]) != nullptr && do_cont->load()){
-                curr = cache->template Read<Node>(sans(curr->next[0]), prealloc_helper_node);
+                curr = cache->template Read<Node>(sans(curr->next[0]), prealloc_helper_node, MAX_HEIGHT - curr->height);
                 if (curr->value == DELETE_SENTINEL && curr->link_level == curr->height){
                     rdma_ptr<uint64_t> ptr = get_value_ptr(curr.remote_origin());
                     uint64_t last = pool->template CompareAndSwap<uint64_t>(ptr, DELETE_SENTINEL, UNLINK_SENTINEL);
                     if (last != DELETE_SENTINEL) continue; // something changed, gonna skip this node
                     cache->Invalidate(curr.remote_origin());
                     unlink_node(pool, curr->key); // physically unlink (has guarantee of unlink)
-                    curr = cache->template Read<Node>(curr.remote_origin()); // refresh curr now that it has changed!
+                    curr = cache->template Read<Node>(curr.remote_origin(), nullptr, MAX_HEIGHT - curr->height); // refresh curr now that it has changed!
 
                     // deallocate unlinked node
                     LimboLists<Node>* q = qs.at(i);
@@ -248,7 +249,8 @@ public:
                         if (old_height == 0){
                             cache->Invalidate(curr.remote_origin());
                             raise_node(pool, curr->key, curr->height);
-                            curr = cache->template Read<Node>(curr.remote_origin()); // refresh curr, now that it has changed
+                            // refresh curr, now that it has changed
+                            curr = cache->template Read<Node>(curr.remote_origin(), nullptr, MAX_HEIGHT - curr->height); 
                         }
                     } else {
                         int old_height = pool->template CompareAndSwap<uint64_t>(get_link_height_ptr(curr.remote_origin()), 0, 1);
@@ -321,7 +323,7 @@ public:
     /// Will unlink nodes only at the data level leaving them indexable
     private: CachedObject<Node> find(capability* pool, K key, bool is_insert){
         // first node is a sentinel, it will always be linked in the data structure
-        CachedObject<Node> curr = cache->template Read<Node>(root, prealloc_find_node1); // root is never deleted, let's say curr is never a deleted node
+        CachedObject<Node> curr = cache->template Read<Node>(root, prealloc_find_node1, -1); // root is never deleted, let's say curr is never a deleted node
         bool use_node1 = false;
         CachedObject<Node> next_curr;
         for(int height = MAX_HEIGHT - 1; height != -1; height--){
@@ -334,7 +336,7 @@ public:
 
                 if (curr->key == key) return curr; // stop early if we find the right key
                 if (sans(curr->next[height]) == nullptr) break; // if next is the END, descend a level
-                next_curr = cache->template Read<Node>(sans(curr->next[height]), use_node1 ? prealloc_find_node1 : prealloc_find_node2);
+                next_curr = cache->template Read<Node>(sans(curr->next[height]), use_node1 ? prealloc_find_node1 : prealloc_find_node2, MAX_HEIGHT - curr->height);
                 if (is_insert && height == 0 && is_marked_del(curr->next[height]) && next_curr->key >= key){
                     REMUS_ASSERT_DEBUG(curr->value == UNLINK_SENTINEL, "Should be unlink sentinel if we are removing curr");
                     // we found a node that we are inserting directly after. Lets help unlink
@@ -527,9 +529,13 @@ public:
         int total_counter[MAX_HEIGHT];
         memset(counter, 0, sizeof(int) * MAX_HEIGHT);
         memset(total_counter, 0, sizeof(int) * MAX_HEIGHT);
-        Node curr = *cache->template Read<Node>(unmark_ptr(root), prealloc_count_node);
+        Node curr = *cache->template Read<Node>(unmark_ptr(root), prealloc_count_node, -1);
+        int cached_nodes = 0;
         while(curr.next[0] != nullptr){
-            curr = *cache->template Read<Node>(unmark_ptr(curr.next[0]), prealloc_count_node);
+            if (is_marked(curr.next[0])){
+                cached_nodes++;
+            }
+            curr = *cache->template Read<Node>(unmark_ptr(curr.next[0]), prealloc_count_node, MAX_HEIGHT - curr.height);
             counter[curr.height - 1]++;
             for(int i = 0; i <= curr.height - 1; i++){
                 total_counter[i]++;
@@ -540,6 +546,7 @@ public:
         for(int i = 0; i < MAX_HEIGHT; i++){
             REMUS_INFO("nodes with height {} = {}, cumulative={}", i, counter[i], total_counter[i]);
         }
+        REMUS_INFO("{} nodes are marked", cached_nodes);
         return count;
     }
 };

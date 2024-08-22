@@ -280,13 +280,13 @@ public:
     remote_plist parent_ptr = root;
 
     // start at root
-    CachedObject<PList> curr = cache->Read<PList>(root);
+    CachedObject<PList> curr = cache->Read<PList>(root, nullptr, 0);
     while (true) {
       uint64_t bucket = level_hash(key, depth, count);
       // Normal descent
       if (curr->buckets[bucket].lock == P_UNLOCKED){
         auto bucket_base = static_cast<remote_plist>(curr->buckets[bucket].base);
-        curr = cache->ExtendedRead<PList>(bucket_base, 1 << depth);
+        curr = cache->ExtendedRead<PList>(bucket_base, 1 << depth, nullptr, depth);
         parent_ptr = bucket_base;
         depth++;
         count *= 2;
@@ -298,7 +298,7 @@ public:
         // Erroneous descent into EList (Think we are at an EList, but it turns out its a PList)
         if (!acquire(pool, get_lock(parent_ptr, bucket))){
           // We must re-fetch the PList to ensure freshness of our pointers (1 << depth-1 to adjust size of read with customized ExtendedRead)
-          curr = cache->ExtendedRead<PList>(parent_ptr, 1 << (depth - 1));
+          curr = cache->ExtendedRead<PList>(parent_ptr, 1 << (depth - 1), nullptr, depth - 1);
           continue;
         }
       }
@@ -306,7 +306,7 @@ public:
       // We locked an elist, we can read the baseptr and progress
       remote_elist bucket_base = static_cast<remote_elist>(curr->buckets[bucket].base);
       // Past this point we have recursed to an elist
-      CachedObject<EList> e = cache->Read<EList>(unmark_ptr(bucket_base), temp_elist); // shouldn't fetch via the cache, but register the number of reads!
+      CachedObject<EList> e = cache->Read<EList>(unmark_ptr(bucket_base), temp_elist, 1000); // shouldn't fetch via the cache, but register the number of reads!
 
       // Get elist and linear search
       for (size_t i = 0; i < e->count; i++) {
@@ -339,14 +339,14 @@ public:
     remote_plist parent_ptr = root;
 
     // start at root
-    CachedObject<PList> curr = cache->Read<PList>(root);
+    CachedObject<PList> curr = cache->Read<PList>(root, nullptr, 0);
 
     while (true) {
       uint64_t bucket = level_hash(key, depth, count);
       // Normal descent
       if (curr->buckets[bucket].lock == P_UNLOCKED){
         auto bucket_base = static_cast<remote_plist>(curr->buckets[bucket].base);
-        curr = cache->ExtendedRead<PList>(bucket_base, 1 << depth);
+        curr = cache->ExtendedRead<PList>(bucket_base, 1 << depth, nullptr, depth);
         parent_ptr = bucket_base;
         depth++;
         count *= 2;
@@ -356,13 +356,13 @@ public:
       // Erroneous descent into EList (Think we are at an EList, but it turns out its a PList)
       if (!acquire(pool, get_lock(parent_ptr, bucket))){
         // We must re-fetch the PList to ensure freshness of our pointers (1 << depth-1 to adjust size of read with customized ExtendedRead)
-        curr = cache->ExtendedRead<PList>(parent_ptr, 1 << (depth - 1));
+        curr = cache->ExtendedRead<PList>(parent_ptr, 1 << (depth - 1), nullptr, depth - 1);
         continue;
       }
 
       // We locked an elist, we can read the baseptr and progress
       remote_elist bucket_base = static_cast<remote_elist>(curr->buckets[bucket].base);
-      remote_elist e = is_local(bucket_base) ? bucket_base : pool->Read<EList>(bucket_base, temp_elist);
+      remote_elist e = is_local(bucket_base) ? bucket_base : pool->Read<EList>(bucket_base, temp_elist, 1000);
 
       // We have recursed to an non-empty elist
       for (size_t i = 0; i < e->count; i++) {
@@ -404,7 +404,7 @@ public:
       cache->Invalidate(parent_ptr);
 
       // we need to refresh our copy as well :)
-      curr = cache->ExtendedRead<PList>(parent_ptr, 1 << (depth - 1)); // todo: check this
+      curr = cache->ExtendedRead<PList>(parent_ptr, 1 << (depth - 1), nullptr, depth - 1); // todo: check this
     }
   }
 
@@ -420,14 +420,14 @@ public:
     remote_plist parent_ptr = root;
 
     // start at root
-    CachedObject<PList> curr = cache->Read<PList>(root);
+    CachedObject<PList> curr = cache->Read<PList>(root, nullptr, 0);
 
     while (true) {
       uint64_t bucket = level_hash(key, depth, count);
       // Normal descent
       if (curr->buckets[bucket].lock == P_UNLOCKED){
         auto bucket_base = static_cast<remote_plist>(curr->buckets[bucket].base);
-        curr = cache->ExtendedRead<PList>(bucket_base, 1 << depth);
+        curr = cache->ExtendedRead<PList>(bucket_base, 1 << depth, nullptr, depth);
         parent_ptr = bucket_base;
         depth++;
         count *= 2;
@@ -437,14 +437,14 @@ public:
       // Erroneous descent into EList (Think we are at an EList, but it turns out its a PList)
       if (!acquire(pool, get_lock(parent_ptr, bucket))){
         // We must re-fetch the PList to ensure freshness of our pointers (1 << depth-1 to adjust size of read with customized ExtendedRead)
-        curr = cache->ExtendedRead<PList>(parent_ptr, 1 << (depth - 1));
+        curr = cache->ExtendedRead<PList>(parent_ptr, 1 << (depth - 1), nullptr, depth - 1);
         continue;
       }
 
       // We locked an elist, we can read the baseptr and progress
       remote_elist bucket_base = static_cast<remote_elist>(curr->buckets[bucket].base);
       // Past this point we have recursed to an elist
-      remote_elist e = is_local(bucket_base) ? bucket_base : pool->Read<EList>(bucket_base, temp_elist);
+      remote_elist e = is_local(bucket_base) ? bucket_base : pool->Read<EList>(bucket_base, temp_elist, 1000);
 
       // Get elist and linear search
       for (size_t i = 0; i < e->count; i++) {

@@ -19,7 +19,7 @@ using namespace remus::rdma;
 #define USE_RW_LOCK true // use rw lock instead of normal mutex
 // #define EXPERIMENTAL true // (only used if USE_RW_LOCK is true, invalidate locally by acquiring shared-lock instead of exclusive-lock)
 #define ASYNC_INVALIDATE true // async invalidate other cache lines
-// #define PRIORI !! todo:
+#define PRIORITY true
 
 #ifdef USE_RW_LOCK
 #include <shared_mutex>
@@ -382,6 +382,7 @@ public:
                     metrics.hits++;
                 }
             } else {
+                #ifdef PRIORITY
                 if (l->priority < priority){
                     // -- Cache miss (priority) -- //
                     // if old priority is less than new priority
@@ -393,6 +394,7 @@ public:
                     #endif
                     goto unmarked_execution;
                 }
+                #endif
                 #ifdef USE_RW_LOCK
                 l->mu->unlock_shared();
                 l->mu->lock();
