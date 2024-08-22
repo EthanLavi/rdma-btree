@@ -10,9 +10,9 @@
     "key_lb": 0,
     "key_ub": 10000,
     "region_size": 28,
-    "thread_count": 4,
-    "node_count": 2,
-    "qp_per_conn": 16,
+    "thread_count": 8,
+    "node_count": 10,
+    "qp_per_conn": 60,
     "cache_depth": 3,
     "distribution": "uniform"
 }
