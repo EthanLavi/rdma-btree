@@ -137,7 +137,7 @@ public:
         mu.unlock();
     }
 
-    void Await(uint64_t id){
+    void Await(uint64_t id, int left_to_await){
         mu.lock();
         // update the ptrs for sake of catching bugs if I try to use prealloc result immediately
         if (async_jobs.find(id) != async_jobs.end()){
@@ -145,6 +145,12 @@ public:
             *job.org = job.new_val;
             async_jobs[id]->pop_back();
         }        
+        int total = 0;
+        for(auto begin = async_jobs.begin(); begin != async_jobs.end(); begin++){
+            auto x = *begin;
+            total += x.second->size();
+        }
+        REMUS_ASSERT(left_to_await == total, "Size across all ids are eq to left_to_await");
         mu.unlock();
     }
 

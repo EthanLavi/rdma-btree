@@ -22,7 +22,7 @@ int main(){
     // Construct the remote cache
     RemoteCacheImpl<CountingPool>* cache = new RemoteCacheImpl<CountingPool>(pool, 0);
     RemoteCacheImpl<CountingPool>::pool = pool; // set pool to other pool so we acccept our own cacheline
-    cache->init({cache->root()}); // initialize with itself
+    cache->init({cache->root()}, 0); // initialize with itself
 
     Peer self = Peer(0);
     auto iht = new RdmaIHT<int, int, CNF_ELIST_SIZE, CNF_PLIST_SIZE>(self, CacheDepth::UpToLayer1, cache, pool);

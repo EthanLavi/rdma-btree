@@ -155,7 +155,7 @@ int main(){
     // Construct the remote cache
     RemoteCacheImpl<CountingPool>* cache = new RemoteCacheImpl<CountingPool>(pool, 0, 32, 256);
     cache->claim_master();
-    cache->init({cache->root()});
+    cache->init({cache->root()}, 0);
     main_body1(pool, cache);
     cache->free_all_tmp_objects();
     delete cache;
@@ -163,7 +163,7 @@ int main(){
     // Construct a new remote cache
     cache = new RemoteCacheImpl<CountingPool>(pool, 0, 512, 256);
     cache->claim_master();
-    cache->init({cache->root()});
+    cache->init({cache->root()}, 0);
     main_body2(pool, cache);
     cache->free_all_tmp_objects();
     delete cache;
@@ -171,7 +171,7 @@ int main(){
     // Construct a new remote cache
     cache = new RemoteCacheImpl<CountingPool>(pool, 0, 64, 256);
     cache->claim_master();
-    cache->init({cache->root()});
+    cache->init({cache->root()}, 0);
     main_body3(pool, cache);
     cache->free_all_tmp_objects();
     delete cache;
@@ -179,7 +179,7 @@ int main(){
     // Construct a new remote cache
     cache = new RemoteCacheImpl<CountingPool>(pool, 0, 256, 256);
     cache->claim_master();
-    cache->init({cache->root()});
+    cache->init({cache->root()}, 0);
     main_body4(pool, cache);
     cache->free_all_tmp_objects();
     delete cache;
@@ -187,7 +187,7 @@ int main(){
     // Construct a new remote cache
     cache = new RemoteCacheImpl<CountingPool>(pool, 0, 32, 256);
     cache->claim_master();
-    cache->init({cache->root()});
+    cache->init({cache->root()}, 0);
     main_body5(pool, cache);
     cache->free_all_tmp_objects();
     delete cache;

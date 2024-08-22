@@ -320,9 +320,14 @@ public:
       local = std::to_address(prealloc);
       REMUS_TRACE("Preallocated memory for Write: {} bytes @ 0x{:x}", sizeof(T), (uint64_t)local);
     }
-
-    REMUS_ASSERT((uint64_t)local != ptr.address(), "WTF");
-    std::memset(local, 0, sizeof(T));
+    // todo: remove
+    // if ((uint64_t)local == ptr.address() && ptr.id() == self_.id){
+    //   REMUS_INFO("prealloc={} local={} ptr={}", prealloc.address(), (uint64_t) local, ptr.address());
+    //   abort();
+    // }
+    // todo: remove
+    REMUS_ASSERT((uint64_t) local != ptr.address() || ptr.id() != self_.id, "WTF");
+    std::memset(local, 0, sizeof(T)); // todo: comment out for performance?
     *local = val;
     ibv_sge sge{};
     sge.addr = reinterpret_cast<uint64_t>(local);
@@ -533,7 +538,7 @@ public:
   }
 
   /// Wait for all posted async requests to finish
-  void Await(uint64_t id){
+  void Await(uint64_t id, int left_to_await){
     if (conn_info_.find(id) == conn_info_.end()) REMUS_ERROR("Cannot find {} as a node ID", id);
     auto info = conn_info_.at(id);
 
@@ -544,7 +549,7 @@ public:
 
     // Poll until we match on the condition
     ibv_wc wc;
-    while (reordering_counters[index_as_id] != 0) {
+    while (reordering_counters[index_as_id] > left_to_await) {
       int poll = info.conn->poll_cq(1, &wc);
       if (poll == 0 || (poll < 0 && errno == EAGAIN))
         continue;
@@ -630,9 +635,9 @@ private:
     //
     // TODO: If we're serious about being multithreaded, rdma_per_read needs to
     // be thread-local, or else all threads will contend on this.
-    rdma_per_read_lock_.lock();
-    rdma_per_read_ << num_chunks;
-    rdma_per_read_lock_.unlock();
+    // rdma_per_read_lock_.lock();
+    // rdma_per_read_ << num_chunks;
+    // rdma_per_read_lock_.unlock();
   }
 
   // [mfs]  According to [el], it is possible to post multiple requests on the

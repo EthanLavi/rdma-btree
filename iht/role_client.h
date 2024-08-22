@@ -36,25 +36,37 @@ inline bool test_output(bool show_passing, optional<int> actual, optional<int> e
   return true;
 }
 
+enum MapCodes {
+  Insert, Get, Remove, Prepare
+};
+
 /// Capture the API for a map
 /// This is to standardize the map api to allow for different maps to be passed
 class MapAPI {
   public:
-    function<optional<int>(int, int)> insert;
-    function<optional<int>(int)> get;
-    function<optional<int>(int)> remove;
-    function<void(int, int, int)> prepare;
+    function<optional<int>(MapCodes, int, int, int)> conditions;
 
     /// First function is insert(key, value)
     /// Second function is get(key)
     /// Third function is remove(key)
     /// Fourth function is prepare(op_count, key_lb, key_ub), which is used to register the thread and populate the map
-    MapAPI(
-      function<optional<int>(int, int)> insert, 
-      function<optional<int>(int)> get, 
-      function<optional<int>(int)> remove, 
-      function<void(int, int, int)> prepare)
-      : insert(std::move(insert)), get(std::move(get)), remove(std::move(remove)), prepare(std::move(prepare)) {}
+    MapAPI(function<optional<int>(MapCodes, int, int, int)> conditions) : conditions(std::move(conditions)) {}
+
+    optional<int> get(int key){
+      return conditions(Get, key, 0, 0);
+    }
+
+    optional<int> remove(int key){
+      return conditions(Remove, key, 0, 0);
+    }
+
+    void prepare(int op_count, int key_lb, int key_ub){
+      conditions(Prepare, op_count, key_lb, key_ub);
+    }
+
+    optional<int> insert(int key, int value){
+      return conditions(Insert, key, value, 0);
+    }
 };
 
 /// N.B. I can't change the template of the Client without breaking in the WorkloadDriver
