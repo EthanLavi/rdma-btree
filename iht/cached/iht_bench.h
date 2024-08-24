@@ -84,7 +84,7 @@ inline void iht_run(BenchmarkParams& params, rdma_capability* capability, Remote
             map_reduce(endpoint, params, cache->root(), std::function<void(uint64_t)>([&](uint64_t data){
                 peer_roots.push_back(data);
             }));
-            cache->init(peer_roots);
+            cache->init(peer_roots, params.node_count - 1);
 
             std::shared_ptr<KVStore> iht = std::make_shared<KVStore>(self, params.cache_depth, cache, pool);
             // Get the data from the server to init the IHT
@@ -97,27 +97,33 @@ inline void iht_run(BenchmarkParams& params, rdma_capability* capability, Remote
             int delta = 0;
             int populate_amount = 0;
             MapAPI* iht_as_map = new MapAPI(
-                [&](int key, int value){
-                    auto res = iht->insert(pool, key, value);
-                    if (res == std::nullopt) delta++;
-                    return res;
-                },
-                [&](int key){ return iht->contains(pool, key); },
-                [&](int key){
-                    auto res = iht->remove(pool, key);
-                    if (res != std::nullopt) delta--;
-                    return res;
-                },
-                [&](int op_count, int key_lb, int key_ub){
-                    // capability->RegisterThread();
-                    ExperimentManager::ClientArriveBarrier(endpoint);
-                    delta += iht->populate(pool, op_count, key_lb, key_ub, [=](int key){ return key; });
-                    ExperimentManager::ClientArriveBarrier(endpoint);
-                    populate_amount = iht->count(pool); // ? IMPORTANT - Count hits every element which in effect warms up the cache
-                                      // ? BENCHMARK EXECUTION STARTS WITH NO INVALID CACHE LINES
-                    ExperimentManager::ClientArriveBarrier(endpoint);
-                    cache->print_metrics();
-                    cache->reset_metrics();
+                [&](MapCodes code, int param1, int param2, int param3){
+                    if (code == Prepare){
+                        if (params.node_id == 0 && thread_index == 0){
+                            cache->claim_master();
+                        }
+                        // capability->RegisterThread();
+                        ExperimentManager::ClientArriveBarrier(endpoint);
+                        delta += iht->populate(pool, param1, param2, param3, [=](int key){ return key; });
+                        ExperimentManager::ClientArriveBarrier(endpoint);
+                        populate_amount = iht->count(pool);
+                        ExperimentManager::ClientArriveBarrier(endpoint);
+                        cache->print_metrics();
+                        cache->reset_metrics();
+                    } else if (code == Get){
+                        return iht->contains(pool, param1);
+                    } else if (code == Remove){
+                        auto res = iht->remove(pool, param1);
+                        if (res != std::nullopt) delta--;
+                        return res;
+                    } else if (code == Insert){
+                        auto res = iht->insert(pool, param1, param2);
+                        if (res == std::nullopt) delta++;
+                        return res;
+                    } else {
+                        REMUS_WARN("No valid code");
+                    }
+                    return optional<int>();
                 }
             );
             using client_t = Client<Map_Op<int, int>>;
@@ -165,7 +171,7 @@ inline void bulk_time(BenchmarkParams& params, rdma_capability* capability, Remo
     rdma_capability_thread* pool = capability->RegisterThread();
     // initialize thread's thread_local pool
     RemoteCache::pool = pool; 
-    cache->init({}); // self-init
+    cache->init({}, 0); // self-init
     KVStore* iht = new KVStore(self, params.cache_depth, cache, pool);
     iht->InitAsFirst(pool);
     // 50% populated

@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
 
     // Create our remote cache (can initialize the cache space with any pool)
     auto pool = capability->RegisterThread();
-    RemoteCache* cache = new RemoteCache(pool, self.id, 1000);
+    RemoteCache* cache = new RemoteCache(pool, self.id, 10000);
     if (params.structure == "iht"){
         iht_run(params, capability, cache, host, self);
     } else if (params.structure == "iht_tmp"){

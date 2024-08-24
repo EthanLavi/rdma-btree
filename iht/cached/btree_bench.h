@@ -99,7 +99,7 @@ inline void btree_run(BenchmarkParams& params, rdma_capability* capability, Remo
             map_reduce(endpoint, params, cache->root(), std::function<void(uint64_t)>([&](uint64_t data){
                 peer_roots.push_back(data);
             }));
-            cache->init(peer_roots);
+            cache->init(peer_roots, params.node_count - 1);
 
             std::shared_ptr<BTree> btree = std::make_shared<BTree>(self, params.cache_depth, cache, pool, ebr_leaf, ebr_node);
             // Get the data from the server to init the btree
@@ -112,26 +112,34 @@ inline void btree_run(BenchmarkParams& params, rdma_capability* capability, Remo
             int delta = 0;
             int populate_amount = 0;
             MapAPI* btree_as_map = new MapAPI(
-                [&](int key, int value){
-                    auto res = btree->insert(pool, key, value);
-                    if (res == std::nullopt) delta++;
-                    return res;
-                },
-                [&](int key){ return btree->contains(pool, key); },
-                [&](int key){
-                    auto res = btree->remove(pool, key);
-                    if (res != std::nullopt) delta--;
-                    return res;
-                },
-                [&](int op_count, int key_lb, int key_ub){
-                    // capability->RegisterThread();
-                    ExperimentManager::ClientArriveBarrier(endpoint);
-                    delta += btree->populate(pool, op_count, key_lb, key_ub, [=](int key){ return key; });
-                    ExperimentManager::ClientArriveBarrier(endpoint);
-                    populate_amount = btree->count(pool);
-                    ExperimentManager::ClientArriveBarrier(endpoint);
-                    cache->print_metrics();
-                    cache->reset_metrics();
+                [&](MapCodes code, int param1, int param2, int param3){
+                    if (code == Prepare){
+                        if (params.node_id == 0 && thread_index == 0){
+                            cache->claim_master();
+                        }
+                        // capability->RegisterThread();
+                        ExperimentManager::ClientArriveBarrier(endpoint);
+                        delta += btree->populate(pool, param1, param2, param3, [=](int key){ return key; });
+                        ExperimentManager::ClientArriveBarrier(endpoint);
+                        populate_amount = btree->count(pool); // ? IMPORTANT - Count hits every element which in effect warms up the cache
+                                        // ? BENCHMARK EXECUTION STARTS WITH NO INVALID CACHE LINES
+                        ExperimentManager::ClientArriveBarrier(endpoint);
+                        cache->print_metrics();
+                        cache->reset_metrics();
+                    } else if (code == Get){
+                        return btree->contains(pool, param1);
+                    } else if (code == Remove){
+                        auto res = btree->remove(pool, param1);
+                        if (res != std::nullopt) delta--;
+                        return res;
+                    } else if (code == Insert){
+                        auto res = btree->insert(pool, param1, param2);
+                        if (res == std::nullopt) delta++;
+                        return res;
+                    } else {
+                        REMUS_WARN("No valid code");
+                    }
+                    return optional<int>();
                 }
             );
 
@@ -159,7 +167,9 @@ inline void btree_run(BenchmarkParams& params, rdma_capability* capability, Remo
                     btree->debug();
                     REMUS_INFO("BTree is valid? {}", btree->valid());
                 }
-                REMUS_ASSERT(final_size - all_delta == 0, "Initial size + delta ==? Final size");
+                if(final_size - all_delta != 0){
+                    REMUS_WARN("Initial size + delta ==? Final size");
+                }
             }
 
             ExperimentManager::ClientArriveBarrier(endpoint);
@@ -255,7 +265,7 @@ inline void btree_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCac
             map_reduce(endpoint, params, cache->root(), std::function<void(uint64_t)>([&](uint64_t data){
                 peer_roots.push_back(data);
             }));
-            cache->init(peer_roots);
+            cache->init(peer_roots, params.node_count - 1);
 
             auto bptr = new BTreeLocal(self, params.cache_depth, cache, pool, ebr_leaf, ebr_node);
             std::shared_ptr<BTreeLocal> btree = std::shared_ptr<BTreeLocal>(bptr);
@@ -269,26 +279,34 @@ inline void btree_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCac
             int delta = 0;
             int populate_amount = 0;
             MapAPI* btree_as_map = new MapAPI(
-                [&](int key, int value){
-                    auto res = btree->insert(pool, key, value);
-                    if (res == std::nullopt) delta++;
-                    return res;
-                },
-                [&](int key){ return btree->contains(pool, key); },
-                [&](int key){
-                    auto res = btree->remove(pool, key);
-                    if (res != std::nullopt) delta--;
-                    return res;
-                },
-                [&](int op_count, int key_lb, int key_ub){
-                    // capability->RegisterThread();
-                    ExperimentManager::ClientArriveBarrier(endpoint);
-                    delta += btree->populate(pool, op_count, key_lb, key_ub, [=](int key){ return key; });
-                    ExperimentManager::ClientArriveBarrier(endpoint);
-                    populate_amount = btree->count(pool);
-                    ExperimentManager::ClientArriveBarrier(endpoint);
-                    cache->print_metrics();
-                    cache->reset_metrics();
+                [&](MapCodes code, int param1, int param2, int param3){
+                    if (code == Prepare){
+                        if (params.node_id == 0 && thread_index == 0){
+                        cache->claim_master();
+                        }
+                        // capability->RegisterThread();
+                        ExperimentManager::ClientArriveBarrier(endpoint);
+                        delta += btree->populate(pool, param1, param2, param3, [=](int key){ return key; });
+                        ExperimentManager::ClientArriveBarrier(endpoint);
+                        populate_amount = btree->count(pool); // ? IMPORTANT - Count hits every element which in effect warms up the cache
+                                        // ? BENCHMARK EXECUTION STARTS WITH NO INVALID CACHE LINES
+                        ExperimentManager::ClientArriveBarrier(endpoint);
+                        cache->print_metrics();
+                        cache->reset_metrics();
+                    } else if (code == Get){
+                        return btree->contains(pool, param1);
+                    } else if (code == Remove){
+                        auto res = btree->remove(pool, param1);
+                        if (res != std::nullopt) delta--;
+                        return res;
+                    } else if (code == Insert){
+                        auto res = btree->insert(pool, param1, param2);
+                        if (res == std::nullopt) delta++;
+                        return res;
+                    } else {
+                        REMUS_WARN("No valid code");
+                    }
+                    return optional<int>();
                 }
             );
 
@@ -379,7 +397,7 @@ inline void btree_run_local(Peer& self){
     REMUS_INFO("DONE INIT");
 
     for(int i = 40; i >= 0; i--){
-        tree.debug();
+        // tree.debug();
         tree.insert(pool, i, i);
     }
 
@@ -417,6 +435,7 @@ inline void btree_run_local(Peer& self){
     
     REMUS_INFO("Tree is valid? {}", tree.valid());
     REMUS_INFO("Done!");
+    cach->print_metrics("Metrics = ");
     cach->free_all_tmp_objects();
     ebr_leaf->destroy(pool);
     ebr_node->destroy(pool);

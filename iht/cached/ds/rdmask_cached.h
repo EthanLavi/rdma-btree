@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <ostream>
 #include <random>
@@ -20,12 +21,6 @@
 #include <random>
 
 using namespace remus::rdma;
-
-/* 
-todo: Optimize read behaviors
-*/
-
-
 
 template <class T>
 inline bool is_marked_del(rdma_ptr<T> ptr){
@@ -72,15 +67,12 @@ private:
     // shared EBRObjectPool has thread_local internals so its all thread safe
     EBRObjectPool<Node, 100, capability>* ebr;
 
-    // todo: replace for offset of
     inline rdma_ptr<uint64_t> get_value_ptr(nodeptr node) {
-        Node* tmp = (Node*) 0x0;
-        return rdma_ptr<uint64_t>(unmark_ptr(node).id(), unmark_ptr(node).address() + (uint64_t) &tmp->value);
+        return rdma_ptr<uint64_t>(unmark_ptr(node).id(), unmark_ptr(node).address() + offsetof(Node, value));
     }
 
     inline rdma_ptr<uint64_t> get_link_height_ptr(nodeptr node) {
-        Node* tmp = (Node*) 0x0;
-        return rdma_ptr<uint64_t>(unmark_ptr(node).id(), unmark_ptr(node).address() + (uint64_t) &tmp->link_level);
+        return rdma_ptr<uint64_t>(unmark_ptr(node).id(), unmark_ptr(node).address() + offsetof(Node, link_level));
     }
 
     inline rdma_ptr<uint64_t> get_level_ptr(nodeptr node, int level) {          
@@ -128,7 +120,11 @@ private:
     }
 
     /// Try to physically unlink a node that we know exists and we have the responsibility of unlinking
-    void unlink_node(capability* pool, K key){
+    void unlink_node(capability* pool, K key, int retries = 10000){
+        if (retries == 0) {
+            REMUS_ERROR("Too many retries. Ignore the node {} forever?", key);
+            return;
+        }
         if (key == MINKEY) return;
         // REMUS_ASSERT_DEBUG(key != MINKEY, "Removing the root node shouldn't happen");
         rdma_ptr<Node> preds[MAX_HEIGHT];
@@ -138,7 +134,6 @@ private:
         CachedObject<Node> node = fill(key, preds, succs, found, prev_keys);
         // if (!found[0]) return; // cannot find the node, (someone else might have removed for me too!)
         
-        bool had_update = false;
         for(int height = MAX_HEIGHT - 1; height != -1; height--){
             if (!found[height]) continue;
             // if not marked, try to mark
@@ -147,11 +142,10 @@ private:
                 // mark for deletion to prevent inserts after and also delete issues?
                 uint64_t old_ptr = pool->template CompareAndSwap<uint64_t>(level_ptr, succs[height].raw(), marked_del(succs[height]).raw());
                 if (old_ptr != succs[height].raw()){
-                    // cas failed, retry; also if we had an update, invalidate
-                    if (had_update) cache->Invalidate(node.remote_origin());
-                    return unlink_node(pool, key); // retry
+                    // cas failed, retry
+                    return unlink_node(pool, key, retries - 1); // retry
                 }
-                had_update = true;
+                cache->Invalidate(node.remote_origin());
             }
 
             // physically unlink
@@ -161,12 +155,10 @@ private:
             // only remove the level if prev is not marked
             uint64_t old_ptr = pool->template CompareAndSwap<uint64_t>(level_ptr, sans(node.remote_origin()).raw(), sans(succs[height]).raw());
             if (old_ptr != node.remote_origin().raw()){
-                if (had_update) cache->Invalidate(node.remote_origin()); // invalidate the node
-                return unlink_node(pool, key); // retry
+                return unlink_node(pool, key, retries - 1); // retry
             }
             cache->Invalidate(preds[height]);
         }
-        if (had_update) cache->Invalidate(node.remote_origin()); // invalidate the node
     }
 
     /// Try to raise a node to the level
@@ -230,12 +222,14 @@ public:
                     if (last != DELETE_SENTINEL) continue; // something changed, gonna skip this node
                     cache->Invalidate(curr.remote_origin());
                     unlink_node(pool, curr->key); // physically unlink (has guarantee of unlink)
-                    curr = cache->template Read<Node>(curr.remote_origin(), nullptr, MAX_HEIGHT - curr->height); // refresh curr now that it has changed!
-
-                    // deallocate unlinked node
-                    LimboLists<Node>* q = qs.at(i);
-                    q->free_lists[2].load()->push(unmark_ptr(curr.remote_origin()));
                     
+                    cache->Invalidate(curr.remote_origin()); // invalidate since curr has now changed
+                    curr = cache->template Read<Node>(curr.remote_origin(), nullptr, MAX_HEIGHT - curr->height); // refresh curr
+
+                    // equivalent to ebr->deallocate unlinked node
+                    LimboLists<Node>* q = qs.at(i);
+                    q->free_lists[2].load()->push(unmark_ptr(curr.remote_origin())); // todo: allow it to be marked?
+
                     // cycle the index
                     i++;
                     i %= qs.size();
@@ -249,7 +243,9 @@ public:
                         if (old_height == 0){
                             cache->Invalidate(curr.remote_origin());
                             raise_node(pool, curr->key, curr->height);
+                            
                             // refresh curr, now that it has changed
+                            cache->Invalidate(curr.remote_origin());
                             curr = cache->template Read<Node>(curr.remote_origin(), nullptr, MAX_HEIGHT - curr->height); 
                         }
                     } else {
@@ -330,15 +326,17 @@ public:
             // iterate on this level until we find the last node that <= the key
             K last_key = MINKEY;
             while(true){
-                REMUS_ASSERT_DEBUG(last_key < curr->key || last_key == MINKEY, "Infinite loop detected {} {}", last_key, curr->key);
-                // if (last_key >= curr->key && last_key != MINKEY) REMUS_FATAL("Infinite loop height={} prev={} curr={}", height, last_key, curr->key);
+                if (last_key >= curr->key && last_key != MINKEY) {
+                    // REMUS_WARN("Infinite loop height={} prev={} curr={}", height, last_key, curr->key);
+                    // abort();
+                }
                 last_key = curr->key;
 
                 if (curr->key == key) return curr; // stop early if we find the right key
                 if (sans(curr->next[height]) == nullptr) break; // if next is the END, descend a level
                 next_curr = cache->template Read<Node>(sans(curr->next[height]), use_node1 ? prealloc_find_node1 : prealloc_find_node2, MAX_HEIGHT - curr->height);
-                if (is_insert && height == 0 && is_marked_del(curr->next[height]) && next_curr->key >= key){
-                    REMUS_ASSERT_DEBUG(curr->value == UNLINK_SENTINEL, "Should be unlink sentinel if we are removing curr");
+                if (is_insert && height == 0 && is_marked_del(curr->next[height]) && next_curr->key >= key && curr->value == UNLINK_SENTINEL){
+                    // REMUS_ASSERT_DEBUG(curr->value == UNLINK_SENTINEL, "Should be unlink sentinel if we are removing curr");
                     // we found a node that we are inserting directly after. Lets help unlink
                     nonblock_unlink_node(pool, curr->key);
                     return find(pool, key, is_insert); // recursively retry
@@ -376,7 +374,11 @@ public:
         while(true){
             CachedObject<Node> curr = find(pool, key, true);
             if (curr->key == key) {
-                if (curr->value == UNLINK_SENTINEL) continue; // it is being unlinked, retry
+                if (curr->value == UNLINK_SENTINEL){
+                    // if it is in the process of unlinking, help unlink it
+                    // unlink_node(pool, key);
+                    continue;
+                }
                 if (curr->value == DELETE_SENTINEL){
                     rdma_ptr<uint64_t> curr_remote_value = get_value_ptr(curr.remote_origin());
                     uint64_t old_value = pool->template CompareAndSwap<uint64_t>(curr_remote_value, DELETE_SENTINEL, value);
@@ -413,6 +415,9 @@ public:
                 height = new_node.height;
                 pool->template Write<Node>(new_node_ptr, new_node, prealloc_node_w);
             }
+            // invalidate the new node to ensure the old value isn't in there!
+            cache->Invalidate(mark_ptr(new_node_ptr));
+            // todo: cache invalidate BEFORE linking into the structure
 
             // if the next is a deleted node, we need to physically delete
             rdma_ptr<uint64_t> dest = get_level_ptr(curr.remote_origin(), 0);

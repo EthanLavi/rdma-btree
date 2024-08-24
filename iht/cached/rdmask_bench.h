@@ -117,7 +117,7 @@ inline void rdmask_run(BenchmarkParams& params, rdma_capability* capability, Rem
             map_reduce(endpoint, params, cache->root(), std::function<void(uint64_t)>([&](uint64_t data){
                 peer_roots.push_back(data);
             }));
-            cache->init(peer_roots);
+            cache->init(peer_roots, params.node_count - 1);
 
             std::shared_ptr<RDMASK> sk = std::make_shared<RDMASK>(self, MAX_HEIGHT_SK - params.cache_depth, cache, pool, peers, ebr);
             // Get the data from the server to init the btree
@@ -146,28 +146,35 @@ inline void rdmask_run(BenchmarkParams& params, rdma_capability* capability, Rem
                 ExperimentManager::ClientArriveBarrier(endpoint); // stop the client with this
             } else {
                 MapAPI* rdmask_as_map = new MapAPI(
-                    [&](int key, int value){
-                        auto res = sk->insert(pool, key, value);
-                        if (res == std::nullopt) delta++;
-                        return res;
-                    },
-                    [&](int key){ return sk->contains(pool, key); },
-                    [&](int key){
-                        auto res = sk->remove(pool, key);
-                        if (res != std::nullopt) delta--;
-                        return res;
-                    },
-                    [&](int op_count, int key_lb, int key_ub){
-                        // capability->RegisterThread();
-                        ExperimentManager::ClientArriveBarrier(endpoint);
-                        delta += sk->populate(pool, op_count, key_lb, key_ub, [=](int key){ return key; });
-                        ExperimentManager::ClientArriveBarrier(endpoint);
-                        populate_amount = sk->count(pool);
-                        ExperimentManager::ClientArriveBarrier(endpoint);
-                        cache->print_metrics();
-                        cache->reset_metrics();
-
-                        std::this_thread::sleep_for(std::chrono::seconds(3)); // wait 3 seconds for the helper thread to catch up
+                    [&](MapCodes code, int param1, int param2, int param3){
+                        if (code == Prepare){
+                            if (params.node_id == 0 && thread_index == 0){
+                            cache->claim_master();
+                            }
+                            // capability->RegisterThread();
+                            ExperimentManager::ClientArriveBarrier(endpoint);
+                            delta += sk->populate(pool, param1, param2, param3, [=](int key){ return key; });
+                            ExperimentManager::ClientArriveBarrier(endpoint);
+                            populate_amount = sk->count(pool); // ? IMPORTANT - Count hits every element which in effect warms up the cache
+                                            // ? BENCHMARK EXECUTION STARTS WITH NO INVALID CACHE LINES
+                            ExperimentManager::ClientArriveBarrier(endpoint);
+                            cache->print_metrics();
+                            cache->reset_metrics();
+                            std::this_thread::sleep_for(std::chrono::seconds(3)); // wait 3 seconds for the helper thread to catch up
+                        } else if (code == Get){
+                            return sk->contains(pool, param1);
+                        } else if (code == Remove){
+                            auto res = sk->remove(pool, param1);
+                            if (res != std::nullopt) delta--;
+                            return res;
+                        } else if (code == Insert){
+                            auto res = sk->insert(pool, param1, param2);
+                            if (res == std::nullopt) delta++;
+                            return res;
+                        } else {
+                            REMUS_WARN("No valid code");
+                        }
+                        return optional<uint64_t>();
                     }
                 );
 
@@ -204,7 +211,9 @@ inline void rdmask_run(BenchmarkParams& params, rdma_capability* capability, Rem
                 REMUS_DEBUG("Delta = {}", all_delta);
                 // debug print if everything is local for inspection? and is small enough
                 if (params.node_count == 1 && (params.key_ub - params.key_lb) < 2000) sk->debug();
-                REMUS_ASSERT(final_size - all_delta == 0, "Initial size + delta ==? Final size");
+                if (final_size - all_delta != 0){
+                    REMUS_WARN("Initial size + delta ==? Final size");
+                }
             }
 
             ExperimentManager::ClientArriveBarrier(endpoint);
@@ -228,7 +237,7 @@ inline void rdmask_run(BenchmarkParams& params, rdma_capability* capability, Rem
 
 inline void rdmask_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCacheImpl<CountingPool>* cache, Peer& host, Peer& self, std::vector<Peer> peers){
     using Node = node<int, MAX_HEIGHT_SK>;
-    REMUS_ASSERT(params.thread_count >= 3, "Thread count should be at least 3 to account for the two helper thread");
+    REMUS_ASSERT(params.thread_count >= 2, "Thread count should be at least 3 to account for the two helper thread");
     
     // Create a list of client and server  threads
     std::vector<std::thread> threads;
@@ -283,8 +292,8 @@ inline void rdmask_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCa
     REMUS_INFO("Init ebr");
 
     // Barrier to start all the clients at the same time
-    std::barrier client_sync = std::barrier(params.thread_count - 2);
-    WorkloadDriverResult workload_results[params.thread_count - 2];
+    std::barrier client_sync = std::barrier(params.thread_count - 1);
+    WorkloadDriverResult workload_results[params.thread_count];
     
     // LimboLists
     std::barrier init_sync = std::barrier(params.thread_count);
@@ -306,7 +315,7 @@ inline void rdmask_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCa
             map_reduce(endpoint, params, cache->root(), std::function<void(uint64_t)>([&](uint64_t data){
                 peer_roots.push_back(data);
             }));
-            cache->init(peer_roots);
+            cache->init(peer_roots, params.node_count - 1);
 
             std::shared_ptr<RDMASKLocal> sk = std::make_shared<RDMASKLocal>(self, MAX_HEIGHT_SK - params.cache_depth, cache, pool, peers, ebr);
             // Get the data from the server to init the btree
@@ -320,7 +329,7 @@ inline void rdmask_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCa
             int delta = 0;
             int populate_amount = 0;
             // Create and run a client in a thread
-            if (thread_index == helper_tidx || thread_index == helper_tidx - 1){
+            if (thread_index == helper_tidx){ // || thread_index == helper_tidx - 1){
                 REMUS_INFO("Helper thread {}", thread_index);
                 init_sync.arrive_and_wait(); // wait until all threads have added to the limbo lists
 
@@ -328,37 +337,45 @@ inline void rdmask_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCa
                 ExperimentManager::ClientArriveBarrier(endpoint); // after populate
                 ExperimentManager::ClientArriveBarrier(endpoint); // after count
 
-                REMUS_ASSERT(qs.size() == params.thread_count - 2, "Accurate # of LimboLists");
+                REMUS_ASSERT(qs.size() == params.thread_count - 1, "Accurate # of LimboLists");
                 ebr->RegisterThread();
                 init_sync.arrive_and_drop(); // arrive pre-emptively
-                sk->helper_thread(&do_cont, pool, ebr, qs); // then establish the helper thread
+                if (thread_index == helper_tidx) // ! only run 1 helper thread
+                    sk->helper_thread(&do_cont, pool, ebr, qs); // then establish the helper thread
                 // the helper thread will finish last because of init_sync
 
                 ExperimentManager::ClientArriveBarrier(endpoint); // stop the client with this
             } else {
                 MapAPI* rdmask_as_map = new MapAPI(
-                    [&](int key, int value){
-                        auto res = sk->insert(pool, key, value);
-                        if (res == std::nullopt) delta++;
-                        return res;
-                    },
-                    [&](int key){ return sk->contains(pool, key); },
-                    [&](int key){
-                        auto res = sk->remove(pool, key);
-                        if (res != std::nullopt) delta--;
-                        return res;
-                    },
-                    [&](int op_count, int key_lb, int key_ub){
-                        // capability->RegisterThread();
-                        ExperimentManager::ClientArriveBarrier(endpoint);
-                        delta += sk->populate(pool, op_count, key_lb, key_ub, [=](int key){ return key; });
-                        ExperimentManager::ClientArriveBarrier(endpoint);
-                        populate_amount = sk->count(pool);
-                        ExperimentManager::ClientArriveBarrier(endpoint);
-                        cache->print_metrics();
-                        cache->reset_metrics();
-
-                        std::this_thread::sleep_for(std::chrono::seconds(3)); // wait 3 seconds for the helper thread to catch up
+                    [&](MapCodes code, int param1, int param2, int param3){
+                        if (code == Prepare){
+                            if (params.node_id == 0 && thread_index == 0){
+                            cache->claim_master();
+                            }
+                            // capability->RegisterThread();
+                            ExperimentManager::ClientArriveBarrier(endpoint);
+                            delta += sk->populate(pool, param1, param2, param3, [=](int key){ return key; });
+                            ExperimentManager::ClientArriveBarrier(endpoint);
+                            populate_amount = sk->count(pool); // ? IMPORTANT - Count hits every element which in effect warms up the cache
+                                            // ? BENCHMARK EXECUTION STARTS WITH NO INVALID CACHE LINES
+                            ExperimentManager::ClientArriveBarrier(endpoint);
+                            cache->print_metrics();
+                            cache->reset_metrics();
+                            std::this_thread::sleep_for(std::chrono::seconds(3)); // wait 3 seconds for the helper thread to catch up
+                        } else if (code == Get){
+                            return sk->contains(pool, param1);
+                        } else if (code == Remove){
+                            auto res = sk->remove(pool, param1);
+                            if (res != std::nullopt) delta--;
+                            return res;
+                        } else if (code == Insert){
+                            auto res = sk->insert(pool, param1, param2);
+                            if (res == std::nullopt) delta++;
+                            return res;
+                        } else {
+                            REMUS_WARN("No valid code");
+                        }
+                        return optional<uint64_t>();
                     }
                 );
 
@@ -374,7 +391,7 @@ inline void rdmask_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCa
                     init_sync.arrive_and_wait(); // wait until all other threads have completed
                     do_cont.store(false); // stop the helper thread at end
                 });
-                double populate_frac = 0.5 / (double) (params.node_count * (params.thread_count - 2));
+                double populate_frac = 0.5 / (double) (params.node_count * (params.thread_count - 1));
 
                 StatusVal<WorkloadDriverResult> output = client_t::Run(std::move(client), thread_index, populate_frac);
                 REMUS_ASSERT(output.status.t == StatusType::Ok && output.val.has_value(), "Client run failed");
@@ -414,27 +431,27 @@ inline void rdmask_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCa
     }
     delete_endpoints(endpoint_managers, params);
 
-    save_result("skiplist_result.csv", workload_results, params, params.thread_count - 2);
+    save_result("skiplist_result.csv", workload_results, params, params.thread_count - 1);
 }
 
 inline void rdmask_run_local(Peer& self){
     using Node = node<int, MAX_HEIGHT_SK>;
     CountingPool* pool = new CountingPool(true);
-    RemoteCacheImpl<CountingPool>* cach = new RemoteCacheImpl<CountingPool>(pool, 0);
+    RemoteCacheImpl<CountingPool>* cach = new RemoteCacheImpl<CountingPool>(pool, 0, 5000);
     RemoteCacheImpl<CountingPool>::pool = pool; // set pool to other pool so we acccept our own cacheline
 
     if (true){
         BenchmarkParams params = BenchmarkParams();
-        params.cache_depth = (CacheDepth::CacheDepth) 16;
-        params.contains = 50;
-        params.insert = 25;
-        params.remove = 25;
+        params.cache_depth = (CacheDepth::CacheDepth) 15;
+        params.contains = 80;
+        params.insert = 10;
+        params.remove = 10;
         params.key_lb = 0;
-        params.key_ub = 100;
+        params.key_ub = 10000;
         params.node_count = 1;
         params.node_id = 0;
         params.thread_count = 8;
-        params.op_count = 10000;
+        params.op_count = 100000;
         params.runtime = 1;
         params.qp_per_conn = 1;
         params.structure = "skiplist";

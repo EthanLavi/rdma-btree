@@ -116,7 +116,7 @@ inline void multi_run(BenchmarkParams& params, rdma_capability* capability, Remo
             map_reduce(endpoint, params, cache->root(), std::function<void(uint64_t)>([&](uint64_t data){
                 peer_roots.push_back(data);
             }));
-            cache->init(peer_roots);
+            cache->init(peer_roots, params.node_count - 1);
 
             std::shared_ptr<MultiList> sk = std::make_shared<MultiList>(self, params.cache_depth + 1, cache, pool, peers, ebr);
             sk->set_key_range(params.key_lb, params.key_ub);
@@ -146,26 +146,35 @@ inline void multi_run(BenchmarkParams& params, rdma_capability* capability, Remo
                 ExperimentManager::ClientArriveBarrier(endpoint); // stop the client with this
             } else {
                 MapAPI* rdmask_as_map = new MapAPI(
-                    [&](int key, int value){
-                        auto res = sk->insert(pool, key, value);
-                        if (res == std::nullopt) delta++;
-                        return res;
-                    },
-                    [&](int key){ return sk->contains(pool, key); },
-                    [&](int key){
-                        auto res = sk->remove(pool, key);
-                        if (res != std::nullopt) delta--;
-                        return res;
-                    },
-                    [&](int op_count, int key_lb, int key_ub){
-                        // capability->RegisterThread();
-                        ExperimentManager::ClientArriveBarrier(endpoint);
-                        delta += sk->populate(pool, op_count, key_lb, key_ub, [=](int key){ return key; });
-                        ExperimentManager::ClientArriveBarrier(endpoint);
-                        populate_amount = sk->count(pool);
-                        ExperimentManager::ClientArriveBarrier(endpoint);
-
-                        std::this_thread::sleep_for(std::chrono::seconds(3)); // wait 3 seconds for the helper thread to catch up
+                    [&](MapCodes code, int param1, int param2, int param3){
+                        if (code == Prepare){
+                            if (params.node_id == 0 && thread_index == 0){
+                            cache->claim_master();
+                            }
+                            // capability->RegisterThread();
+                            ExperimentManager::ClientArriveBarrier(endpoint);
+                            delta += sk->populate(pool, param1, param2, param3, [=](int key){ return key; });
+                            ExperimentManager::ClientArriveBarrier(endpoint);
+                            populate_amount = sk->count(pool); // ? IMPORTANT - Count hits every element which in effect warms up the cache
+                                            // ? BENCHMARK EXECUTION STARTS WITH NO INVALID CACHE LINES
+                            ExperimentManager::ClientArriveBarrier(endpoint);
+                            cache->print_metrics();
+                            cache->reset_metrics();
+                            std::this_thread::sleep_for(std::chrono::seconds(3)); // wait 3 seconds for the helper thread to catch up
+                        } else if (code == Get){
+                            return sk->contains(pool, param1);
+                        } else if (code == Remove){
+                            auto res = sk->remove(pool, param1);
+                            if (res != std::nullopt) delta--;
+                            return res;
+                        } else if (code == Insert){
+                            auto res = sk->insert(pool, param1, param2);
+                            if (res == std::nullopt) delta++;
+                            return res;
+                        } else {
+                            REMUS_WARN("No valid code");
+                        }
+                        return optional<uint64_t>();
                     }
                 );
 
@@ -305,7 +314,7 @@ inline void multi_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCac
             map_reduce(endpoint, params, cache->root(), std::function<void(uint64_t)>([&](uint64_t data){
                 peer_roots.push_back(data);
             }));
-            cache->init(peer_roots);
+            cache->init(peer_roots, params.node_count - 1);
 
             std::shared_ptr<MultiListLocal> sk = std::make_shared<MultiListLocal>(self, params.cache_depth + 1, cache, pool, peers, ebr);
             sk->set_key_range(params.key_lb, params.key_ub);
@@ -331,31 +340,42 @@ inline void multi_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCac
                 REMUS_ASSERT(qs.size() == params.thread_count - 2, "Accurate # of LimboLists");
                 ebr->RegisterThread();
                 init_sync.arrive_and_drop(); // arrive pre-emptively
-                sk->helper_thread(&do_cont, pool, ebr, qs); // then establish the helper thread
+                if (thread_index == helper_tidx) // ! only run 1 helper thread
+                    sk->helper_thread(&do_cont, pool, ebr, qs); // then establish the helper thread
                 // the helper thread will finish last because of init_sync
 
                 ExperimentManager::ClientArriveBarrier(endpoint); // stop the client with this
             } else {
                 MapAPI* rdmask_as_map = new MapAPI(
-                    [&](int key, int value){
-                        auto res = sk->insert(pool, key, value);
-                        if (res == std::nullopt) delta++;
-                        return res;
-                    },
-                    [&](int key){ return sk->contains(pool, key); },
-                    [&](int key){
-                        auto res = sk->remove(pool, key);
-                        if (res != std::nullopt) delta--;
-                        return res;
-                    },
-                    [&](int op_count, int key_lb, int key_ub){
-                        // capability->RegisterThread();
-                        ExperimentManager::ClientArriveBarrier(endpoint);
-                        delta += sk->populate(pool, op_count, key_lb, key_ub, [=](int key){ return key; });
-                        ExperimentManager::ClientArriveBarrier(endpoint);
-                        populate_amount = sk->count(pool);
-                        ExperimentManager::ClientArriveBarrier(endpoint);
-                        std::this_thread::sleep_for(std::chrono::seconds(3)); // wait 3 seconds for the helper thread to catch up
+                    [&](MapCodes code, int param1, int param2, int param3){
+                        if (code == Prepare){
+                            if (params.node_id == 0 && thread_index == 0){
+                            cache->claim_master();
+                            }
+                            // capability->RegisterThread();
+                            ExperimentManager::ClientArriveBarrier(endpoint);
+                            delta += sk->populate(pool, param1, param2, param3, [=](int key){ return key; });
+                            ExperimentManager::ClientArriveBarrier(endpoint);
+                            populate_amount = sk->count(pool); // ? IMPORTANT - Count hits every element which in effect warms up the cache
+                                            // ? BENCHMARK EXECUTION STARTS WITH NO INVALID CACHE LINES
+                            ExperimentManager::ClientArriveBarrier(endpoint);
+                            cache->print_metrics();
+                            cache->reset_metrics();
+                            std::this_thread::sleep_for(std::chrono::seconds(3)); // wait 3 seconds for the helper thread to catch up
+                        } else if (code == Get){
+                            return sk->contains(pool, param1);
+                        } else if (code == Remove){
+                            auto res = sk->remove(pool, param1);
+                            if (res != std::nullopt) delta--;
+                            return res;
+                        } else if (code == Insert){
+                            auto res = sk->insert(pool, param1, param2);
+                            if (res == std::nullopt) delta++;
+                            return res;
+                        } else {
+                            REMUS_WARN("No valid code");
+                        }
+                        return optional<uint64_t>();
                     }
                 );
 
@@ -397,6 +417,7 @@ inline void multi_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCac
 
             ExperimentManager::ClientArriveBarrier(endpoint);
             REMUS_INFO("[{} THREAD] -- End of execution; -- ", thread_index == helper_tidx ? "HELPER" : "CLIENT");
+            cache->print_metrics(thread_index == helper_tidx ? "Helper -> " : "");
         }, i));
     }
 
@@ -426,14 +447,14 @@ inline void multi_run_local(Peer& self){
     if (true){
         BenchmarkParams params = BenchmarkParams();
         params.cache_depth = (CacheDepth::CacheDepth) 4;
-        params.contains = 80;
-        params.insert = 10;
-        params.remove = 10;
+        params.contains = 98;
+        params.insert = 1;
+        params.remove = 1;
         params.key_lb = 0;
-        params.key_ub = 100;
+        params.key_ub = 10000;
         params.node_count = 1;
         params.node_id = 0;
-        params.thread_count = 5;
+        params.thread_count = 3;
         params.op_count = 10000;
         params.runtime = 1;
         params.qp_per_conn = 1;

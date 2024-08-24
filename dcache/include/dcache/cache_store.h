@@ -334,6 +334,7 @@ public:
         // todo: resetting the address is not coherent with remote CAS?
         rdma_ptr<T> result;
         ref_t* reference_counter;
+        bool was_marked = is_marked(ptr);
         if (is_marked(ptr)){
             // Get cache line and lock
             ptr = unmark_ptr(ptr);
@@ -451,7 +452,8 @@ public:
         // Increment metrics
         metrics.remote_reads++;
         metrics.allocation++;
-        return CachedObject<T>(ptr, result, [=](){
+        // restore original ptr
+        return CachedObject<T>(was_marked ? mark_ptr(ptr) : ptr, result, [=](){
             if (result != prealloc){ // don't accidentally deallocate prealloc
                 pool->template Deallocate<T>(result, size);
             }

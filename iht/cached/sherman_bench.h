@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdint>
 #include <barrier>
 #include <memory>
@@ -20,6 +21,7 @@
 #include "sherman/sherman_cache.h"
 
 #include <dcache/cache_store.h>
+#include <thread>
 
 using namespace remus::util;
 using namespace remus::rdma;
@@ -27,7 +29,7 @@ using namespace remus::rdma;
 inline void sherman_run(BenchmarkParams& params, rdma_capability* capability, RemoteCache* cache, Peer& host, Peer& self, std::vector<Peer> peers){
     using BTree = ShermanBPTree<int, 12, rdma_capability_thread>; // todo: increment size more?
     using Cache = IndexCache<BTree::BNode, 12, int>;
-    Cache* index = new Cache(1000); // just like in 
+    Cache* index = new Cache(1000, params.thread_count); // just like in sherman
 
     // Create a list of client and server  threads
     std::vector<std::thread> threads;
@@ -96,14 +98,14 @@ inline void sherman_run(BenchmarkParams& params, rdma_capability* capability, Re
             ebr_leaf->RegisterThread();
             ebr_node->RegisterThread();
 
-             // initialize thread's thread_local pool
+            // initialize thread's thread_local pool
             RemoteCache::pool = pool; 
             // Exchange the root pointer of the other cache stores via TCP module
             vector<uint64_t> peer_roots;
             map_reduce(endpoint, params, cache->root(), std::function<void(uint64_t)>([&](uint64_t data){
                 peer_roots.push_back(data);
             }));
-            cache->init(peer_roots);
+            cache->init(peer_roots, params.node_count - 1);
 
             std::shared_ptr<BTree> btree = std::make_shared<BTree>(self, cache, index, pool, ebr_leaf, ebr_node);
             // Get the data from the server to init the btree
@@ -116,24 +118,34 @@ inline void sherman_run(BenchmarkParams& params, rdma_capability* capability, Re
             int delta = 0;
             int populate_amount = 0;
             MapAPI* btree_as_map = new MapAPI(
-                [&](int key, int value){
-                    auto res = btree->insert(pool, key, value);
-                    if (res == std::nullopt) delta++;
-                    return res;
-                },
-                [&](int key){ return btree->contains(pool, key); },
-                [&](int key){
-                    auto res = btree->remove(pool, key);
-                    if (res != std::nullopt) delta--;
-                    return res;
-                },
-                [&](int op_count, int key_lb, int key_ub){
-                    // capability->RegisterThread();
-                    ExperimentManager::ClientArriveBarrier(endpoint);
-                    delta += btree->populate(pool, op_count, key_lb, key_ub, [=](int key){ return key; });
-                    ExperimentManager::ClientArriveBarrier(endpoint);
-                    populate_amount = btree->count(pool);
-                    ExperimentManager::ClientArriveBarrier(endpoint);
+                [&](MapCodes code, int param1, int param2, int param3){
+                    if (code == Prepare){
+                        if (params.node_id == 0 && thread_index == 0){
+                            cache->claim_master();
+                        }
+                        // capability->RegisterThread();
+                        ExperimentManager::ClientArriveBarrier(endpoint);
+                        delta += btree->populate(pool, param1, param2, param3, [=](int key){ return key; });
+                        ExperimentManager::ClientArriveBarrier(endpoint);
+                        populate_amount = btree->count(pool); // ? IMPORTANT - Count hits every element which in effect warms up the cache
+                                        // ? BENCHMARK EXECUTION STARTS WITH NO INVALID CACHE LINES
+                        ExperimentManager::ClientArriveBarrier(endpoint);
+                        cache->print_metrics();
+                        cache->reset_metrics();
+                    } else if (code == Get){
+                        return btree->contains(pool, param1);
+                    } else if (code == Remove){
+                        auto res = btree->remove(pool, param1);
+                        if (res != std::nullopt) delta--;
+                        return res;
+                    } else if (code == Insert){
+                        auto res = btree->insert(pool, param1, param2);
+                        if (res == std::nullopt) delta++;
+                        return res;
+                    } else {
+                        REMUS_WARN("No valid code");
+                    }
+                    return optional<int>();
                 }
             );
 
@@ -188,7 +200,7 @@ inline void sherman_run(BenchmarkParams& params, rdma_capability* capability, Re
 inline void sherman_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteCacheImpl<CountingPool>* cache, Peer& host, Peer& self, std::vector<Peer> peers){
     using BTreeLocal = ShermanBPTree<int, 12, CountingPool>; // todo: increment size more?
     using Cache = IndexCache<BTreeLocal::BNode, 12, int>;
-    Cache* index = new Cache(1000); // just like in 
+    Cache* index = new Cache(1000, params.thread_count); // just like in 
 
     // Create a list of client and server  threads
     std::vector<std::thread> threads;
@@ -261,7 +273,7 @@ inline void sherman_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteC
             map_reduce(endpoint, params, cache->root(), std::function<void(uint64_t)>([&](uint64_t data){
                 peer_roots.push_back(data);
             }));
-            cache->init(peer_roots);
+            cache->init(peer_roots, params.node_count - 1);
 
             std::shared_ptr<BTreeLocal> btree = std::make_shared<BTreeLocal>(self, cache, index, pool, ebr_leaf, ebr_node);
             // Get the data from the server to init the btree
@@ -273,25 +285,36 @@ inline void sherman_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteC
             // Create and run a client in a thread
             int delta = 0;
             int populate_amount = 0;
+            
             MapAPI* btree_as_map = new MapAPI(
-                [&](int key, int value){
-                    auto res = btree->insert(pool, key, value);
-                    if (res == std::nullopt) delta++;
-                    return res;
-                },
-                [&](int key){ return btree->contains(pool, key); },
-                [&](int key){
-                    auto res = btree->remove(pool, key);
-                    if (res != std::nullopt) delta--;
-                    return res;
-                },
-                [&](int op_count, int key_lb, int key_ub){
-                    // capability->RegisterThread();
-                    ExperimentManager::ClientArriveBarrier(endpoint);
-                    delta += btree->populate(pool, op_count, key_lb, key_ub, [=](int key){ return key; });
-                    ExperimentManager::ClientArriveBarrier(endpoint);
-                    populate_amount = btree->count(pool);
-                    ExperimentManager::ClientArriveBarrier(endpoint);
+                [&](MapCodes code, int param1, int param2, int param3){
+                    if (code == Prepare){
+                        if (params.node_id == 0 && thread_index == 0){
+                        cache->claim_master();
+                        }
+                        // capability->RegisterThread();
+                        ExperimentManager::ClientArriveBarrier(endpoint);
+                        delta += btree->populate(pool, param1, param2, param3, [=](int key){ return key; });
+                        ExperimentManager::ClientArriveBarrier(endpoint);
+                        populate_amount = btree->count(pool); // ? IMPORTANT - Count hits every element which in effect warms up the cache
+                                        // ? BENCHMARK EXECUTION STARTS WITH NO INVALID CACHE LINES
+                        ExperimentManager::ClientArriveBarrier(endpoint);
+                        cache->print_metrics();
+                        cache->reset_metrics();
+                    } else if (code == Get){
+                        return btree->contains(pool, param1);
+                    } else if (code == Remove){
+                        auto res = btree->remove(pool, param1);
+                        if (res != std::nullopt) delta--;
+                        return res;
+                    } else if (code == Insert){
+                        auto res = btree->insert(pool, param1, param2);
+                        if (res == std::nullopt) delta++;
+                        return res;
+                    } else {
+                        REMUS_WARN("No valid code");
+                    }
+                    return optional<int>();
                 }
             );
 
@@ -344,12 +367,15 @@ inline void sherman_run_tmp(BenchmarkParams& params, CountingPool* pool, RemoteC
 }
 
 inline void sherman_run_local(Peer& self){
-    CountingPool* pool = new CountingPool(true);
-
-
     using BTreeLocal = ShermanBPTree<int, 1, CountingPool>;
     using Cache = IndexCache<BTreeLocal::BNode, 1, int>;
-    Cache* index = new Cache(1000); // just like in sherman
+    
+    CountingPool* pool = new CountingPool(true);
+    
+    Cache* index_test = new Cache(1000, 1); // just like in sherman
+    index_test->bench();
+    REMUS_INFO("DONE BENCH");
+    std::this_thread::sleep_for(std::chrono::seconds(2));
 
     RemoteCacheImpl<CountingPool>* rcach = new RemoteCacheImpl<CountingPool>(pool, 0);
     RemoteCacheImpl<CountingPool>::pool = pool; // set pool to other pool so we acccept our own cacheline
@@ -357,15 +383,15 @@ inline void sherman_run_local(Peer& self){
     if (true){
         BenchmarkParams params = BenchmarkParams();
         params.cache_depth = CacheDepth::None;
-        params.contains = 0;
-        params.insert = 50;
-        params.remove = 50;
+        params.contains = 80;
+        params.insert = 10;
+        params.remove = 10;
         params.key_lb = 0;
-        params.key_ub = 10000;
+        params.key_ub = 50000;
         params.node_count = 1;
         params.node_id = 0;
         params.thread_count = 4;
-        params.op_count = 10000;
+        params.op_count = 1000000;
         params.runtime = 1;
         params.qp_per_conn = 1;
         params.structure = "sherman";
@@ -377,6 +403,8 @@ inline void sherman_run_local(Peer& self){
         sherman_run_tmp(params, pool, rcach, host, self, peers);
         return;
     }
+
+    Cache* index = new Cache(1000, 1); // just like in sherman
 
     using EBRLeaf = EBRObjectPool<BTreeLocal::BLeaf, 100, CountingPool>;
     using EBRNode = EBRObjectPoolAccompany<BTreeLocal::BNode, BTreeLocal::BLeaf, 100, CountingPool>;

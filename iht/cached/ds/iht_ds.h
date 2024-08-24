@@ -184,7 +184,7 @@ private:
   /// @param lock the lock to unlock
   /// @param unlock_status what should the end lock status be.
   inline void unlock(rdma_capability_thread* pool, remote_lock lock, uint64_t unlock_status) {
-    pool->Write<lock_type>(lock, unlock_status, temp_lock, internal::RDMAWriteWithAck);
+    pool->Write<lock_type>(lock, unlock_status, temp_lock, internal::RDMAWriteWithNoAck);
   }
 
   /// @brief Change the baseptr for a given bucket to point to a different EList or a different PList
@@ -281,9 +281,9 @@ private:
   remote_elist temp_elist;
   // N.B. I don't bother creating preallocated PLists since we're hoping to cache them anyways :)
 
-  /// @brief Try to fetch the cached value for a remote pointer
+  /// @brief Try to fetch the cached value for a remote pointer. Optimizations break this function
   /// If it is cached, then it returns a non null
-  PList* __attribute__((optimize("O2"))) fetch_cache(int* bucket_path) {
+  PList* __attribute__ ((optimize("0"))) fetch_cache(int* bucket_path) [[gnu::optimize(0)]] {
     // Bucket path:
     // [-1 -1 -1] -- root level (depth 1)
     // [n -1 -1] -- depth 2
@@ -414,13 +414,17 @@ private:
         continue;
       }
 
+      bool did_acquire = false;
       // Erroneous descent into EList (Think we are at an EList, but it turns out its a PList)
       if (sizeof(EList) != 64 || !do_lock_free){
+        retry_by_acquire:
         if (!acquire(pool, get_lock(ctx.parent_ptr, ctx.bucket))){
             // We must re-fetch the PList to ensure freshness of our pointers (1 << depth-1 to adjust size of read with customized ExtendedRead)
             ctx.curr.deallocate(pool);
             ctx.curr = CachedPList(pool->ExtendedRead<PList>(ctx.parent_ptr, 1 << (ctx.depth - 1)), ctx.depth - 1);
             continue;
+        } else {
+          did_acquire = true;
         }
       }
 
@@ -428,9 +432,13 @@ private:
       ctx.bucket_base = static_cast<remote_elist>(ctx.curr->buckets[ctx.bucket].base);
       // Past this point we have recursed to an elist
       ctx.e = pool->Read<EList>(ctx.bucket_base, temp_elist);
+      if (ctx.e->count > ELIST_SIZE + 1){
+        // found a plist instead of an elist
+        goto retry_by_acquire;
+      }
       // apply function to the elist
       if (apply(&ctx)){
-        if (sizeof(EList) != 64 || !do_lock_free)
+        if (did_acquire)
           unlock(pool, get_lock(ctx.parent_ptr, ctx.bucket), E_UNLOCKED);
         // deallocate plist that brought us to the elist & exit
         ctx.curr.deallocate(pool);
