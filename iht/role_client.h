@@ -131,11 +131,15 @@ public:
     int contains = client->params_.contains;
     int insert = client->params_.insert;
     function<Operation(void)> generator;
+    uniform_int_distribution<int> k_dist_uni = uniform_int_distribution<int>(key_lb, key_ub);
+    zipfian_int_distribution<int> k_dist_90 = zipfian_int_distribution<int>(key_lb, key_ub, 0.90);
+    zipfian_int_distribution<int> k_dist_95 = zipfian_int_distribution<int>(key_lb, key_ub, 0.95);
+    zipfian_int_distribution<int> k_dist_99 = zipfian_int_distribution<int>(key_lb, key_ub, 0.99);
+    
     if (client->params_.distribution == "uniform"){
       generator = [&]() {
-        uniform_int_distribution<int> k_dist = uniform_int_distribution<int>(key_lb, key_ub);
         int rng = op_dist(gen);
-        int k = k_dist(gen);
+        int k = k_dist_uni(gen);
         if (rng <= contains) {
           // between 0 and CONTAINS
           return Operation(CONTAINS, k, 0);
@@ -148,27 +152,24 @@ public:
       };
     } else if (client->params_.distribution == "skew90"){
       generator = [&]() {
-        zipfian_int_distribution<int> k_dist = zipfian_int_distribution<int>(key_lb, key_ub, 0.90);
         int rng = op_dist(gen);
-        int k = k_dist(gen);
+        int k = k_dist_90(gen);
         if (rng <= contains) return Operation(CONTAINS, k, 0);
         else if (rng <= contains + insert) return Operation(INSERT, k, k);
         else return Operation(REMOVE, k, 0);
       };
     } else if (client->params_.distribution == "skew95"){
       generator = [&]() {
-        zipfian_int_distribution<int> k_dist = zipfian_int_distribution<int>(key_lb, key_ub, 0.95);
         int rng = op_dist(gen);
-        int k = k_dist(gen);
+        int k = k_dist_95(gen);
         if (rng <= contains) return Operation(CONTAINS, k, 0);
         else if (rng <= contains + insert) return Operation(INSERT, k, k);
         else return Operation(REMOVE, k, 0);
       };
     } else if (client->params_.distribution == "skew99"){
       generator = [&]() {
-        zipfian_int_distribution<int> k_dist = zipfian_int_distribution<int>(key_lb, key_ub, 0.99);
         int rng = op_dist(gen);
-        int k = k_dist(gen);
+        int k = k_dist_99(gen);
         if (rng <= contains) return Operation(CONTAINS, k, 0);
         else if (rng <= contains + insert) return Operation(INSERT, k, k);
         else return Operation(REMOVE, k, 0);
@@ -176,8 +177,6 @@ public:
     } else {
       REMUS_FATAL("Cannot find distribution");
     }
-
-    
 
     // Generate two streams based on what the user wants (operation count or
     // timed stream)
