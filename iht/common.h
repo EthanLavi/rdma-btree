@@ -31,7 +31,7 @@ template <typename K, typename V> struct Map_Op {
 #define CNF_ELIST_SIZE 7
 // this is the number of elements in each elist
 
-#define CNF_PLIST_SIZE 8 
+#define CNF_PLIST_SIZE 32
 // this is the starting number of buckets in the first layer. The number of buckets doubles everytime we go down a layer.
 // This number should also be a multiple of 4, so we can use up all the PList space (aligned to 64 bytes and each bucket is 16 bytes)
 
@@ -39,6 +39,7 @@ template <typename K, typename V> struct Map_Op {
 // We mod by the number of buckets - 1 (we dont use the last bucket so we get an even use of all our other buckets). 
 
 // Our first three layers have 7, 15, and 31 buckets
+// Next two are 63 and 127
 // Since these numbers are co-prime, we will fill all our buckets.
 
 // Note: we can choose a bad number for CNF_PLIST_SIZE. If we use 4, our sizes for the cache-able layers are 3, 7, and 15. 3 and 15 are not co-prime, meaning that buckets in the 3rd layer won't be completely filled. For example, if a key is a multiple of 3, we go in bucket 0 for layer 1 and we must go in a bucket that is also a multiple of 3 for layer 3. This is bad since we only cache a layer when all the buckets are filled.
