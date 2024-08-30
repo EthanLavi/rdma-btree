@@ -69,9 +69,6 @@ struct alignas(64) CacheLine {
 
 static_assert(offsetof(CacheLine, address) == 0);
 
-static CacheMetrics history[10];
-static int size = 0;
-
 template <typename Pool = rdma_capability_thread>
 class RemoteCacheImpl {
 private:
@@ -83,8 +80,6 @@ private:
     std::mutex init_lock;
     vector<rdma_ptr<uint64_t>> prealloc_cas_result;
     uint16_t self_id;
-    int op_count;
-    int check_freq;
 
     template <typename T>
     uint64_t hash(rdma_ptr<T> ptr){
@@ -145,7 +140,7 @@ private:
     }
 
     template <class T>
-    void invalidate(CacheLine* l, rdma_ptr<T> ptr){
+    void invalidate(CacheLine* l, rdma_ptr<T> ptr, internal::RDMAWriteBehavior write_behavior = internal::RDMAWriteWithAck){
         // Invalidate locally
         #ifdef EXPERIMENTAL
         l->mu->lock_shared();
@@ -168,10 +163,14 @@ private:
             // CAS the remote cache's address to have the mask
             rdma_ptr<uint64_t> cache_line = static_cast<rdma_ptr<uint64_t>>(remote_caches[i][hash(ptr)]);
             #ifdef ASYNC_INVALIDATE
-            // batched compare and swap
-            rdma_ptr<uint64_t> cas_result = prealloc_cas_result[i];
-            pool->template CompareAndSwapAsync(cache_line, cas_result, ptr.raw(), ptr.raw() | mask);
-            ids[i] = cache_line.id();
+            if (write_behavior == remus::rdma::internal::RDMAWriteWithAck){
+                // batched compare and swap
+                rdma_ptr<uint64_t> cas_result = prealloc_cas_result[i];
+                pool->template CompareAndSwapAsync(cache_line, cas_result, ptr.raw(), ptr.raw() | mask);
+                ids[i] = cache_line.id();
+            } else {
+                pool->template CompareAndSwap<uint64_t>(cache_line, ptr.raw(), ptr.raw() | mask, remus::rdma::internal::RDMAWriteWithNoAck);
+            }
             #else
             // sequential compare and swap
             uint64_t old_value = pool->template CompareAndSwap<uint64_t>(cache_line, ptr.raw(), ptr.raw() | mask);
@@ -180,10 +179,12 @@ private:
             metrics.remote_cas++;
         }
         #ifdef ASYNC_INVALIDATE
-        int count = remote_caches.size();
-        for(int i = 0; i < remote_caches.size(); i++){
-            pool->template Await(ids[i], count - i - 1);
-            if (*prealloc_cas_result.at(i) == ptr.raw()) metrics.successful_invalidations++;
+        if (write_behavior == remus::rdma::internal::RDMAWriteWithAck){
+            int count = remote_caches.size();
+            for(int i = 0; i < remote_caches.size(); i++){
+                pool->template Await(ids[i], count - i - 1);
+                if (*prealloc_cas_result.at(i) == ptr.raw()) metrics.successful_invalidations++;
+            }
         }
         #endif
     }
@@ -197,8 +198,7 @@ public:
     /// - initializer: The pool to initialize with 
     /// - self_id: The id of the node the cache is running on. 
     /// - number_of_lines: The initial number of lines in the cache. This can change dynamically
-    /// - check_freq: How often the master thread should check it's metrics to determine if a dynamic change is warranted
-    RemoteCacheImpl(Pool* intializer, uint16_t self_id, int number_of_lines = 2000, int freq = 1000) : self_id(self_id), check_freq(freq) {
+    RemoteCacheImpl(Pool* intializer, uint16_t self_id, int number_of_lines = 2000) : self_id(self_id) {
         static_assert(sizeof(Object) == 1, "Precondition");
         this->number_of_lines = number_of_lines;
         origin_address = intializer->template Allocate<CacheLine>(number_of_lines);
@@ -216,7 +216,6 @@ public:
             lines[i].mu = new std::mutex();
             #endif
         }
-        op_count = 0;
         reset_metrics();
     }
 
@@ -324,33 +323,38 @@ public:
     }
 
     template <typename T>
-    CachedObject<T> ExtendedRead(rdma_ptr<T> ptr, int size, rdma_ptr<T> prealloc = nullptr, int priority = 0){
-        REMUS_ASSERT_DEBUG(ptr != nullptr, "Cant read nullptr");
+    CachedObject<T> ExtendedRead(rdma_ptr<T> ptr_m, int size, rdma_ptr<T> prealloc = nullptr, int priority = 0){
+        REMUS_ASSERT_DEBUG(ptr_m != nullptr, "Cant read nullptr");
         // Periodically call try_free_some to cleanup limbo lists
         try_free_some();
     
         // todo: do i need to mark the cache line as volatile?
-        // todo: implement priorities
-        // todo: resetting the address is not coherent with remote CAS?
+        retry:
         rdma_ptr<T> result;
         ref_t* reference_counter;
-        bool was_marked = is_marked(ptr);
-        if (is_marked(ptr)){
+        bool was_marked = is_marked(ptr_m);
+        if (is_marked(ptr_m)){
             // Get cache line and lock
-            ptr = unmark_ptr(ptr);
+            rdma_ptr<T> ptr = unmark_ptr(ptr_m);
             CacheLine* l = &lines[hash(ptr)];
             #ifdef USE_RW_LOCK
             l->mu->lock_shared();
-            bool acquired_rw_lock = false;
+            bool acquired_wlock = false;
             #else
             l->mu->lock();
             #endif
             if ((l->address & ~mask) == ptr.raw()){
                 if (l->address & mask){
+                    uint64_t original = l->address & ~mask;
                     #ifdef USE_RW_LOCK
                     l->mu->unlock_shared();
                     l->mu->lock();
-                    acquired_rw_lock = true;
+                    if ((l->address & ~mask) != original){
+                        // the data was swapped out for something else, restart
+                        l->mu->unlock();
+                        goto retry;
+                    }
+                    acquired_wlock = true;
                     #endif
                     // -- Cache miss (coherence) -- //
                     // clear the invalid bit before reading. Linearizes the read
@@ -397,9 +401,15 @@ public:
                 }
                 #endif
                 #ifdef USE_RW_LOCK
+                uint64_t original = l->address & ~mask;
                 l->mu->unlock_shared();
                 l->mu->lock();
-                acquired_rw_lock = true;
+                if ((l->address & ~mask) != original){
+                    // the data was swapped out, restart
+                    l->mu->unlock();
+                    goto retry;
+                }
+                acquired_wlock = true;
                 #endif
                 // -- Cache miss (compulsory or conflict) -- //
                 uint64_t old_address = l->address;
@@ -433,7 +443,7 @@ public:
             reference_counter->fetch_add(1); // increment ref count before releasing cache line and causing other issues
             // Unlock mutex on cache line
             #ifdef USE_RW_LOCK
-            if (acquired_rw_lock)
+            if (acquired_wlock)
                 l->mu->unlock();
             else
                 l->mu->unlock_shared();
@@ -447,13 +457,13 @@ public:
         unmarked_execution:
         // -- No cache -- //
         // Setup the result
-        result = pool->template ExtendedRead<T>(ptr, size, prealloc);
+        result = pool->template ExtendedRead<T>(unmark_ptr(ptr_m), size, prealloc);
 
         // Increment metrics
         metrics.remote_reads++;
         metrics.allocation++;
         // restore original ptr
-        return CachedObject<T>(was_marked ? mark_ptr(ptr) : ptr, result, [=](){
+        return CachedObject<T>(ptr_m, result, [=](){
             if (result != prealloc){ // don't accidentally deallocate prealloc
                 pool->template Deallocate<T>(result, size);
             }
@@ -468,11 +478,11 @@ public:
             CacheLine* l = &lines[hash(ptr)];
 
             // write to the value in the owner
-            pool->Write(ptr, val, prealloc, write_behavior);
+            pool->Write(ptr, val, prealloc);
             metrics.remote_writes++;
 
             // Invalidate
-            invalidate(l, ptr);
+            invalidate(l, ptr, write_behavior);
         } else {
             // write normally
             pool->Write(ptr, val, prealloc, write_behavior);

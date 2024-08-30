@@ -15,7 +15,7 @@ struct CacheMetrics {
     int deallocation;
     /// something was found in the cache but was invalid
     int coherence_misses;
-    /// had to swap something out (compulsory miss)
+    /// had to swap something out
     int conflict_misses;
     /// cold miss. Swap something in and replace nothing
     int cold_misses;
