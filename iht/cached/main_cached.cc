@@ -8,12 +8,12 @@
 // #include "map_cache.h"
 
 #include "../experiment.h"
-#include "iht_bench.h"
+// #include "iht_bench.h"
 #include "btree_bench.h"
-#include "rdmask_bench.h"
+// #include "rdmask_bench.h"
 #include "sherman_bench.h"
-#include "multi_bench.h"
-#include "iht_bench2.h"
+// #include "multi_bench.h"
+// #include "iht_bench2.h"
 
 #include <dcache/cache_store.h>
 
@@ -105,20 +105,10 @@ int main(int argc, char **argv) {
     // Create our remote cache (can initialize the cache space with any pool)
     auto pool = capability->RegisterThread();
     RemoteCache* cache = new RemoteCache(pool, self.id, 10000);
-    if (params.structure == "iht"){
-        iht_run(params, capability, cache, host, self);
-    } else if (params.structure == "iht_tmp"){
-        bulk_time(params, capability, cache, host, self);
-    } else if (params.structure == "iht_tuned"){
-        iht2_run(params, capability, cache, host, self);
-    } else if (params.structure == "btree"){
+    if (params.structure == "btree"){
         btree_run(params, capability, cache, host, self, peers);
     } else if (params.structure == "sherman"){
         sherman_run(params, capability, cache, host, self, peers);
-    } else if (params.structure == "skiplist"){
-        rdmask_run(params, capability, cache, host, self, peers);
-    } else if (params.structure == "multi"){
-        multi_run(params, capability, cache, host, self, peers);
     } else {
         REMUS_ERROR("Cannot identify structure");
     }
